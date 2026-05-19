@@ -1,0 +1,30 @@
+{
+  "name": "chrome-dev-mcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "test": "vitest"
+  },
+  "packageManager": "pnpm@11.1.2",
+  "keywords": [],
+  "author": "yuancongzhou",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chrome-remote-interface": "^0.34.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.34.0",
+    "@types/node": "^25.8.0",
+    "prettier": "^3.8.3",
+    "tsx": "^4.22.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}

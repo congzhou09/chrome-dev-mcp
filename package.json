@@ -1,8 +1,11 @@
 {
   "name": "chrome-dev-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An MCP server for Chrome runtime debugging",
   "main": "dist/index.js",
+  "bin": {
+    "chrome-dev-mcp": "dist/index.js"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -22,6 +25,9 @@
   "repository": "https://github.com/congzhou09/chrome-dev-mcp.git",
   "author": "yuancongzhou",
   "license": "ISC",
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "@jridgewell/trace-mapping": "^0.3.31",
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import CDP from 'chrome-remote-interface';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createServer } from './server.js';

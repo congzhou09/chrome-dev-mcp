@@ -15,6 +15,7 @@
 ## Limitations
 
 ■ Connects to the first `page` target whose URL contains `localhost`. Other pages, iframes, workers, and service workers are not supported at present.
+
 ■ Not designed to run alongside chrome-devtools-mcp. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
 ## Prerequisites
@@ -26,32 +27,32 @@
 
 ### Chrome
 
-●Launch Chrome with remote debugging enabled.
+▲Launch Chrome with remote debugging enabled.
 
 ```
 chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug-profile
 # --user-data-dir can be any empty directory; it keeps the debug session isolated from your normal Chrome profile.
-# Verify remote debugging is active by opening http://localhost:9222/json in a browser — it should return a JSON list of debuggable targets.
-
 ```
 
-●Open the page you want to debug.
+▲Verify remote debugging is active by opening http://localhost:9222/json in a browser — it should return a JSON list of debuggable targets.
 
-●This MCP server will connect to the first `page` target whose URL contains `localhost`.
+▲Open the page you want to debug.
+
+▲This MCP server will connect to the first `page` target whose URL contains `localhost`.
 
 ### Claude Code configuration
 
 #### through local project
 
-●Clone this project to local.
+▲Clone this project to local.
 
-●Add the server to Claude Code's MCP.
+▲Add the server to Claude Code's MCP.
 
 ```
 claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist/index.js"
 ```
 
-●Claude Code's config(`~/.claude.json`) may like this:
+▲Claude Code's config(`~/.claude.json`) may like this:
 
 ```json
 "mcpServers": {
@@ -66,19 +67,19 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 #### through npm package
 
-●Install npm package globally.
+▲Install npm package globally.
 
 ```
 npm install -g chrome-dev-mcp
 ```
 
-●Add the server to Claude Code's MCP.
+▲Add the server to Claude Code's MCP.
 
 ```
 claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 ```
 
-●Claude Code's config(`~/.claude.json`) may like this:
+▲Claude Code's config(`~/.claude.json`) may like this:
 
 ```json
 "mcpServers": {
@@ -95,7 +96,7 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 
 ●run `claude mcp list`, and it will print `chrome-dev: xxxxx - ✓ Connected`.
 
-## Tools
+## MCP Tools
 
 ### Page inspection
 
@@ -126,8 +127,9 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 
 ## Typical debugging workflow
 
-1. Bring Chrome to the desired state manually — navigate to a specific route, trigger a flow, or pause at a breakpoint.
-2. Ask the AI what you want to investigate; it will call `get_debugger_state`, `get_scope_variables`, etc. when needed.
+◆Bring Chrome to the desired state manually — navigate to a specific route, trigger a flow, or pause at a breakpoint.
+
+◆Ask the AI what you want to investigate, and it will call `get_debugger_state`, `get_scope_variables`, etc. automatically when needed.
 
 ```
 # Example sequence Claude might use

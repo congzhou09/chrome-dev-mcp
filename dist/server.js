@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping';
 import { z } from 'zod';
 import pkgInfo from '../package.json' with { type: 'json' };
 const NOT_CONNECTED = {
@@ -18,6 +19,10 @@ export function createServer(getClient) {
     };
     // breakpointId -> human-readable label ("url:line")
     const activeBreakpoints = new Map();
+    // scriptId -> { url, sourceMapURL }; populated by Debugger.scriptParsed
+    const scriptRegistry = new Map();
+    // script url -> parsed TraceMap (null = no source map or fetch failed)
+    const sourceMapCache = new Map();
     // Track which client the event listeners are registered on.
     // When getClient() returns a different instance (reconnect), we re-register
     // and reset stale debugger state — this is the "reconnect cleanup" point.
@@ -32,6 +37,16 @@ export function createServer(getClient) {
         debuggerState.pauseReason = '';
         debuggerState.hitBreakpoints = [];
         activeBreakpoints.clear();
+        scriptRegistry.clear();
+        sourceMapCache.clear();
+        client.Debugger.on('scriptParsed', (event) => {
+            if (event.url) {
+                scriptRegistry.set(event.scriptId, {
+                    url: event.url,
+                    sourceMapURL: event.sourceMapURL || undefined,
+                });
+            }
+        });
         client.Debugger.on('paused', (event) => {
             debuggerState.paused = true;
             debuggerState.callFrames = event.callFrames;
@@ -54,6 +69,42 @@ export function createServer(getClient) {
         await client.Debugger.enable({});
         await initialPauseSettled;
     };
+    const fetchTraceMap = async (scriptUrl, sourceMapURL) => {
+        try {
+            let raw;
+            if (sourceMapURL.startsWith('data:')) {
+                const b64 = sourceMapURL.slice(sourceMapURL.indexOf(',') + 1);
+                raw = Buffer.from(b64, 'base64').toString('utf-8');
+            }
+            else {
+                const mapUrl = new URL(sourceMapURL, scriptUrl).href;
+                const res = await fetch(mapUrl);
+                if (!res.ok)
+                    return null;
+                raw = await res.text();
+            }
+            return new TraceMap(raw);
+        }
+        catch {
+            return null;
+        }
+    };
+    const resolveOriginalPosition = async (scriptId, line0, col) => {
+        const script = scriptRegistry.get(scriptId);
+        if (!script?.sourceMapURL)
+            return null;
+        if (!sourceMapCache.has(script.url)) {
+            sourceMapCache.set(script.url, await fetchTraceMap(script.url, script.sourceMapURL));
+        }
+        const tracer = sourceMapCache.get(script.url);
+        if (!tracer)
+            return null;
+        // trace-mapping uses 0-based line and column
+        const pos = originalPositionFor(tracer, { line: line0 + 1, column: col });
+        if (pos.source == null)
+            return null;
+        return { source: pos.source, line: pos.line, column: pos.column, name: pos.name ?? undefined };
+    };
     // Resolves true when the next paused event arrives, false on timeout.
     // Call BEFORE issuing the step command to avoid missing the event.
     const waitForNextPause = (client, timeoutMs = 5000) => new Promise((resolve) => {
@@ -63,13 +114,19 @@ export function createServer(getClient) {
             resolve(true);
         });
     });
-    const formatCallStack = () => debuggerState.callFrames.map((frame, index) => ({
-        index,
-        functionName: frame.functionName || '(anonymous)',
-        url: frame.url,
-        lineNumber: frame.location.lineNumber + 1,
-        columnNumber: frame.location.columnNumber ?? 0,
-        scopeTypes: (frame.scopeChain ?? []).map((s) => s.type),
+    const formatCallStack = async () => Promise.all(debuggerState.callFrames.map(async (frame, index) => {
+        const line0 = frame.location.lineNumber;
+        const col = frame.location.columnNumber ?? 0;
+        const orig = await resolveOriginalPosition(frame.location.scriptId, line0, col);
+        return {
+            index,
+            functionName: frame.functionName || '(anonymous)',
+            url: orig?.source ?? frame.url,
+            lineNumber: orig?.line ?? line0 + 1,
+            columnNumber: orig?.column ?? col,
+            ...(orig && { compiledUrl: frame.url, compiledLine: line0 + 1 }),
+            scopeTypes: (frame.scopeChain ?? []).map((s) => s.type),
+        };
     }));
     const server = new McpServer({
         name: pkgInfo.name,
@@ -197,7 +254,7 @@ export function createServer(getClient) {
                         paused: true,
                         reason: debuggerState.pauseReason,
                         hitBreakpoints: debuggerState.hitBreakpoints,
-                        callStack: formatCallStack(),
+                        callStack: await formatCallStack(),
                     }, null, 2),
                 },
             ],
@@ -354,7 +411,7 @@ export function createServer(getClient) {
             content: [
                 {
                     type: 'text',
-                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: formatCallStack() }, null, 2),
+                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: await formatCallStack() }, null, 2),
                 },
             ],
         };
@@ -380,7 +437,7 @@ export function createServer(getClient) {
             content: [
                 {
                     type: 'text',
-                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: formatCallStack() }, null, 2),
+                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: await formatCallStack() }, null, 2),
                 },
             ],
         };
@@ -406,7 +463,7 @@ export function createServer(getClient) {
             content: [
                 {
                     type: 'text',
-                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: formatCallStack() }, null, 2),
+                    text: JSON.stringify({ paused: true, reason: debuggerState.pauseReason, callStack: await formatCallStack() }, null, 2),
                 },
             ],
         };

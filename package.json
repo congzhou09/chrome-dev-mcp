@@ -1,7 +1,7 @@
 {
   "name": "chrome-dev-mcp",
   "version": "1.0.0",
-  "description": "",
+  "description": "An MCP server for Chrome runtime debugging",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -10,11 +10,20 @@
     "build": "tsc",
     "test": "vitest"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "packageManager": "pnpm@11.1.2",
-  "keywords": [],
+  "keywords": [
+    "runtime-debug",
+    "chrome-debug",
+    "mcp"
+  ],
+  "repository": "https://github.com/congzhou09/chrome-dev-mcp.git",
   "author": "yuancongzhou",
   "license": "ISC",
   "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chrome-remote-interface": "^0.34.0",
     "zod": "^4.4.3"

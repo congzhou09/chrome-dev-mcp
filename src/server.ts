@@ -207,14 +207,26 @@ export function createServer(getClient: () => Promise<CDP.Client | null>) {
   server.registerTool(
     'evaluate_js',
     {
-      description: 'Evaluate javascript in page',
+      description: 'Evaluate javascript in page. To access the currently selected element in the Elements panel ($0), use get_inspected_element instead.',
       inputSchema: z.object({ expression: z.string() }),
     },
     async ({ expression }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-      return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
+      const result = await client.Runtime.evaluate({
+        expression,
+        returnByValue: true,
+      });
+      if (result.exceptionDetails) {
+        const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+        return { content: [{ type: 'text', text: `Error: ${msg}` }] };
+      }
+      const { value, type, description } = result.result;
+      const text =
+        value !== undefined
+          ? JSON.stringify(value, null, 2)
+          : description ?? type ?? 'undefined';
+      return { content: [{ type: 'text', text }] };
     },
   );
 
@@ -285,6 +297,43 @@ export function createServer(getClient: () => Promise<CDP.Client | null>) {
       if (!client) return NOT_CONNECTED;
       const result = await client.Page.captureScreenshot({ format: 'png' });
       return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+    },
+  );
+
+  server.registerTool(
+    'get_inspected_element',
+    {
+      description:
+        'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console. Returns tag, id, classes, attributes, and outerHTML.',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const client = await getClient();
+      if (!client) return NOT_CONNECTED;
+      const result = await client.Runtime.evaluate({
+        expression: `
+          (() => {
+            const el = window.$0;
+            if (!(el instanceof Element)) return null;
+            const attrs = {};
+            for (const a of el.attributes) attrs[a.name] = a.value;
+            return {
+              tagName: el.tagName.toLowerCase(),
+              id: el.id || undefined,
+              className: el.className || undefined,
+              attributes: attrs,
+              outerHTML: el.outerHTML.slice(0, 5000),
+            };
+          })()
+        `,
+        returnByValue: true,
+      });
+      if (result.result.value === null) {
+        return {
+          content: [{ type: 'text', text: 'No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.' }],
+        };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
     },
   );
 
@@ -556,6 +605,57 @@ export function createServer(getClient: () => Promise<CDP.Client | null>) {
           },
         ],
       };
+    },
+  );
+
+  server.registerTool(
+    'evaluate_at_frame',
+    {
+      description:
+        'Evaluate a JavaScript expression in the scope of a paused call frame. Unlike evaluate_js, this has access to local variables, closure variables, and the current `this`. Only works when execution is paused.',
+      inputSchema: z.object({
+        expression: z.string().describe('JS expression to evaluate'),
+        frameIndex: z.number().default(0).describe('Call frame index (0 = top frame); use get_debugger_state to find available frames'),
+      }),
+    },
+    async ({ expression, frameIndex }) => {
+      const client = await getClient();
+      if (!client) return NOT_CONNECTED;
+      await ensureDebuggerEvents(client);
+
+      if (!debuggerState.paused) {
+        return { content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }] };
+      }
+      const frame = debuggerState.callFrames[frameIndex];
+      if (!frame) {
+        return { content: [{ type: 'text', text: `No call frame at index ${frameIndex}.` }] };
+      }
+
+      const result = await client.Debugger.evaluateOnCallFrame({
+        callFrameId: frame.callFrameId,
+        expression,
+        returnByValue: false,
+        generatePreview: true,
+      });
+
+      if (result.exceptionDetails) {
+        const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+        return { content: [{ type: 'text', text: `Error: ${msg}` }] };
+      }
+
+      const r = result.result;
+      let text: string;
+      if (r.value !== undefined) {
+        text = JSON.stringify(r.value, null, 2);
+      } else if (r.preview) {
+        const props = (r.preview.properties ?? [])
+          .map((p: any) => `  ${p.name}: ${p.value}`)
+          .join(',\n');
+        text = `${r.preview.description ?? r.type} {\n${props}\n}`;
+      } else {
+        text = r.description ?? r.type ?? 'undefined';
+      }
+      return { content: [{ type: 'text', text }] };
     },
   );
 

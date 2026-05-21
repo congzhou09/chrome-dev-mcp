@@ -94,6 +94,36 @@ describe('evaluate_js', () => {
     expect(evaluate).toHaveBeenCalledWith({ expression: 'window.__myData', returnByValue: true });
     expect(result.content).toEqual([{ type: 'text', text: JSON.stringify({ count: 42 }, null, 2) }]);
   });
+
+  it('returns error message when expression throws', async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {},
+      exceptionDetails: { text: 'Uncaught', exception: { description: 'ReferenceError: x is not defined' } },
+    });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'x' } });
+
+    expect((result.content as any)[0].text).toBe('Error: ReferenceError: x is not defined');
+  });
+
+  it('returns description when value is undefined (e.g. non-serializable object)', async () => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { type: 'object', description: 'HTMLDivElement' } });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'document.body' } });
+
+    expect((result.content as any)[0].text).toBe('HTMLDivElement');
+  });
+
+  it('returns "undefined" string when expression result is undefined', async () => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { type: 'undefined' } });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'void 0' } });
+
+    expect((result.content as any)[0].text).toBe('undefined');
+  });
 });
 
 describe('get_computed_style', () => {
@@ -244,5 +274,40 @@ describe('resume_execution', () => {
     await mcpClient.callTool({ name: 'resume_execution', arguments: {} });
 
     expect(resume).toHaveBeenCalled();
+  });
+});
+
+describe('get_inspected_element', () => {
+  it('returns element info when window.$0 is set', async () => {
+    const elementData = {
+      tagName: 'div',
+      id: 'app',
+      className: 'container',
+      attributes: { id: 'app', class: 'container' },
+      outerHTML: '<div id="app" class="container"></div>',
+    };
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: elementData } });
+    const mcpClient = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
+
+    expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(elementData, null, 2) }]);
+  });
+
+  it('returns guidance message when window.$0 is not set', async () => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: null } });
+    const mcpClient = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
+
+    expect((result.content as any)[0].text).toMatch(/window\.\$0 = \$0/);
+  });
+
+  it('returns not-connected message when Chrome is unavailable', async () => {
+    const mcpClient = await setupMcpClient(null);
+
+    const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
+
+    expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
   });
 });

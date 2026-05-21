@@ -100,15 +100,16 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 
 ### Page inspection
 
-| Tool                 | Description                                           |
-| -------------------- | ----------------------------------------------------- |
-| `get_title`          | Current page title                                    |
-| `get_url`            | Current page URL                                      |
-| `get_html`           | Full page HTML (capped at 20,000 chars)               |
-| `evaluate_js`        | Run arbitrary JavaScript and return the result        |
-| `get_computed_style` | Computed CSS properties for a CSS selector            |
-| `element_from_point` | Topmost element at a selector's bounding-box position |
-| `screenshot`         | PNG screenshot of the current viewport                |
+| Tool                   | Description                                           |
+| ---------------------- | ----------------------------------------------------- |
+| `get_title`            | Current page title                                    |
+| `get_url`              | Current page URL                                      |
+| `get_html`             | Full page HTML (capped at 20,000 chars)               |
+| `evaluate_js`          | Run arbitrary JavaScript and return the result        |
+| `get_computed_style`   | Computed CSS properties for a CSS selector            |
+| `element_from_point`   | Topmost element at a selector's bounding-box position |
+| `screenshot`           | PNG screenshot of the current viewport                |
+| `get_inspected_element`| Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
 
 ### Debugger
 
@@ -116,6 +117,7 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line (map to source code if possible) |
 | `get_scope_variables` | Variable values inside a call frame scope (`local`, `closure`, `block`, `global`, …)                                |
+| `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — has access to local variables, closures, and `this`       |
 | `set_breakpoint`      | Set a breakpoint by URL + line number; supports conditions and URL regex                                            |
 | `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                       |
 | `list_breakpoints`    | All breakpoints active in this session                                                                              |
@@ -131,11 +133,22 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 
 ◆Ask the AI what you want to investigate, and it will call `get_debugger_state`, `get_scope_variables`, etc. automatically when needed.
 
+◆To share a specific DOM element with the AI during debugging, select it in the Elements panel, then run this in the DevTools console:
+
+```js
+window.$0 = $0
+```
+
+The AI can then call `get_inspected_element` to read its tag, attributes, and HTML.
+
 ```
 # Example sequence Claude might use
 get_debugger_state          → { paused: true, callStack: [{ functionName: "handleClick", url: "...", lineNumber: 42 }] }
 get_scope_variables         → [{ name: "event", type: "object", value: "MouseEvent" }, ...]
+evaluate_at_frame           → expression: "dropTargets.map(t => t.id)"  →  ["list-1", "list-2"]
 ```
+
+> `evaluate_at_frame` runs in the paused frame's scope and can read local variables, whereas `evaluate_js` runs in the global scope and cannot.
 
 ## Development
 

@@ -22,9 +22,9 @@
 
 ## Limitations
 
-■ Connects to the first `page` target whose URL contains `localhost`. Other pages, iframes, workers, and service workers are not supported at present.
+■ **Connects to the first `page` target whose URL contains `localhost`**. Other pages, iframes, workers, and service workers are not supported at present.
 
-■ Not designed to run alongside chrome-devtools-mcp. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
+■ **Not designed to run alongside chrome-devtools-mcp**. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
 ## Prerequisites
 
@@ -50,7 +50,7 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug-profile
 
 ### Claude Code configuration
 
-#### through local project
+#### Through local project
 
 ▲Clone this project to local.
 
@@ -60,7 +60,7 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug-profile
 claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist/index.js"
 ```
 
-▲Claude Code's config(`~/.claude.json`) may like this:
+▲Claude Code's config(`~/.claude.json`) will look like this:
 
 ```json
 "mcpServers": {
@@ -73,7 +73,9 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 }
 ```
 
-#### through npm package
+#### Through npm package
+
+##### With a fixed version
 
 ▲Install npm package globally.
 
@@ -87,7 +89,7 @@ npm install -g chrome-dev-mcp
 claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 ```
 
-▲Claude Code's config(`~/.claude.json`) may like this:
+▲Claude Code's config(`~/.claude.json`) will look like this:
 
 ```json
 "mcpServers": {
@@ -95,6 +97,31 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
     "type": "stdio",
     "command": "chrome-dev-mcp",
     "args": [],
+    "env": {}
+  }
+},
+```
+
+##### Always use the latest version
+
+▲Add the server to Claude Code's MCP.
+
+```
+claude mcp add --transport stdio chrome-dev -- npx -y chrome-dev-mcp@latest
+# '-y' is not supportted at 20260522. We may change the config below directory.
+```
+
+▲Claude Code's config(`~/.claude.json`) will look like this:
+
+```json
+"mcpServers": {
+  "chrome-dev": {
+    "type": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "chrome-dev-mcp@latest"
+    ],
     "env": {}
   }
 },

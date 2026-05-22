@@ -1,6 +1,6 @@
 {
   "name": "chrome-dev-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "An MCP server for Chrome runtime debugging",
   "main": "dist/index.js",
   "bin": {
@@ -22,6 +22,7 @@
     "chrome-debug",
     "mcp"
   ],
+  "mcpName": "io.github.congzhou09/chrome-dev-mcp",
   "repository": "https://github.com/congzhou09/chrome-dev-mcp.git",
   "author": "yuancongzhou",
   "license": "ISC",

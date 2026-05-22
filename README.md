@@ -12,6 +12,14 @@
 
 ●This project exists as a faster, independent implementation focused specifically on making Chrome runtime debugging usable for AI agents before similar functionality is officially available in chrome-devtools-mcp.
 
+### Architectural difference from chrome-devtools-mcp
+
+●chrome-devtools-mcp runs DevTools SDK models (`TargetManager`, `DebuggerModel`, `NetworkManager`, etc.) directly in Node.js via `chrome-devtools-frontend`'s `/mcp/mcp.js` entrypoint, backed by a Puppeteer CDP connection — capabilities that go beyond what the raw Chrome DevTools Protocol exposes directly.
+
+●That approach comes with trade-offs: `chrome-devtools-frontend` is a very large package (it mirrors the entire Chrome DevTools frontend codebase), and the approach relies on the internal structure of the DevTools page remaining stable across Chrome versions.
+
+●This project takes the opposite approach: plain CDP via `chrome-remote-interface`, no DevTools SDK, minimal dependencies. The result is a lightweight server that is easy to install, audit, and extend.
+
 ## Limitations
 
 ■ Connects to the first `page` target whose URL contains `localhost`. Other pages, iframes, workers, and service workers are not supported at present.
@@ -100,16 +108,16 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 
 ### Page inspection
 
-| Tool                   | Description                                           |
-| ---------------------- | ----------------------------------------------------- |
-| `get_title`            | Current page title                                    |
-| `get_url`              | Current page URL                                      |
-| `get_html`             | Full page HTML (capped at 20,000 chars)               |
-| `evaluate_js`          | Run arbitrary JavaScript and return the result        |
-| `get_computed_style`   | Computed CSS properties for a CSS selector            |
-| `element_from_point`   | Topmost element at a selector's bounding-box position |
-| `screenshot`           | PNG screenshot of the current viewport                |
-| `get_inspected_element`| Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
+| Tool                    | Description                                                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `get_title`             | Current page title                                                                                             |
+| `get_url`               | Current page URL                                                                                               |
+| `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
+| `evaluate_js`           | Run arbitrary JavaScript and return the result                                                                 |
+| `get_computed_style`    | Computed CSS properties for a CSS selector                                                                     |
+| `element_from_point`    | Topmost element at a selector's bounding-box position                                                          |
+| `screenshot`            | PNG screenshot of the current viewport                                                                         |
+| `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
 
 ### Debugger
 
@@ -136,7 +144,7 @@ claude mcp add --transport stdio chrome-dev -- chrome-dev-mcp
 ◆To share a specific DOM element with the AI during debugging, select it in the Elements panel, then run this in the DevTools console:
 
 ```js
-window.$0 = $0
+window.$0 = $0;
 ```
 
 The AI can then call `get_inspected_element` to read its tag, attributes, and HTML.

@@ -1,6 +1,6 @@
 {
   "name": "chrome-dev-mcp",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "An MCP server for Chrome runtime debugging",
   "main": "dist/index.js",
   "bin": {

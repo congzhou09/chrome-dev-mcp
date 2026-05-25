@@ -1,5 +1,7 @@
 # chrome-dev-mcp
 
+[![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp)
+
 ●An MCP server that connects AI agents to a running Chrome tab via the Chrome DevTools Protocol (CDP).
 
 ●This project focuses on Chrome runtime debugging.

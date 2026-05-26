@@ -10,6 +10,7 @@ const NOT_CONNECTED = {
         },
     ],
 };
+const MAX_CONSOLE_LOGS = 500;
 export function createServer(getClient) {
     const debuggerState = {
         paused: false,
@@ -23,6 +24,8 @@ export function createServer(getClient) {
     const scriptRegistry = new Map();
     // script url -> parsed TraceMap (null = no source map or fetch failed)
     const sourceMapCache = new Map();
+    // Circular buffer for console messages and uncaught exceptions.
+    const consoleLogs = [];
     // Track which client the event listeners are registered on.
     // When getClient() returns a different instance (reconnect), we re-register
     // and reset stale debugger state — this is the "reconnect cleanup" point.
@@ -39,6 +42,52 @@ export function createServer(getClient) {
         activeBreakpoints.clear();
         scriptRegistry.clear();
         sourceMapCache.clear();
+        consoleLogs.length = 0;
+        // ── Console / exception event listeners ──────────────────────────────────
+        // Format a Runtime.StackTrace into resolved (source-mapped) frames.
+        const formatStackTrace = async (stackTrace) => {
+            if (!stackTrace?.callFrames?.length)
+                return undefined;
+            return Promise.all(stackTrace.callFrames.map(async (frame) => {
+                const line0 = frame.lineNumber ?? 0;
+                const col = frame.columnNumber ?? 0;
+                const orig = frame.scriptId
+                    ? await resolveOriginalPosition(frame.scriptId, line0, col)
+                    : null;
+                return {
+                    functionName: frame.functionName || '(anonymous)',
+                    url: orig?.source ?? frame.url ?? '',
+                    lineNumber: orig?.line ?? line0 + 1,
+                    columnNumber: orig?.column ?? col,
+                };
+            }));
+        };
+        // Console.messageAdded covers both historical and new messages.
+        // Chrome replays all existing Console entries when Console.enable() is called,
+        // then continues delivering new ones — so we capture what is already visible
+        // in DevTools before this server connected.
+        //
+        // source === 'javascript' + level === 'error' → uncaught exception (not a console.error call).
+        client.Console.on('messageAdded', async (event) => {
+            const msg = event.message;
+            const type = msg.source === 'javascript' && msg.level === 'error' ? 'exception' : msg.level;
+            const stackTrace = msg.stackTrace
+                ? await formatStackTrace(msg.stackTrace)
+                : undefined;
+            consoleLogs.push({
+                timestamp: new Date().toISOString(),
+                type,
+                text: msg.text,
+                ...(stackTrace?.length ? { stackTrace } : {}),
+            });
+            if (consoleLogs.length > MAX_CONSOLE_LOGS)
+                consoleLogs.shift();
+        });
+        // Console domain is marked @deprecated in CDP in favour of Runtime.consoleAPICalled +
+        // Log.entryAdded, but those alternatives do NOT replay history. Console.enable() is the
+        // only mechanism that replays all messages already visible in DevTools before this server
+        // connected — which is the core requirement here.  The @deprecated hint is intentional.
+        await client.Console.enable();
         client.Debugger.on('scriptParsed', (event) => {
             if (event.url) {
                 scriptRegistry.set(event.scriptId, {
@@ -554,6 +603,45 @@ export function createServer(getClient) {
                 },
             ],
         };
+    });
+    // ── Console log tool ───────────────────────────────────────────────────────
+    server.registerTool('get_console_logs', {
+        description: 'Return browser console messages and uncaught exceptions. ' +
+            'Includes messages already visible in DevTools before this server connected, ' +
+            'plus new output produced afterwards. ' +
+            'Exceptions are reported with their full stack trace (source-mapped when available).',
+        inputSchema: z.object({
+            limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(MAX_CONSOLE_LOGS)
+                .default(100)
+                .describe('Maximum number of most-recent entries to return'),
+            level: z
+                .enum(['log', 'info', 'debug', 'warning', 'error', 'exception'])
+                .optional()
+                .describe('Filter by log level / type. Omit to return all levels.'),
+            clear: z
+                .boolean()
+                .default(false)
+                .describe('Clear the buffer after returning entries'),
+        }),
+    }, async ({ limit, level, clear }) => {
+        const client = await getClient();
+        if (!client)
+            return NOT_CONNECTED;
+        await ensureDebuggerEvents(client);
+        const filtered = level
+            ? consoleLogs.filter((e) => e.type === level)
+            : consoleLogs;
+        const entries = filtered.slice(-limit);
+        if (clear)
+            consoleLogs.length = 0;
+        if (entries.length === 0) {
+            return { content: [{ type: 'text', text: 'No console entries captured yet.' }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(entries, null, 2) }] };
     });
     return server;
 }

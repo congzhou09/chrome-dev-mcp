@@ -148,6 +148,12 @@ claude mcp add --transport stdio chrome-dev -- npx -y chrome-dev-mcp@latest
 | `screenshot`            | PNG screenshot of the current viewport                                                                         |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
 
+### Console
+
+| Tool               | Description                                                                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `get_console_logs` | All messages visible in the DevTools Console — including output that existed before this server connected. Exceptions are reported with their full stack trace (source-mapped when available). Supports filtering by level (`log` / `info` / `debug` / `warning` / `error` / `exception`) and an optional `clear` flag to flush the buffer after reading. |
+
 ### Debugger
 
 | Tool                  | Description                                                                                                         |

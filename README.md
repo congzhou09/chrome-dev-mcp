@@ -2,7 +2,7 @@
 
 [![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp)
 
-●An MCP server that connects AI agents to a running Chrome tab via the Chrome DevTools Protocol (CDP).
+●An MCP server for Web Frontend development in Chrome.
 
 ●This project focuses on Chrome runtime debugging.
 
@@ -24,7 +24,7 @@
 
 ## Limitations
 
-■ **Connects to the first `page` target whose URL contains `localhost`**. Other pages, iframes, workers, and service workers are not supported at present.
+■ **Connects to the currently active Chrome tab** (the visible `page` target in the Chrome window). If multiple Chrome windows are open, the first visible tab found is used. Iframes, workers, and service workers are not supported at present.
 
 ■ **Not designed to run alongside chrome-devtools-mcp**. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
@@ -48,32 +48,9 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug-profile
 
 ▲Open the page you want to debug.
 
-▲This MCP server will connect to the first `page` target whose URL contains `localhost`.
+▲This MCP server will connect to the currently active tab in the Chrome window.
 
 ### Claude Code configuration
-
-#### Through local project
-
-▲Clone this project to local.
-
-▲Add the server to Claude Code's MCP.
-
-```
-claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist/index.js"
-```
-
-▲Claude Code's config(`~/.claude.json`) will look like this:
-
-```json
-"mcpServers": {
-  "chrome-dev": {
-    "type": "stdio",
-    "command": "node",
-    "args": ["path/to/chrome-dev-mcp/dist/index.js"],
-    "env": {}
-  }
-}
-```
 
 #### Through npm package
 
@@ -129,6 +106,29 @@ claude mcp add --transport stdio chrome-dev -- npx -y chrome-dev-mcp@latest
 },
 ```
 
+#### Through local project
+
+▲Clone this project to local.
+
+▲Add the server to Claude Code's MCP.
+
+```
+claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist/index.js"
+```
+
+▲Claude Code's config(`~/.claude.json`) will look like this:
+
+```json
+"mcpServers": {
+  "chrome-dev": {
+    "type": "stdio",
+    "command": "node",
+    "args": ["path/to/chrome-dev-mcp/dist/index.js"],
+    "env": {}
+  }
+}
+```
+
 ### Validation
 
 ●run `claude mcp list`, and it will print `chrome-dev: xxxxx - ✓ Connected`.
@@ -150,8 +150,8 @@ claude mcp add --transport stdio chrome-dev -- npx -y chrome-dev-mcp@latest
 
 ### Console
 
-| Tool               | Description                                                                                                                                                                                                  |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Tool               | Description                                                                                                                                                                                                                                                                                                                                               |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `get_console_logs` | All messages visible in the DevTools Console — including output that existed before this server connected. Exceptions are reported with their full stack trace (source-mapped when available). Supports filtering by level (`log` / `info` / `debug` / `warning` / `error` / `exception`) and an optional `clear` flag to flush the buffer after reading. |
 
 ### Debugger

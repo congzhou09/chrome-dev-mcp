@@ -7,19 +7,36 @@ let cdpClient: CDP.Client | null = null;
 // Shared promise while a connection attempt is in flight — prevents duplicate attempts.
 let connectingPromise: Promise<CDP.Client | null> | null = null;
 
+async function findActivePageTargetId(): Promise<string | undefined> {
+  const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 })) as Array<{ id: string; type: string }>;
+  const pageTargets = targets.filter((t) => t.type === 'page');
+
+  for (const target of pageTargets) {
+    const tempClient = await CDP({ host: '127.0.0.1', port: 9222, target: target.id }).catch(() => null);
+    if (!tempClient) continue;
+    try {
+      const { result } = await tempClient.Runtime.evaluate({ expression: 'document.visibilityState === "visible"' });
+      if (result.value === true) return target.id;
+    } finally {
+      await tempClient.close().catch(() => {});
+    }
+  }
+
+  return pageTargets[0]?.id;
+}
+
 async function getClient(): Promise<CDP.Client | null> {
   if (cdpClient) return cdpClient;
   if (connectingPromise) return connectingPromise;
 
   connectingPromise = (async () => {
     try {
-      const client = await CDP({
-        host: '127.0.0.1',
-        port: 9222,
-        target: (targets) => {
-          return targets.find((t) => t.type === 'page' && t.url.includes('localhost')) as CDP.Target;
-        },
-      });
+      const targetId = await findActivePageTargetId();
+      if (targetId === undefined) {
+        console.error('[chrome-dev-mcp] No page target found in Chrome');
+        return null;
+      }
+      const client = await CDP({ host: '127.0.0.1', port: 9222, target: targetId });
       await client.Runtime.enable();
       await client.Page.enable();
       cdpClient = client;

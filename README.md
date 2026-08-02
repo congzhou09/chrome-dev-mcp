@@ -2,9 +2,9 @@
 
 [![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp)
 
-●An MCP server for Web Frontend development in Chrome.
+●An MCP server for inspecting and debugging web pages in Chrome, especially useful for web frontend development.
 
-●This project focuses on Chrome runtime debugging.
+●This project focuses on Chrome runtime debugging, supports JS/CSS inspection, console log access, and runtime debugging (breakpoints, stepping, scope variables) in open Chrome tabs.
 
 ## Why This Exists
 
@@ -24,7 +24,9 @@
 
 ## Limitations
 
-■ **Connects to the currently active Chrome tab** (the visible `page` target in the Chrome window). If multiple Chrome windows are open, the first visible tab found is used. Iframes, workers, and service workers are not supported at present.
+■ **Does not track Chrome's active tab automatically.** CDP does not expose a tab-switch event, so switching tabs in Chrome does not change the MCP connection — use `switch_tab` to explicitly reconnect to the tab you want.
+
+■ **Iframes, workers, and service workers are not supported at present.**
 
 ■ **Not designed to run alongside chrome-devtools-mcp**. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
@@ -46,9 +48,7 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug-profile
 
 ▲Verify remote debugging is active by opening http://localhost:9222/json in a browser — it should return a JSON list of debuggable targets.
 
-▲Open the page you want to debug.
-
-▲This MCP server will connect to the currently active tab in the Chrome window.
+▲Open the page you want to debug. The MCP server connects to the active tab at startup. To switch to a different tab later, ask the AI to switch — it will use `list_tabs` and `switch_tab` as needed.
 
 ### Claude Code configuration
 
@@ -134,6 +134,13 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 ●run `claude mcp list`, and it will print `chrome-dev: xxxxx - ✓ Connected`.
 
 ## MCP Tools
+
+### Tab management
+
+| Tool         | Description                                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_tabs`  | List all open Chrome page tabs as `{ targetId: { title, url, active?: true } }` — the currently connected tab is marked with `active: true` |
+| `switch_tab` | Switch the MCP connection to a specific tab by `targetId` (obtained from `list_tabs`)                                                       |
 
 ### Page inspection
 

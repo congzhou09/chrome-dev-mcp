@@ -34,7 +34,11 @@ const NOT_CONNECTED = {
 
 const MAX_CONSOLE_LOGS = 500;
 
-export function createServer(getClient: () => Promise<CDP.Client | null>) {
+export function createServer(
+  getClient: () => Promise<CDP.Client | null>,
+  switchToTarget: (targetId: string) => Promise<CDP.Client | null>,
+  getCurrentTargetId: () => string | null,
+) {
   const debuggerState: DebuggerState = {
     paused: false,
     callFrames: [],
@@ -224,6 +228,55 @@ export function createServer(getClient: () => Promise<CDP.Client | null>) {
     name: pkgInfo.name,
     version: pkgInfo.version,
   });
+
+  // ── Tab management tools ────────────────────────────────────────────────────
+
+  server.registerTool(
+    'list_tabs',
+    {
+      description: 'List all open Chrome page tabs with their targetIds, titles, and URLs. When you are unsure which tab to inspect, call this proactively to discover available tabs, then present the list to the user and ask which one to switch to — do NOT tell the user to switch tabs manually in Chrome.',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 })) as Array<{
+          id: string;
+          type: string;
+          title: string;
+          url: string;
+        }>;
+        const activeId = getCurrentTargetId();
+        const result: Record<string, { title: string; url: string; active?: true }> = {};
+        for (const t of targets.filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'))) {
+          result[t.id] = t.id === activeId
+            ? { title: t.title, url: t.url, active: true }
+            : { title: t.title, url: t.url };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch {
+        return NOT_CONNECTED;
+      }
+    },
+  );
+
+  server.registerTool(
+    'switch_tab',
+    {
+      description: 'Switch the MCP connection to a specific Chrome tab. Use list_tabs first to get available targetIds.',
+      inputSchema: z.object({
+        targetId: z.string().describe('Target ID from list_tabs'),
+      }),
+    },
+    async ({ targetId }) => {
+      const client = await switchToTarget(targetId);
+      if (!client) {
+        return { content: [{ type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` }] };
+      }
+      await ensureDebuggerEvents(client);
+      const result = await client.Runtime.evaluate({ expression: 'document.title + " — " + location.href', returnByValue: true });
+      return { content: [{ type: 'text', text: `Switched to: ${String(result.result.value)}` }] };
+    },
+  );
 
   // ── Page inspection tools ───────────────────────────────────────────────────
 

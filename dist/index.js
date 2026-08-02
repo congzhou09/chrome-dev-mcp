@@ -3,17 +3,18 @@ import CDP from 'chrome-remote-interface';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createServer } from './server.js';
 let cdpClient = null;
+let currentTargetId = null;
 // Shared promise while a connection attempt is in flight — prevents duplicate attempts.
 let connectingPromise = null;
 async function findActivePageTargetId() {
     const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 }));
-    const pageTargets = targets.filter((t) => t.type === 'page');
+    const pageTargets = targets.filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'));
     for (const target of pageTargets) {
         const tempClient = await CDP({ host: '127.0.0.1', port: 9222, target: target.id }).catch(() => null);
         if (!tempClient)
             continue;
         try {
-            const { result } = await tempClient.Runtime.evaluate({ expression: 'document.hasFocus()' });
+            const { result } = await tempClient.Runtime.evaluate({ expression: 'document.visibilityState === "visible"' });
             if (result.value === true)
                 return target.id;
         }
@@ -22,6 +23,22 @@ async function findActivePageTargetId() {
         }
     }
     return pageTargets[0]?.id;
+}
+async function connectToTarget(targetId) {
+    const client = await CDP({ host: '127.0.0.1', port: 9222, target: targetId });
+    await client.Runtime.enable();
+    await client.Page.enable();
+    cdpClient = client;
+    currentTargetId = targetId;
+    console.error('[chrome-dev-mcp] Connected to Chrome');
+    // Cleanup only: clear the reference so the next tool call triggers reconnect.
+    // Debugger state reset happens in server.ts when it detects a new client.
+    client.on('disconnect', () => {
+        cdpClient = null;
+        currentTargetId = null;
+        console.error('[chrome-dev-mcp] Chrome disconnected — will reconnect on next tool call');
+    });
+    return client;
 }
 async function getClient() {
     if (cdpClient)
@@ -35,18 +52,7 @@ async function getClient() {
                 console.error('[chrome-dev-mcp] No page target found in Chrome');
                 return null;
             }
-            const client = await CDP({ host: '127.0.0.1', port: 9222, target: targetId });
-            await client.Runtime.enable();
-            await client.Page.enable();
-            cdpClient = client;
-            console.error('[chrome-dev-mcp] Connected to Chrome');
-            // Cleanup only: clear the reference so the next tool call triggers reconnect.
-            // Debugger state reset happens in server.ts when it detects a new client.
-            client.on('disconnect', () => {
-                cdpClient = null;
-                console.error('[chrome-dev-mcp] Chrome disconnected — will reconnect on next tool call');
-            });
-            return client;
+            return await connectToTarget(targetId);
         }
         catch (e) {
             console.error('[chrome-dev-mcp] Chrome unavailable:', e.message);
@@ -58,9 +64,23 @@ async function getClient() {
     })();
     return connectingPromise;
 }
+async function switchToTarget(targetId) {
+    if (cdpClient) {
+        await cdpClient.close().catch(() => { });
+        cdpClient = null;
+    }
+    connectingPromise = null;
+    try {
+        return await connectToTarget(targetId);
+    }
+    catch (e) {
+        console.error('[chrome-dev-mcp] Failed to switch to target:', e.message);
+        return null;
+    }
+}
 // Start MCP transport before attempting Chrome connection so Claude Code
 // can always reach the server even when Chrome is not yet running.
-const server = createServer(getClient);
+const server = createServer(getClient, switchToTarget, () => currentTargetId);
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error('[chrome-dev-mcp] MCP server ready');

@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type CDP from 'chrome-remote-interface';
+import CDP from 'chrome-remote-interface';
 import { createServer } from './server.js';
 
 function makeMockClient(
@@ -26,12 +26,17 @@ function makeMockClient(
   return Object.assign(new EventEmitter(), {
     Runtime: { enable: vi.fn(), evaluate, getProperties: vi.fn() },
     Page: { enable: vi.fn(), captureScreenshot },
+    Console: { on: vi.fn(), enable: vi.fn().mockResolvedValue({}) },
     Debugger: debugger_,
   }) as unknown as CDP.Client;
 }
 
-async function setupMcpClient(cdpClient: CDP.Client | null) {
-  const server = createServer(async () => cdpClient);
+async function setupMcpClient(
+  cdpClient: CDP.Client | null,
+  switchToTarget: (targetId: string) => Promise<CDP.Client | null> = vi.fn(),
+  getCurrentTargetId: () => string | null = () => null,
+) {
+  const server = createServer(async () => cdpClient, switchToTarget, getCurrentTargetId);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const mcpClient = new Client({ name: 'test', version: '0.0.0' });
@@ -274,6 +279,79 @@ describe('resume_execution', () => {
     await mcpClient.callTool({ name: 'resume_execution', arguments: {} });
 
     expect(resume).toHaveBeenCalled();
+  });
+});
+
+describe('list_tabs', () => {
+  it('returns available tabs filtered by type and excluding devtools://', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce([
+      { id: 'tab-1', type: 'page', title: 'My App', url: 'http://localhost:3000/' },
+      { id: 'tab-2', type: 'page', title: 'About', url: 'http://localhost:3000/about' },
+      { id: 'tab-3', type: 'page', title: 'DevTools', url: 'devtools://devtools/bundled/devtools_app.html' },
+      { id: 'tab-4', type: 'service_worker', title: '', url: 'http://localhost:3000/sw.js' },
+    ]);
+    const mcpClient = await setupMcpClient(null);
+
+    const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
+
+    const parsed = JSON.parse((result.content as any)[0].text);
+    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/' });
+    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
+    expect(parsed['tab-3']).toBeUndefined();
+    expect(parsed['tab-4']).toBeUndefined();
+
+    vi.restoreAllMocks();
+  });
+
+  it('marks the currently connected tab with active: true', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce([
+      { id: 'tab-1', type: 'page', title: 'My App', url: 'http://localhost:3000/' },
+      { id: 'tab-2', type: 'page', title: 'About', url: 'http://localhost:3000/about' },
+    ]);
+    const mcpClient = await setupMcpClient(null, vi.fn(), () => 'tab-1');
+
+    const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
+
+    const parsed = JSON.parse((result.content as any)[0].text);
+    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/', active: true });
+    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
+
+    vi.restoreAllMocks();
+  });
+
+  it('returns not-connected when Chrome is unavailable', async () => {
+    vi.spyOn(CDP, 'List' as any).mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const mcpClient = await setupMcpClient(null);
+
+    const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
+
+    expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+
+    vi.restoreAllMocks();
+  });
+});
+
+describe('switch_tab', () => {
+  it('calls switchToTarget and returns new tab info', async () => {
+    const newClient = makeMockClient(
+      vi.fn().mockResolvedValue({ result: { value: 'My App — http://localhost:3000/' } }),
+    );
+    const switchToTarget = vi.fn().mockResolvedValue(newClient);
+    const mcpClient = await setupMcpClient(null, switchToTarget);
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
+
+    expect(switchToTarget).toHaveBeenCalledWith('tab-1');
+    expect((result.content as any)[0].text).toBe('Switched to: My App — http://localhost:3000/');
+  });
+
+  it('returns error message when target is not found', async () => {
+    const switchToTarget = vi.fn().mockResolvedValue(null);
+    const mcpClient = await setupMcpClient(null, switchToTarget);
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'nonexistent' } });
+
+    expect((result.content as any)[0].text).toMatch(/Failed to connect/);
   });
 });
 

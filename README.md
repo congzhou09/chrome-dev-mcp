@@ -6,6 +6,10 @@
 
 ●This project focuses on Chrome runtime debugging, supports JS/CSS inspection, console log access, and runtime debugging (breakpoints, stepping, scope variables) in open Chrome tabs.
 
+## Demo video
+
+[![Debugging JS](https://github.com/user-attachments/assets/d29339ab-a462-485e-bba9-b8061d941b97)](https://github.com/user-attachments/assets/9d4de615-9b96-4780-ac72-c4097083bf8c)
+
 ## Why This Exists
 
 ●Currently, [chrome-devtools-mcp](https://www.npmjs.com/package/chrome-devtools-mcp) is still focused more on browser automation and inspection than full runtime debugging, though it is clearly moving toward exposing more DevTools capabilities, as described in this [Let your Coding Agent debug your browser session with Chrome DevTools MCP](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session?utm_source=chatgpt.com).

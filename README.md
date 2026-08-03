@@ -8,9 +8,13 @@
 
 ## Demo video
 
-[![Debugging js](https://github.com/user-attachments/assets/d29339ab-a462-485e-bba9-b8061d941b97)](https://github.com/user-attachments/assets/9d4de615-9b96-4780-ac72-c4097083bf8c)
+### Debugging js
 
-[![Inspecting html and css](https://github.com/user-attachments/assets/97695d5e-7a8c-473e-90d7-f3eab0d00a6c)](https://github.com/user-attachments/assets/2b15035b-c144-474a-91e3-71bbb607bf37)
+[![Debugging js](https://github.com/user-attachments/assets/9f1a8066-4e0c-42cb-a95a-1bb58d5bbade)](https://github.com/user-attachments/assets/9d4de615-9b96-4780-ac72-c4097083bf8c)
+
+### Inspecting html and css
+
+[![Inspecting html and css](https://github.com/user-attachments/assets/d0a53c59-d3c8-4671-9387-9330cab952aa)](https://github.com/user-attachments/assets/2b15035b-c144-474a-91e3-71bbb607bf37)
 
 ## Why This Exists
 

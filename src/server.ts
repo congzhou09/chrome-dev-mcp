@@ -553,23 +553,52 @@ export function createServer(
     'set_breakpoint',
     {
       description:
-        'Set a breakpoint at a URL + line number. Supports exact URL match or regex. Returns a breakpointId to use with remove_breakpoint.',
+        'Set a breakpoint by URL (exact or regex) + line number. Returns `{ breakpointId, resolvedLocations }`. `resolvedLocations` may be empty if the script is not loaded yet — the breakpoint will resolve later when Chrome parses it.',
       inputSchema: z.object({
-        url: z.string().describe('Exact script URL, or omit to use urlRegex'),
-        lineNumber: z.number().describe('Line number (1-indexed)'),
-        columnNumber: z.number().optional().describe('Column number (optional)'),
-        condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
-        urlRegex: z.string().optional().describe('URL regex pattern (alternative to exact url)'),
+        url: z
+          .string()
+          .optional()
+          .describe('Exact script URL. Provide this or urlRegex; if both, urlRegex takes precedence.'),
+        lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
+        columnNumber: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe('Column number, 1-indexed (optional)'),
+        condition: z
+          .string()
+          .optional()
+          .describe('JS expression; breakpoint triggers only when truthy'),
+        urlRegex: z
+          .string()
+          .optional()
+          .describe('URL regex pattern. Provide this or url; if both, urlRegex takes precedence.'),
       }),
+      annotations: {
+        title: 'Set breakpoint',
+        idempotentHint: true,
+      },
     },
     async ({ url, lineNumber, columnNumber, condition, urlRegex }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
+      if (!url && !urlRegex) {
+        return {
+          content: [{ type: 'text', text: 'Must provide either url or urlRegex.' }],
+        };
+      }
       await ensureDebuggerEvents(client);
 
-      const params: any = {
+      const params: {
+        lineNumber: number;
+        columnNumber?: number;
+        condition?: string;
+        url?: string;
+        urlRegex?: string;
+      } = {
         lineNumber: lineNumber - 1,
-        ...(columnNumber !== undefined && { columnNumber }),
+        ...(columnNumber !== undefined && { columnNumber: columnNumber - 1 }),
         ...(condition && { condition }),
         ...(urlRegex ? { urlRegex } : { url }),
       };
@@ -594,15 +623,24 @@ export function createServer(
   server.registerTool(
     'remove_breakpoint',
     {
-      description: 'Remove a breakpoint by its ID (obtained from set_breakpoint or list_breakpoints).',
+      description:
+        'Remove a breakpoint by ID. The ID is invalidated; use set_breakpoint to restore (returns a new ID).',
       inputSchema: z.object({ breakpointId: z.string() }),
+      annotations: {
+        title: 'Remove breakpoint',
+        destructiveHint: true,
+        idempotentHint: false,
+      },
     },
     async ({ breakpointId }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       await ensureDebuggerEvents(client);
-      await client.Debugger.removeBreakpoint({ breakpointId });
-      activeBreakpoints.delete(breakpointId);
+      try {
+        await client.Debugger.removeBreakpoint({ breakpointId });
+      } finally {
+        activeBreakpoints.delete(breakpointId);
+      }
       return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     },
   );

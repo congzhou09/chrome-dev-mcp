@@ -354,56 +354,50 @@ export function createServer(
   server.registerTool(
     'get_computed_style',
     {
-      description: 'Get computed style of element',
-      inputSchema: z.object({ selector: z.string() }),
+      description:
+        'Get computed CSS values for the given properties on the element matched by selector.',
+      inputSchema: z.object({
+        selector: z.string().describe('CSS selector for the target element'),
+        properties: z
+          .array(z.string())
+          .min(1)
+          .describe('CSS property names to return (kebab-case or camelCase)'),
+      }),
+      outputSchema: z.object({
+        styles: z.record(z.string(), z.string()),
+      }),
+      annotations: {
+        title: 'Get computed style',
+        readOnlyHint: true,
+      },
     },
-    async ({ selector }) => {
+    async ({ selector, properties }) => {
       const client = await getClient();
-      if (!client) return NOT_CONNECTED;
+      if (!client) return { ...NOT_CONNECTED, isError: true };
       const expression = `
         (() => {
           const el = document.querySelector(${JSON.stringify(selector)});
           if (!el) return null;
           const s = getComputedStyle(el);
-          return {
-            display: s.display,
-            position: s.position,
-            overflow: s.overflow,
-            zIndex: s.zIndex,
-            pointerEvents: s.pointerEvents,
-            opacity: s.opacity,
-            visibility: s.visibility,
-          };
+          const out = {};
+          for (const p of ${JSON.stringify(properties)}) {
+            out[p] = s.getPropertyValue(p) || s[p] || '';
+          }
+          return out;
         })()
       `;
       const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-      return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
-    },
-  );
-
-  server.registerTool(
-    'element_from_point',
-    {
-      description: 'Get actual top element at target position',
-      inputSchema: z.object({ selector: z.string() }),
-    },
-    async ({ selector }) => {
-      const client = await getClient();
-      if (!client) return NOT_CONNECTED;
-      const expression = `
-        (() => {
-          const el = document.querySelector(${JSON.stringify(selector)});
-          if (!el) return null;
-          const rect = el.getBoundingClientRect();
-          const topEl = document.elementFromPoint(rect.left + 5, rect.top + 5);
-          return {
-            target: el.outerHTML,
-            actualTopElement: topEl?.outerHTML,
-          };
-        })()
-      `;
-      const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-      return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
+      if (result.result.value === null) {
+        return {
+          content: [{ type: 'text', text: `No element matches selector: ${selector}` }],
+          isError: true,
+        };
+      }
+      const styles = result.result.value as Record<string, string>;
+      return {
+        content: [{ type: 'text', text: JSON.stringify(styles, null, 2) }],
+        structuredContent: { styles },
+      };
     },
   );
 
@@ -648,8 +642,13 @@ export function createServer(
   server.registerTool(
     'list_breakpoints',
     {
-      description: 'List all breakpoints set in this session.',
+      description:
+        'List breakpoints tracked by this server (set via `set_breakpoint`). Returns `[{ breakpointId, location }]`. Breakpoints set outside this server (DevTools UI, other CDP clients, prior sessions) are not visible — CDP has no API to enumerate them.',
       inputSchema: z.object({}),
+      annotations: {
+        title: 'List breakpoints',
+        readOnlyHint: true,
+      },
     },
     async () => {
       const list = Array.from(activeBreakpoints.entries()).map(([id, label]) => ({

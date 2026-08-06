@@ -272,52 +272,49 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'text', text }] };
     });
     server.registerTool('get_computed_style', {
-        description: 'Get computed style of element',
-        inputSchema: z.object({ selector: z.string() }),
-    }, async ({ selector }) => {
+        description: 'Get computed CSS values for the given properties on the element matched by selector.',
+        inputSchema: z.object({
+            selector: z.string().describe('CSS selector for the target element'),
+            properties: z
+                .array(z.string())
+                .min(1)
+                .describe('CSS property names to return (kebab-case or camelCase)'),
+        }),
+        outputSchema: z.object({
+            styles: z.record(z.string(), z.string()),
+        }),
+        annotations: {
+            title: 'Get computed style',
+            readOnlyHint: true,
+        },
+    }, async ({ selector, properties }) => {
         const client = await getClient();
         if (!client)
-            return NOT_CONNECTED;
+            return { ...NOT_CONNECTED, isError: true };
         const expression = `
         (() => {
           const el = document.querySelector(${JSON.stringify(selector)});
           if (!el) return null;
           const s = getComputedStyle(el);
-          return {
-            display: s.display,
-            position: s.position,
-            overflow: s.overflow,
-            zIndex: s.zIndex,
-            pointerEvents: s.pointerEvents,
-            opacity: s.opacity,
-            visibility: s.visibility,
-          };
+          const out = {};
+          for (const p of ${JSON.stringify(properties)}) {
+            out[p] = s.getPropertyValue(p) || s[p] || '';
+          }
+          return out;
         })()
       `;
         const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-        return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
-    });
-    server.registerTool('element_from_point', {
-        description: 'Get actual top element at target position',
-        inputSchema: z.object({ selector: z.string() }),
-    }, async ({ selector }) => {
-        const client = await getClient();
-        if (!client)
-            return NOT_CONNECTED;
-        const expression = `
-        (() => {
-          const el = document.querySelector(${JSON.stringify(selector)});
-          if (!el) return null;
-          const rect = el.getBoundingClientRect();
-          const topEl = document.elementFromPoint(rect.left + 5, rect.top + 5);
-          return {
-            target: el.outerHTML,
-            actualTopElement: topEl?.outerHTML,
-          };
-        })()
-      `;
-        const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-        return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
+        if (result.result.value === null) {
+            return {
+                content: [{ type: 'text', text: `No element matches selector: ${selector}` }],
+                isError: true,
+            };
+        }
+        const styles = result.result.value;
+        return {
+            content: [{ type: 'text', text: JSON.stringify(styles, null, 2) }],
+            structuredContent: { styles },
+        };
     });
     server.registerTool('screenshot', {
         description: 'Capture screenshot',
@@ -436,22 +433,45 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'text', text: JSON.stringify(variables, null, 2) }] };
     });
     server.registerTool('set_breakpoint', {
-        description: 'Set a breakpoint at a URL + line number. Supports exact URL match or regex. Returns a breakpointId to use with remove_breakpoint.',
+        description: 'Set a breakpoint by URL (exact or regex) + line number. Returns `{ breakpointId, resolvedLocations }`. `resolvedLocations` may be empty if the script is not loaded yet — the breakpoint will resolve later when Chrome parses it.',
         inputSchema: z.object({
-            url: z.string().describe('Exact script URL, or omit to use urlRegex'),
-            lineNumber: z.number().describe('Line number (1-indexed)'),
-            columnNumber: z.number().optional().describe('Column number (optional)'),
-            condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
-            urlRegex: z.string().optional().describe('URL regex pattern (alternative to exact url)'),
+            url: z
+                .string()
+                .optional()
+                .describe('Exact script URL. Provide this or urlRegex; if both, urlRegex takes precedence.'),
+            lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
+            columnNumber: z
+                .number()
+                .int()
+                .min(1)
+                .optional()
+                .describe('Column number, 1-indexed (optional)'),
+            condition: z
+                .string()
+                .optional()
+                .describe('JS expression; breakpoint triggers only when truthy'),
+            urlRegex: z
+                .string()
+                .optional()
+                .describe('URL regex pattern. Provide this or url; if both, urlRegex takes precedence.'),
         }),
+        annotations: {
+            title: 'Set breakpoint',
+            idempotentHint: true,
+        },
     }, async ({ url, lineNumber, columnNumber, condition, urlRegex }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
+        if (!url && !urlRegex) {
+            return {
+                content: [{ type: 'text', text: 'Must provide either url or urlRegex.' }],
+            };
+        }
         await ensureDebuggerEvents(client);
         const params = {
             lineNumber: lineNumber - 1,
-            ...(columnNumber !== undefined && { columnNumber }),
+            ...(columnNumber !== undefined && { columnNumber: columnNumber - 1 }),
             ...(condition && { condition }),
             ...(urlRegex ? { urlRegex } : { url }),
         };
@@ -468,20 +488,33 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         };
     });
     server.registerTool('remove_breakpoint', {
-        description: 'Remove a breakpoint by its ID (obtained from set_breakpoint or list_breakpoints).',
+        description: 'Remove a breakpoint by ID. The ID is invalidated; use set_breakpoint to restore (returns a new ID).',
         inputSchema: z.object({ breakpointId: z.string() }),
+        annotations: {
+            title: 'Remove breakpoint',
+            destructiveHint: true,
+            idempotentHint: false,
+        },
     }, async ({ breakpointId }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
-        await client.Debugger.removeBreakpoint({ breakpointId });
-        activeBreakpoints.delete(breakpointId);
+        try {
+            await client.Debugger.removeBreakpoint({ breakpointId });
+        }
+        finally {
+            activeBreakpoints.delete(breakpointId);
+        }
         return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     });
     server.registerTool('list_breakpoints', {
-        description: 'List all breakpoints set in this session.',
+        description: 'List breakpoints tracked by this server (set via `set_breakpoint`). Returns `[{ breakpointId, location }]`. Breakpoints set outside this server (DevTools UI, other CDP clients, prior sessions) are not visible — CDP has no API to enumerate them.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'List breakpoints',
+            readOnlyHint: true,
+        },
     }, async () => {
         const list = Array.from(activeBreakpoints.entries()).map(([id, label]) => ({
             breakpointId: id,

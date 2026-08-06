@@ -132,46 +132,39 @@ describe('evaluate_js', () => {
 });
 
 describe('get_computed_style', () => {
-  it('returns computed style as JSON text', async () => {
+  it('returns styles in both content text and structuredContent', async () => {
     const style = {
       display: 'flex',
       position: 'relative',
       overflow: 'hidden',
-      zIndex: '1',
-      pointerEvents: 'auto',
-      opacity: '1',
-      visibility: 'visible',
     };
     const evaluate = vi.fn().mockResolvedValue({ result: { value: style } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
-    const result = await client.callTool({ name: 'get_computed_style', arguments: { selector: '#app' } });
+    const result = await client.callTool({
+      name: 'get_computed_style',
+      arguments: { selector: '#app', properties: ['display', 'position', 'overflow'] },
+    });
 
     expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(style, null, 2) }]);
+    expect(result.structuredContent).toEqual({ styles: style });
+    expect(result.isError).toBeFalsy();
   });
 
-  it('returns null when element not found', async () => {
+  it('sets isError with a not-found message when element does not match', async () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { value: null } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
     const result = await client.callTool({
       name: 'get_computed_style',
-      arguments: { selector: '.nonexistent' },
+      arguments: { selector: '.nonexistent', properties: ['display'] },
     });
 
-    expect(result.content).toEqual([{ type: 'text', text: 'null' }]);
-  });
-});
-
-describe('element_from_point', () => {
-  it('returns target and actualTopElement', async () => {
-    const value = { target: "<div id='app'>", actualTopElement: '<span>' };
-    const evaluate = vi.fn().mockResolvedValue({ result: { value } });
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    const result = await client.callTool({ name: 'element_from_point', arguments: { selector: '#app' } });
-
-    expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(value, null, 2) }]);
+    expect(result.content).toEqual([
+      { type: 'text', text: 'No element matches selector: .nonexistent' },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
   });
 });
 

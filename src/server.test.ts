@@ -55,10 +55,11 @@ describe('get_title', () => {
     expect(evaluate).toHaveBeenCalledWith({ expression: 'document.title', returnByValue: true });
   });
 
-  it('returns not-connected message when Chrome is unavailable', async () => {
+  it('returns not-connected message with isError when Chrome is unavailable', async () => {
     const client = await setupMcpClient(null);
     const result = await client.callTool({ name: 'get_title', arguments: {} });
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
   });
 });
 
@@ -312,13 +313,14 @@ describe('list_tabs', () => {
     vi.restoreAllMocks();
   });
 
-  it('returns not-connected when Chrome is unavailable', async () => {
+  it('returns not-connected with isError when Chrome is unavailable', async () => {
     vi.spyOn(CDP, 'List' as any).mockRejectedValueOnce(new Error('ECONNREFUSED'));
     const mcpClient = await setupMcpClient(null);
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
 
     vi.restoreAllMocks();
   });
@@ -374,11 +376,12 @@ describe('get_inspected_element', () => {
     expect((result.content as any)[0].text).toMatch(/window\.\$0 = \$0/);
   });
 
-  it('returns not-connected message when Chrome is unavailable', async () => {
+  it('returns not-connected message with isError when Chrome is unavailable', async () => {
     const mcpClient = await setupMcpClient(null);
 
     const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
 
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
   });
 });

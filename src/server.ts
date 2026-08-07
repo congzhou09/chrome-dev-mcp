@@ -30,6 +30,7 @@ const NOT_CONNECTED = {
       text: 'Chrome is not connected. Launch Chrome with:\n  --remote-debugging-port=9222 --user-data-dir=<path>\nThen try again.',
     },
   ],
+  isError: true,
 };
 
 const MAX_CONSOLE_LOGS = 500;
@@ -364,7 +365,11 @@ export function createServer(
           .describe('CSS property names to return (kebab-case or camelCase)'),
       }),
       outputSchema: z.object({
-        styles: z.record(z.string(), z.string()),
+        styles: z
+          .record(z.string(), z.string())
+          .describe(
+            'Map of property name → computed value. Keys match the input `properties` verbatim (case preserved). Values are `getComputedStyle` output; unknown properties yield empty string.',
+          ),
       }),
       annotations: {
         title: 'Get computed style',
@@ -373,7 +378,7 @@ export function createServer(
     },
     async ({ selector, properties }) => {
       const client = await getClient();
-      if (!client) return { ...NOT_CONNECTED, isError: true };
+      if (!client) return NOT_CONNECTED;
       const expression = `
         (() => {
           const el = document.querySelector(${JSON.stringify(selector)});
@@ -404,8 +409,13 @@ export function createServer(
   server.registerTool(
     'screenshot',
     {
-      description: 'Capture screenshot',
+      description:
+        'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools).',
       inputSchema: z.object({}),
+      annotations: {
+        title: 'Screenshot',
+        readOnlyHint: true,
+      },
     },
     async () => {
       const client = await getClient();

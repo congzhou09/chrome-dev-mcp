@@ -4,10 +4,7 @@ Coordinated pass to move every tool's return contract from
 `content: [{ type: 'text', text: JSON.stringify(...) }]` to the modern MCP
 pattern: `outputSchema` + `structuredContent` + `isError`.
 
-**Do this AFTER the per-tool description/behavior review is complete** —
-migration and review changes overlap (both touch description text and return
-shape), so batching migration once tools are behaviorally sound avoids
-churn.
+~~**Do this AFTER the per-tool description/behavior review is complete**~~ ✓ Both review and migration are done.
 
 Pilot: `get_computed_style` — pattern established at
 [src/server.ts:354-405](src/server.ts#L354-L405). Reference this when
@@ -30,14 +27,14 @@ migrating others.
 ## Tools to migrate
 
 Tools with structured returns (need outputSchema):
-- [ ] `set_breakpoint` → `{ breakpointId, resolvedLocations }`
-- [ ] `list_breakpoints` → wrap array: `{ breakpoints: [...] }`
-- [ ] `get_debugger_state` → complex object; biggest schema
-- [ ] `get_console_logs` → wrap array: `{ logs: [...] }`
-- [ ] `list_tabs` → wrap array: `{ tabs: [...] }`
-- [ ] `switch_tab` → object with tab metadata
-- [ ] `get_scope_variables` → wrap array
-- [ ] `get_inspected_element` → object
+- [x] `set_breakpoint` → `{ breakpointId, resolvedLocations }`
+- [x] `list_breakpoints` → wrap array: `{ breakpoints: [...] }`
+- [x] `get_debugger_state` → complex object; biggest schema
+- [x] `get_console_logs` → wrap array: `{ logs: [...] }`
+- [x] `list_tabs` → wrap array: `{ tabs: [...] }`
+- [x] `switch_tab` → object with tab metadata
+- [x] `get_scope_variables` → wrap array
+- [x] `get_inspected_element` → object
 
 Tools that stay unchanged:
 - `screenshot` — image content, not structured

@@ -288,11 +288,10 @@ describe('list_tabs', () => {
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
-    const parsed = JSON.parse((result.content as any)[0].text);
-    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/' });
-    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
-    expect(parsed['tab-3']).toBeUndefined();
-    expect(parsed['tab-4']).toBeUndefined();
+    const { tabs } = (result.structuredContent as any);
+    expect(tabs).toHaveLength(2);
+    expect(tabs.find((t: any) => t.targetId === 'tab-1')).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/', active: false });
+    expect(tabs.find((t: any) => t.targetId === 'tab-2')).toEqual({ targetId: 'tab-2', title: 'About', url: 'http://localhost:3000/about', active: false });
 
     vi.restoreAllMocks();
   });
@@ -306,9 +305,9 @@ describe('list_tabs', () => {
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
-    const parsed = JSON.parse((result.content as any)[0].text);
-    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/', active: true });
-    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
+    const { tabs } = (result.structuredContent as any);
+    expect(tabs.find((t: any) => t.targetId === 'tab-1')).toMatchObject({ active: true });
+    expect(tabs.find((t: any) => t.targetId === 'tab-2')).toMatchObject({ active: false });
 
     vi.restoreAllMocks();
   });
@@ -329,7 +328,7 @@ describe('list_tabs', () => {
 describe('switch_tab', () => {
   it('calls switchToTarget and returns new tab info', async () => {
     const newClient = makeMockClient(
-      vi.fn().mockResolvedValue({ result: { value: 'My App — http://localhost:3000/' } }),
+      vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
     );
     const switchToTarget = vi.fn().mockResolvedValue(newClient);
     const mcpClient = await setupMcpClient(null, switchToTarget);
@@ -338,6 +337,7 @@ describe('switch_tab', () => {
 
     expect(switchToTarget).toHaveBeenCalledWith('tab-1');
     expect((result.content as any)[0].text).toBe('Switched to: My App — http://localhost:3000/');
+    expect(result.structuredContent).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/' });
   });
 
   it('returns error message when target is not found', async () => {

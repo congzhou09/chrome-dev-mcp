@@ -160,8 +160,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `get_url`               | Current page URL                                                                                               |
 | `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
 | `evaluate_js`           | Run arbitrary JavaScript and return the result                                                                 |
-| `get_computed_style`    | Computed CSS properties for a CSS selector                                                                     |
-| `element_from_point`    | Topmost element at a selector's bounding-box position                                                          |
+| `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
 | `screenshot`            | PNG screenshot of the current viewport                                                                         |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
 

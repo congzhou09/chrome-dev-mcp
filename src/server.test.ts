@@ -55,10 +55,11 @@ describe('get_title', () => {
     expect(evaluate).toHaveBeenCalledWith({ expression: 'document.title', returnByValue: true });
   });
 
-  it('returns not-connected message when Chrome is unavailable', async () => {
+  it('returns not-connected message with isError when Chrome is unavailable', async () => {
     const client = await setupMcpClient(null);
     const result = await client.callTool({ name: 'get_title', arguments: {} });
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
   });
 });
 
@@ -132,46 +133,39 @@ describe('evaluate_js', () => {
 });
 
 describe('get_computed_style', () => {
-  it('returns computed style as JSON text', async () => {
+  it('returns styles in both content text and structuredContent', async () => {
     const style = {
       display: 'flex',
       position: 'relative',
       overflow: 'hidden',
-      zIndex: '1',
-      pointerEvents: 'auto',
-      opacity: '1',
-      visibility: 'visible',
     };
     const evaluate = vi.fn().mockResolvedValue({ result: { value: style } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
-    const result = await client.callTool({ name: 'get_computed_style', arguments: { selector: '#app' } });
+    const result = await client.callTool({
+      name: 'get_computed_style',
+      arguments: { selector: '#app', properties: ['display', 'position', 'overflow'] },
+    });
 
     expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(style, null, 2) }]);
+    expect(result.structuredContent).toEqual({ styles: style });
+    expect(result.isError).toBeFalsy();
   });
 
-  it('returns null when element not found', async () => {
+  it('sets isError with a not-found message when element does not match', async () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { value: null } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
     const result = await client.callTool({
       name: 'get_computed_style',
-      arguments: { selector: '.nonexistent' },
+      arguments: { selector: '.nonexistent', properties: ['display'] },
     });
 
-    expect(result.content).toEqual([{ type: 'text', text: 'null' }]);
-  });
-});
-
-describe('element_from_point', () => {
-  it('returns target and actualTopElement', async () => {
-    const value = { target: "<div id='app'>", actualTopElement: '<span>' };
-    const evaluate = vi.fn().mockResolvedValue({ result: { value } });
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    const result = await client.callTool({ name: 'element_from_point', arguments: { selector: '#app' } });
-
-    expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(value, null, 2) }]);
+    expect(result.content).toEqual([
+      { type: 'text', text: 'No element matches selector: .nonexistent' },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
   });
 });
 
@@ -294,11 +288,10 @@ describe('list_tabs', () => {
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
-    const parsed = JSON.parse((result.content as any)[0].text);
-    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/' });
-    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
-    expect(parsed['tab-3']).toBeUndefined();
-    expect(parsed['tab-4']).toBeUndefined();
+    const { tabs } = (result.structuredContent as any);
+    expect(tabs).toHaveLength(2);
+    expect(tabs.find((t: any) => t.targetId === 'tab-1')).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/', active: false });
+    expect(tabs.find((t: any) => t.targetId === 'tab-2')).toEqual({ targetId: 'tab-2', title: 'About', url: 'http://localhost:3000/about', active: false });
 
     vi.restoreAllMocks();
   });
@@ -312,20 +305,21 @@ describe('list_tabs', () => {
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
-    const parsed = JSON.parse((result.content as any)[0].text);
-    expect(parsed['tab-1']).toEqual({ title: 'My App', url: 'http://localhost:3000/', active: true });
-    expect(parsed['tab-2']).toEqual({ title: 'About', url: 'http://localhost:3000/about' });
+    const { tabs } = (result.structuredContent as any);
+    expect(tabs.find((t: any) => t.targetId === 'tab-1')).toMatchObject({ active: true });
+    expect(tabs.find((t: any) => t.targetId === 'tab-2')).toMatchObject({ active: false });
 
     vi.restoreAllMocks();
   });
 
-  it('returns not-connected when Chrome is unavailable', async () => {
+  it('returns not-connected with isError when Chrome is unavailable', async () => {
     vi.spyOn(CDP, 'List' as any).mockRejectedValueOnce(new Error('ECONNREFUSED'));
     const mcpClient = await setupMcpClient(null);
 
     const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
 
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
 
     vi.restoreAllMocks();
   });
@@ -334,7 +328,7 @@ describe('list_tabs', () => {
 describe('switch_tab', () => {
   it('calls switchToTarget and returns new tab info', async () => {
     const newClient = makeMockClient(
-      vi.fn().mockResolvedValue({ result: { value: 'My App — http://localhost:3000/' } }),
+      vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
     );
     const switchToTarget = vi.fn().mockResolvedValue(newClient);
     const mcpClient = await setupMcpClient(null, switchToTarget);
@@ -343,6 +337,7 @@ describe('switch_tab', () => {
 
     expect(switchToTarget).toHaveBeenCalledWith('tab-1');
     expect((result.content as any)[0].text).toBe('Switched to: My App — http://localhost:3000/');
+    expect(result.structuredContent).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/' });
   });
 
   it('returns error message when target is not found', async () => {
@@ -381,11 +376,12 @@ describe('get_inspected_element', () => {
     expect((result.content as any)[0].text).toMatch(/window\.\$0 = \$0/);
   });
 
-  it('returns not-connected message when Chrome is unavailable', async () => {
+  it('returns not-connected message with isError when Chrome is unavailable', async () => {
     const mcpClient = await setupMcpClient(null);
 
     const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
 
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
   });
 });

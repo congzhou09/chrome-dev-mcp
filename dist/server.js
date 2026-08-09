@@ -10,6 +10,7 @@ const NOT_CONNECTED = {
             text: 'Chrome is not connected. Launch Chrome with:\n  --remote-debugging-port=9222 --user-data-dir=<path>\nThen try again.',
         },
     ],
+    isError: true,
 };
 const MAX_CONSOLE_LOGS = 500;
 export function createServer(getClient, switchToTarget, getCurrentTargetId) {
@@ -186,17 +187,34 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('list_tabs', {
         description: 'List all open Chrome page tabs with their targetIds, titles, and URLs. When you are unsure which tab to inspect, call this proactively to discover available tabs, then present the list to the user and ask which one to switch to — do NOT tell the user to switch tabs manually in Chrome.',
         inputSchema: z.object({}),
+        outputSchema: z.object({
+            tabs: z.array(z.object({
+                targetId: z.string(),
+                title: z.string(),
+                url: z.string(),
+                active: z.boolean().describe('True if this tab is the current MCP target'),
+            })),
+        }),
+        annotations: {
+            title: 'List tabs',
+            readOnlyHint: true,
+        },
     }, async () => {
         try {
             const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 }));
             const activeId = getCurrentTargetId();
-            const result = {};
-            for (const t of targets.filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'))) {
-                result[t.id] = t.id === activeId
-                    ? { title: t.title, url: t.url, active: true }
-                    : { title: t.title, url: t.url };
-            }
-            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+            const tabs = targets
+                .filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'))
+                .map((t) => ({
+                targetId: t.id,
+                title: t.title,
+                url: t.url,
+                active: t.id === activeId,
+            }));
+            return {
+                content: [{ type: 'text', text: JSON.stringify(tabs, null, 2) }],
+                structuredContent: { tabs },
+            };
         }
         catch {
             return NOT_CONNECTED;
@@ -207,19 +225,41 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         inputSchema: z.object({
             targetId: z.string().describe('Target ID from list_tabs'),
         }),
+        outputSchema: z.object({
+            targetId: z.string(),
+            title: z.string(),
+            url: z.string(),
+        }),
+        annotations: {
+            title: 'Switch tab',
+        },
     }, async ({ targetId }) => {
         const client = await switchToTarget(targetId);
         if (!client) {
-            return { content: [{ type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` }] };
+            return {
+                content: [{ type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` }],
+                isError: true,
+            };
         }
         await ensureDebuggerEvents(client);
-        const result = await client.Runtime.evaluate({ expression: 'document.title + " — " + location.href', returnByValue: true });
-        return { content: [{ type: 'text', text: `Switched to: ${String(result.result.value)}` }] };
+        const result = await client.Runtime.evaluate({
+            expression: '({ title: document.title, url: location.href })',
+            returnByValue: true,
+        });
+        const { title, url } = result.result.value;
+        return {
+            content: [{ type: 'text', text: `Switched to: ${title} — ${url}` }],
+            structuredContent: { targetId, title, url },
+        };
     });
     // ── Page inspection tools ───────────────────────────────────────────────────
     server.registerTool('get_title', {
-        description: 'Get current page title',
+        description: 'Get the title of the currently connected tab (`document.title`).',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Get page title',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -228,8 +268,12 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'text', text: String(result.result.value) }] };
     });
     server.registerTool('get_url', {
-        description: 'Get current page url',
+        description: 'Get the URL of the currently connected tab (`location.href`).',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Get page URL',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -238,8 +282,12 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'text', text: String(result.result.value) }] };
     });
     server.registerTool('get_html', {
-        description: 'Get current page html',
+        description: 'Get the full HTML source of the currently connected tab (`document.documentElement.outerHTML`). Truncated to 20 000 characters for large pages.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Get page HTML',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -253,6 +301,9 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('evaluate_js', {
         description: 'Evaluate javascript in page. To access the currently selected element in the Elements panel ($0), use get_inspected_element instead.',
         inputSchema: z.object({ expression: z.string() }),
+        annotations: {
+            title: 'Evaluate JS',
+        },
     }, async ({ expression }) => {
         const client = await getClient();
         if (!client)
@@ -263,7 +314,7 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         });
         if (result.exceptionDetails) {
             const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
-            return { content: [{ type: 'text', text: `Error: ${msg}` }] };
+            return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
         }
         const { value, type, description } = result.result;
         const text = value !== undefined
@@ -272,9 +323,24 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'text', text }] };
     });
     server.registerTool('get_computed_style', {
-        description: 'Get computed style of element',
-        inputSchema: z.object({ selector: z.string() }),
-    }, async ({ selector }) => {
+        description: 'Get computed CSS values for the given properties on the element matched by selector.',
+        inputSchema: z.object({
+            selector: z.string().describe('CSS selector for the target element'),
+            properties: z
+                .array(z.string())
+                .min(1)
+                .describe('CSS property names to return (kebab-case or camelCase)'),
+        }),
+        outputSchema: z.object({
+            styles: z
+                .record(z.string(), z.string())
+                .describe('Map of property name → computed value. Keys match the input `properties` verbatim (case preserved). Values are `getComputedStyle` output; unknown properties yield empty string.'),
+        }),
+        annotations: {
+            title: 'Get computed style',
+            readOnlyHint: true,
+        },
+    }, async ({ selector, properties }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
@@ -283,45 +349,33 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
           const el = document.querySelector(${JSON.stringify(selector)});
           if (!el) return null;
           const s = getComputedStyle(el);
-          return {
-            display: s.display,
-            position: s.position,
-            overflow: s.overflow,
-            zIndex: s.zIndex,
-            pointerEvents: s.pointerEvents,
-            opacity: s.opacity,
-            visibility: s.visibility,
-          };
+          const out = {};
+          for (const p of ${JSON.stringify(properties)}) {
+            out[p] = s.getPropertyValue(p) || s[p] || '';
+          }
+          return out;
         })()
       `;
         const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-        return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
-    });
-    server.registerTool('element_from_point', {
-        description: 'Get actual top element at target position',
-        inputSchema: z.object({ selector: z.string() }),
-    }, async ({ selector }) => {
-        const client = await getClient();
-        if (!client)
-            return NOT_CONNECTED;
-        const expression = `
-        (() => {
-          const el = document.querySelector(${JSON.stringify(selector)});
-          if (!el) return null;
-          const rect = el.getBoundingClientRect();
-          const topEl = document.elementFromPoint(rect.left + 5, rect.top + 5);
-          return {
-            target: el.outerHTML,
-            actualTopElement: topEl?.outerHTML,
-          };
-        })()
-      `;
-        const result = await client.Runtime.evaluate({ expression, returnByValue: true });
-        return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
+        if (result.result.value === null) {
+            return {
+                content: [{ type: 'text', text: `No element matches selector: ${selector}` }],
+                isError: true,
+            };
+        }
+        const styles = result.result.value;
+        return {
+            content: [{ type: 'text', text: JSON.stringify(styles, null, 2) }],
+            structuredContent: { styles },
+        };
     });
     server.registerTool('screenshot', {
-        description: 'Capture screenshot',
+        description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools).',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Screenshot',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -330,8 +384,19 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
     });
     server.registerTool('get_inspected_element', {
-        description: 'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console. Returns tag, id, classes, attributes, and outerHTML.',
+        description: 'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console.',
         inputSchema: z.object({}),
+        outputSchema: z.object({
+            tagName: z.string(),
+            id: z.string().optional(),
+            className: z.string().optional(),
+            attributes: z.record(z.string(), z.string()),
+            outerHTML: z.string().describe('First 5000 characters of element outerHTML'),
+        }),
+        annotations: {
+            title: 'Get inspected element',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -357,34 +422,62 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         if (result.result.value === null) {
             return {
                 content: [{ type: 'text', text: 'No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.' }],
+                isError: true,
             };
         }
-        return { content: [{ type: 'text', text: JSON.stringify(result.result.value, null, 2) }] };
+        const el = result.result.value;
+        return {
+            content: [{ type: 'text', text: JSON.stringify(el, null, 2) }],
+            structuredContent: el,
+        };
     });
     // ── Debugger tools ──────────────────────────────────────────────────────────
     server.registerTool('get_debugger_state', {
         description: 'Get current debugger state: whether execution is paused, the pause reason, hit breakpoints, and the full call stack with file/line info.',
         inputSchema: z.object({}),
+        outputSchema: z.object({
+            paused: z.boolean(),
+            reason: z.string().optional().describe('Pause reason (e.g. "breakpoint", "exception"). Present only when paused.'),
+            hitBreakpoints: z.array(z.string()).optional().describe('IDs of breakpoints hit. Present only when paused.'),
+            callStack: z
+                .array(z.object({
+                index: z.number(),
+                functionName: z.string(),
+                url: z.string(),
+                lineNumber: z.number(),
+                columnNumber: z.number(),
+                compiledUrl: z.string().optional(),
+                compiledLine: z.number().optional(),
+                scopeTypes: z.array(z.string()),
+            }))
+                .optional()
+                .describe('Source-mapped positions when available. Present only when paused.'),
+        }),
+        annotations: {
+            title: 'Get debugger state',
+            readOnlyHint: true,
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: JSON.stringify({ paused: false }, null, 2) }] };
+            return {
+                content: [{ type: 'text', text: JSON.stringify({ paused: false }, null, 2) }],
+                structuredContent: { paused: false },
+            };
         }
+        const callStack = await formatCallStack();
+        const state = {
+            paused: true,
+            reason: debuggerState.pauseReason,
+            hitBreakpoints: debuggerState.hitBreakpoints,
+            callStack,
+        };
         return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({
-                        paused: true,
-                        reason: debuggerState.pauseReason,
-                        hitBreakpoints: debuggerState.hitBreakpoints,
-                        callStack: await formatCallStack(),
-                    }, null, 2),
-                },
-            ],
+            content: [{ type: 'text', text: JSON.stringify(state, null, 2) }],
+            structuredContent: state,
         };
     });
     server.registerTool('get_scope_variables', {
@@ -396,28 +489,36 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
                 .default('local')
                 .describe('Scope type to inspect'),
         }),
+        outputSchema: z.object({
+            variables: z.array(z.object({
+                name: z.string(),
+                type: z.string().optional(),
+                value: z.unknown().optional(),
+                preview: z.string().optional(),
+            })),
+        }),
+        annotations: {
+            title: 'Get scope variables',
+            readOnlyHint: true,
+        },
     }, async ({ frameIndex, scopeType }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+            return { content: [{ type: 'text', text: 'Debugger is not paused.' }], isError: true };
         }
         const frame = debuggerState.callFrames[frameIndex];
         if (!frame) {
-            return { content: [{ type: 'text', text: `No call frame at index ${frameIndex}.` }] };
+            return { content: [{ type: 'text', text: `No call frame at index ${frameIndex}.` }], isError: true };
         }
         const scope = (frame.scopeChain ?? []).find((s) => s.type === scopeType);
         if (!scope) {
             const available = (frame.scopeChain ?? []).map((s) => s.type).join(', ');
             return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `No "${scopeType}" scope in frame ${frameIndex}. Available: ${available}`,
-                    },
-                ],
+                content: [{ type: 'text', text: `No "${scopeType}" scope in frame ${frameIndex}. Available: ${available}` }],
+                isError: true,
             };
         }
         const props = await client.Runtime.getProperties({
@@ -433,65 +534,124 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
             value: p.value?.value ?? p.value?.description,
             preview: p.value?.preview?.description,
         }));
-        return { content: [{ type: 'text', text: JSON.stringify(variables, null, 2) }] };
+        return {
+            content: [{ type: 'text', text: JSON.stringify(variables, null, 2) }],
+            structuredContent: { variables },
+        };
     });
     server.registerTool('set_breakpoint', {
-        description: 'Set a breakpoint at a URL + line number. Supports exact URL match or regex. Returns a breakpointId to use with remove_breakpoint.',
+        description: 'Set a breakpoint by URL (exact or regex) + line number.',
         inputSchema: z.object({
-            url: z.string().describe('Exact script URL, or omit to use urlRegex'),
-            lineNumber: z.number().describe('Line number (1-indexed)'),
-            columnNumber: z.number().optional().describe('Column number (optional)'),
-            condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
-            urlRegex: z.string().optional().describe('URL regex pattern (alternative to exact url)'),
+            url: z
+                .string()
+                .optional()
+                .describe('Exact script URL. Provide this or urlRegex; if both, urlRegex takes precedence.'),
+            lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
+            columnNumber: z
+                .number()
+                .int()
+                .min(1)
+                .optional()
+                .describe('Column number, 1-indexed (optional)'),
+            condition: z
+                .string()
+                .optional()
+                .describe('JS expression; breakpoint triggers only when truthy'),
+            urlRegex: z
+                .string()
+                .optional()
+                .describe('URL regex pattern. Provide this or url; if both, urlRegex takes precedence.'),
         }),
+        outputSchema: z.object({
+            breakpointId: z.string(),
+            resolvedLocations: z
+                .array(z.object({
+                scriptId: z.string(),
+                lineNumber: z.number(),
+                columnNumber: z.number().optional(),
+            }))
+                .describe('May be empty if the script is not loaded yet; the breakpoint will bind automatically when Chrome parses the script'),
+        }),
+        annotations: {
+            title: 'Set breakpoint',
+            idempotentHint: true,
+        },
     }, async ({ url, lineNumber, columnNumber, condition, urlRegex }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
+        if (!url && !urlRegex) {
+            return {
+                content: [{ type: 'text', text: 'Must provide either url or urlRegex.' }],
+                isError: true,
+            };
+        }
         await ensureDebuggerEvents(client);
         const params = {
             lineNumber: lineNumber - 1,
-            ...(columnNumber !== undefined && { columnNumber }),
+            ...(columnNumber !== undefined && { columnNumber: columnNumber - 1 }),
             ...(condition && { condition }),
             ...(urlRegex ? { urlRegex } : { url }),
         };
         const result = await client.Debugger.setBreakpointByUrl(params);
         const label = `${urlRegex ?? url}:${lineNumber}`;
         activeBreakpoints.set(result.breakpointId, label);
+        const data = { breakpointId: result.breakpointId, resolvedLocations: result.locations };
         return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({ breakpointId: result.breakpointId, resolvedLocations: result.locations }, null, 2),
-                },
-            ],
+            content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+            structuredContent: data,
         };
     });
     server.registerTool('remove_breakpoint', {
-        description: 'Remove a breakpoint by its ID (obtained from set_breakpoint or list_breakpoints).',
+        description: 'Remove a breakpoint by ID. The ID is invalidated; use set_breakpoint to restore (returns a new ID).',
         inputSchema: z.object({ breakpointId: z.string() }),
+        annotations: {
+            title: 'Remove breakpoint',
+            destructiveHint: true,
+            idempotentHint: false,
+        },
     }, async ({ breakpointId }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
-        await client.Debugger.removeBreakpoint({ breakpointId });
-        activeBreakpoints.delete(breakpointId);
+        try {
+            await client.Debugger.removeBreakpoint({ breakpointId });
+        }
+        finally {
+            activeBreakpoints.delete(breakpointId);
+        }
         return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     });
     server.registerTool('list_breakpoints', {
-        description: 'List all breakpoints set in this session.',
+        description: 'List breakpoints tracked by this server (set via `set_breakpoint`). Breakpoints set outside this server (DevTools UI, other CDP clients, prior sessions) are not visible — CDP has no API to enumerate them.',
         inputSchema: z.object({}),
+        outputSchema: z.object({
+            breakpoints: z.array(z.object({
+                breakpointId: z.string(),
+                location: z.string().describe('Human-readable "url:line" label'),
+            })),
+        }),
+        annotations: {
+            title: 'List breakpoints',
+            readOnlyHint: true,
+        },
     }, async () => {
-        const list = Array.from(activeBreakpoints.entries()).map(([id, label]) => ({
+        const breakpoints = Array.from(activeBreakpoints.entries()).map(([id, label]) => ({
             breakpointId: id,
             location: label,
         }));
-        return { content: [{ type: 'text', text: JSON.stringify(list, null, 2) }] };
+        return {
+            content: [{ type: 'text', text: JSON.stringify(breakpoints, null, 2) }],
+            structuredContent: { breakpoints },
+        };
     });
     server.registerTool('pause_execution', {
         description: 'Pause JavaScript execution immediately. After pausing, use get_debugger_state to inspect the call stack.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Pause execution',
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -507,6 +667,9 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('resume_execution', {
         description: 'Resume JavaScript execution after a breakpoint or pause.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Resume execution',
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
@@ -518,13 +681,16 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('step_over', {
         description: 'Execute the current line and pause at the next line (does not enter function calls). Returns the new call stack position.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Step over',
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }] };
+            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
         }
         const pausePromise = waitForNextPause(client);
         await client.Debugger.stepOver({});
@@ -546,13 +712,16 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('step_into', {
         description: 'Step into the function call on the current line. Returns the new call stack position.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Step into',
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }] };
+            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
         }
         const pausePromise = waitForNextPause(client);
         await client.Debugger.stepInto({});
@@ -575,17 +744,20 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
             expression: z.string().describe('JS expression to evaluate'),
             frameIndex: z.number().default(0).describe('Call frame index (0 = top frame); use get_debugger_state to find available frames'),
         }),
+        annotations: {
+            title: 'Evaluate at frame',
+        },
     }, async ({ expression, frameIndex }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }] };
+            return { content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }], isError: true };
         }
         const frame = debuggerState.callFrames[frameIndex];
         if (!frame) {
-            return { content: [{ type: 'text', text: `No call frame at index ${frameIndex}.` }] };
+            return { content: [{ type: 'text', text: `No call frame at index ${frameIndex}.` }], isError: true };
         }
         const result = await client.Debugger.evaluateOnCallFrame({
             callFrameId: frame.callFrameId,
@@ -595,7 +767,7 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         });
         if (result.exceptionDetails) {
             const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
-            return { content: [{ type: 'text', text: `Error: ${msg}` }] };
+            return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
         }
         const r = result.result;
         let text;
@@ -616,13 +788,16 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     server.registerTool('step_out', {
         description: 'Step out of the current function and pause at the caller. Returns the new call stack position.',
         inputSchema: z.object({}),
+        annotations: {
+            title: 'Step out',
+        },
     }, async () => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
         if (!debuggerState.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }] };
+            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
         }
         const pausePromise = waitForNextPause(client);
         await client.Debugger.stepOut();
@@ -662,21 +837,40 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
                 .default(false)
                 .describe('Clear the buffer after returning entries'),
         }),
+        outputSchema: z.object({
+            logs: z.array(z.object({
+                timestamp: z.string(),
+                type: z.string(),
+                text: z.string(),
+                stackTrace: z
+                    .array(z.object({
+                    functionName: z.string(),
+                    url: z.string(),
+                    lineNumber: z.number(),
+                    columnNumber: z.number(),
+                }))
+                    .optional(),
+            })),
+        }),
+        annotations: {
+            title: 'Get console logs',
+            readOnlyHint: true,
+        },
     }, async ({ limit, level, clear }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         await ensureDebuggerEvents(client);
-        const filtered = level
-            ? consoleLogs.filter((e) => e.type === level)
-            : consoleLogs;
-        const entries = filtered.slice(-limit);
+        const filtered = level ? consoleLogs.filter((e) => e.type === level) : consoleLogs;
+        const logs = filtered.slice(-limit);
         if (clear)
             consoleLogs.length = 0;
-        if (entries.length === 0) {
-            return { content: [{ type: 'text', text: 'No console entries captured yet.' }] };
-        }
-        return { content: [{ type: 'text', text: JSON.stringify(entries, null, 2) }] };
+        return {
+            content: logs.length === 0
+                ? [{ type: 'text', text: 'No console entries captured yet.' }]
+                : [{ type: 'text', text: JSON.stringify(logs, null, 2) }],
+            structuredContent: { logs },
+        };
     });
     return server;
 }

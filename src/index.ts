@@ -8,8 +8,16 @@ let currentTargetId: string | null = null;
 // Shared promise while a connection attempt is in flight — prevents duplicate attempts.
 let connectingPromise: Promise<CDP.Client | null> | null = null;
 
+// Created up here (not next to server.connect below) because connectToTarget needs
+// attachNetwork, and connectToTarget can run before the transport is wired up.
+const { server, attachNetwork } = createServer(getClient, switchToTarget, () => currentTargetId);
+
 async function findActivePageTargetId(): Promise<string | undefined> {
-  const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 })) as Array<{ id: string; type: string; url: string }>;
+  const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 })) as Array<{
+    id: string;
+    type: string;
+    url: string;
+  }>;
   const pageTargets = targets.filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'));
 
   for (const target of pageTargets) {
@@ -30,12 +38,18 @@ async function connectToTarget(targetId: string): Promise<CDP.Client> {
   const client = await CDP({ host: '127.0.0.1', port: 9222, target: targetId });
   await client.Runtime.enable();
   await client.Page.enable();
+
+  // Eager attach: Network.enable() does not replay history, so capture has to start at
+  // connect time rather than on the first tool call. Cheap and side-effect-free, unlike
+  // Debugger.enable() — which is why that one stays lazy. Never rejects.
+  await attachNetwork(client);
+
   cdpClient = client;
   currentTargetId = targetId;
   console.error('[chrome-dev-mcp] Connected to Chrome');
 
   // Cleanup only: clear the reference so the next tool call triggers reconnect.
-  // Debugger state reset happens in server.ts when it detects a new client.
+  // Debugger and network state reset happens in server.ts when it detects a new client.
   client.on('disconnect', () => {
     cdpClient = null;
     currentTargetId = null;
@@ -84,7 +98,6 @@ async function switchToTarget(targetId: string): Promise<CDP.Client | null> {
 
 // Start MCP transport before attempting Chrome connection so Claude Code
 // can always reach the server even when Chrome is not yet running.
-const server = createServer(getClient, switchToTarget, () => currentTargetId);
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error('[chrome-dev-mcp] MCP server ready');

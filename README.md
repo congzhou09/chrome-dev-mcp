@@ -186,6 +186,24 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `step_into`           | Step into the function call on the current line; returns updated call stack                                         |
 | `step_out`            | Step out of the current function back to the caller; returns updated call stack                                     |
 
+### Network
+
+| Tool                        | Description                                                                                                                                                                                                                                                                                                                                                                            |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_network_requests`      | HTTP requests captured from the connected tab — method, URL, resource type, status, transferred size, duration, initiator, and failure reason. Redirects appear as one record per hop. Filter by URL substring, resource type, or status class (`2xx` / `3xx` / `4xx` / `5xx` / `failed` / `pending`); `includeHeaders` adds request/response headers, `clear` flushes the buffer. |
+| `get_network_response_body` | Response body for one `requestId` from `get_network_requests`. Fetched from Chrome on demand — never buffered by this server. Binary bodies are reported as metadata only.                                                                                                                                                                                                             |
+
+Unlike `get_console_logs`, network capture is **not** retroactive: `Network.enable()` has no
+history replay, so capture begins when this server connects to the tab and nothing before
+that is visible. Reload the page to collect its requests.
+
+Requests belonging to a previous page are pruned on navigation, mirroring the DevTools
+Network panel default — the new document's own request is kept. WebSocket frames are not
+captured.
+
+Response bodies live in Chrome's own buffer (100 MB total / 10 MB per resource here), which
+it clears on navigation, so fetch a body while the page is still up.
+
 ## Typical debugging workflow
 
 ◆Bring Chrome to the desired state manually — navigate to a specific route, trigger a flow, or pause at a breakpoint.

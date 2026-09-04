@@ -23,6 +23,36 @@ interface ConsoleEntry {
   }>;
 }
 
+// One record per redirect hop. Chrome reuses a single requestId across a redirect
+// chain, so `requestId` is NOT unique in the buffer — `hop` disambiguates.
+interface NetworkRecord {
+  requestId: string;
+  // Which document load this request belongs to. Used to prune the previous
+  // page's requests on navigation while keeping the new document's own request,
+  // which Chrome reports BEFORE it reports the navigation.
+  loaderId: string;
+  hop: number;
+  method: string;
+  url: string;
+  resourceType: string;
+  requestHeaders: Record<string, string>;
+  initiator: string;
+  startedAt: string;
+  // Monotonic CDP timestamp (seconds); only used to compute durationMs.
+  startMono: number;
+  state: 'pending' | 'complete' | 'failed' | 'redirect';
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  responseHeaders?: Record<string, string>;
+  fromCache?: boolean;
+  redirectedTo?: string;
+  size?: number;
+  durationMs?: number;
+  errorText?: string;
+  canceled?: boolean;
+}
+
 const NOT_CONNECTED = {
   content: [
     {
@@ -34,6 +64,114 @@ const NOT_CONNECTED = {
 };
 
 const MAX_CONSOLE_LOGS = 500;
+
+// Network traffic is far denser than console output — a single page load is routinely
+// 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
+// as the zod `.max()` on `limit`: 1000 records would be ~60-100k tokens in one response.
+const MAX_NETWORK_REQUESTS = 1000; // circular buffer depth
+const MAX_NETWORK_REQUESTS_PER_CALL = 200; // per-response cap — context budget, not buffer depth
+
+// Chrome returns the same "No resource with given identifier found" error for an unknown
+// requestId and for a body it has already discarded, so the error alone cannot tell them
+// apart. These ids are the tombstone that makes the distinction possible: an id in here was
+// really captured, so a failed body fetch means "discarded", not "never existed".
+const MAX_DISCARDED_REQUEST_IDS = 2000;
+
+const MAX_URL_LENGTH = 512;
+const MAX_RESPONSE_BODY_LENGTH = 50_000;
+
+// Chrome retains response bodies in the renderer subject to these limits, and
+// Network.getResponseBody can only read what is still retained. Generous values buy a
+// wider window for on-demand body fetches; the memory cost lands in Chrome, not here.
+const NETWORK_MAX_TOTAL_BUFFER_SIZE = 100 * 1024 * 1024;
+const NETWORK_MAX_RESOURCE_BUFFER_SIZE = 10 * 1024 * 1024;
+
+// Accepts any casing while keeping the exact enum in the advertised JSON Schema.
+// A bare z.enum() rejects "xhr" during input validation — before any handler runs — and
+// `XHR` being the only all-caps member of the CDP enum makes that a likely stumble.
+const caseInsensitiveEnum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.preprocess(
+    (v) => (typeof v === 'string' ? (values.find((x) => x.toLowerCase() === v.toLowerCase()) ?? v) : v),
+    z.enum(values),
+  );
+
+// CDP Network.ResourceType, verbatim.
+const RESOURCE_TYPES = [
+  'Document',
+  'Stylesheet',
+  'Image',
+  'Media',
+  'Font',
+  'Script',
+  'TextTrack',
+  'XHR',
+  'Fetch',
+  'Prefetch',
+  'EventSource',
+  'WebSocket',
+  'Manifest',
+  'SignedExchange',
+  'Ping',
+  'CSPViolationReport',
+  'Preflight',
+  'Other',
+] as const;
+
+// Long URLs are collapsed rather than silently cut: a truncated URL buried in a JSON
+// record would otherwise be reported or re-fetched as if it were complete.
+const formatUrl = (url: string): string => {
+  if (url.startsWith('data:')) {
+    return `${url.slice(0, 64)}… (data URI, ${url.length} chars)`;
+  }
+  if (url.length > MAX_URL_LENGTH) {
+    return `${url.slice(0, MAX_URL_LENGTH)}… (+${url.length - MAX_URL_LENGTH} chars)`;
+  }
+  return url;
+};
+
+// Flattened to a single line at capture time so the CDP handlers stay synchronous.
+// Positions are compiled positions — not source-mapped.
+const formatInitiator = (initiator: any): string => {
+  if (!initiator) return 'unknown';
+  const type = initiator.type ?? 'unknown';
+  const frame = initiator.stack?.callFrames?.[0];
+  if (frame?.url) {
+    return `${type} ${frame.url}:${(frame.lineNumber ?? 0) + 1}`.slice(0, 200);
+  }
+  if (initiator.url) {
+    const line = initiator.lineNumber != null ? `:${initiator.lineNumber + 1}` : '';
+    return `${type} ${initiator.url}${line}`.slice(0, 200);
+  }
+  return type;
+};
+
+const headersToObject = (headers: any): Record<string, string> => {
+  if (!headers || typeof headers !== 'object') return {};
+  return { ...headers } as Record<string, string>;
+};
+
+// Projection for tool output. Every conditional field is omitted (not null) when absent,
+// which is why the matching zod outputSchema marks them `.optional()`.
+const toOutputRecord = (r: NetworkRecord, includeHeaders: boolean) => ({
+  requestId: r.requestId,
+  method: r.method,
+  url: formatUrl(r.url),
+  resourceType: r.resourceType,
+  state: r.state,
+  initiator: r.initiator,
+  startedAt: r.startedAt,
+  ...(r.hop > 0 ? { hop: r.hop } : {}),
+  ...(r.status != null ? { status: r.status } : {}),
+  ...(r.statusText ? { statusText: r.statusText } : {}),
+  ...(r.mimeType ? { mimeType: r.mimeType } : {}),
+  ...(r.size != null ? { size: r.size } : {}),
+  ...(r.durationMs != null ? { durationMs: r.durationMs } : {}),
+  ...(r.fromCache ? { fromCache: true } : {}),
+  ...(r.redirectedTo ? { redirectedTo: formatUrl(r.redirectedTo) } : {}),
+  ...(r.errorText ? { errorText: r.errorText } : {}),
+  ...(r.canceled ? { canceled: true } : {}),
+  ...(includeHeaders ? { requestHeaders: r.requestHeaders, responseHeaders: r.responseHeaders ?? {} } : {}),
+});
 
 export function createServer(
   getClient: () => Promise<CDP.Client | null>,
@@ -58,16 +196,33 @@ export function createServer(
   // Circular buffer for console messages and uncaught exceptions.
   const consoleLogs: ConsoleEntry[] = [];
 
+  // ── Network capture state ───────────────────────────────────────────────────
+  // Owned exclusively by ensureNetworkEvents / resetNetworkCapture below.
+  // Reset through resetNetworkCapture() only — never from ensureDebuggerEvents.
+  const networkRequests: NetworkRecord[] = []; // chronological, circular
+  const networkByRequestId = new Map<string, NetworkRecord>(); // requestId → current hop
+  const discardedRequestIds = new Set<string>();
+
   // Track which client the event listeners are registered on.
   // When getClient() returns a different instance (reconnect), we re-register
   // and reset stale debugger state — this is the "reconnect cleanup" point.
   let registeredOnClient: CDP.Client | null = null;
+
+  // Network has its OWN identity flag because it attaches eagerly at connect time
+  // (see ensureNetworkEvents), while the Debugger/Console listeners stay lazy.
+  let networkRegisteredOnClient: CDP.Client | null = null;
+  let networkAttachInFlight: Promise<void> = Promise.resolve();
 
   const ensureDebuggerEvents = async (client: CDP.Client): Promise<void> => {
     if (registeredOnClient === client) return;
     registeredOnClient = client;
 
     // Reset stale state from the previous Chrome session.
+    //
+    // Do NOT add the network buffer here. This function runs lazily on the first
+    // debugger/console tool call, which can be minutes after connect — clearing the
+    // network buffer at that point would discard everything captured since connect.
+    // Network capture has its own reset in resetNetworkCapture().
     debuggerState.paused = false;
     debuggerState.callFrames = [];
     debuggerState.pauseReason = '';
@@ -86,9 +241,7 @@ export function createServer(
         stackTrace.callFrames.map(async (frame: any) => {
           const line0: number = frame.lineNumber ?? 0;
           const col: number = frame.columnNumber ?? 0;
-          const orig = frame.scriptId
-            ? await resolveOriginalPosition(frame.scriptId, line0, col)
-            : null;
+          const orig = frame.scriptId ? await resolveOriginalPosition(frame.scriptId, line0, col) : null;
           return {
             functionName: frame.functionName || '(anonymous)',
             url: orig?.source ?? frame.url ?? '',
@@ -107,11 +260,8 @@ export function createServer(
     // source === 'javascript' + level === 'error' → uncaught exception (not a console.error call).
     client.Console.on('messageAdded', async (event: any) => {
       const msg = event.message;
-      const type: string =
-        msg.source === 'javascript' && msg.level === 'error' ? 'exception' : (msg.level as string);
-      const stackTrace = msg.stackTrace
-        ? await formatStackTrace(msg.stackTrace)
-        : undefined;
+      const type: string = msg.source === 'javascript' && msg.level === 'error' ? 'exception' : (msg.level as string);
+      const stackTrace = msg.stackTrace ? await formatStackTrace(msg.stackTrace) : undefined;
       consoleLogs.push({
         timestamp: new Date().toISOString(),
         type,
@@ -154,12 +304,163 @@ export function createServer(
     // (if execution is already stopped) is caught and updates debuggerState.
     const initialPauseSettled = new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 200);
-      (client as any).once('Debugger.paused', () => { clearTimeout(timer); resolve(); });
+      (client as any).once('Debugger.paused', () => {
+        clearTimeout(timer);
+        resolve();
+      });
     });
 
     // First-ever enable for this client — Chrome fires 'paused' here if already stopped.
     await client.Debugger.enable({});
     await initialPauseSettled;
+  };
+
+  // ── Network capture ─────────────────────────────────────────────────────────
+
+  const resetNetworkCapture = (): void => {
+    networkRequests.length = 0;
+    networkByRequestId.clear();
+    discardedRequestIds.clear();
+  };
+
+  // Remember that this id was captured but its data is gone, so a later body fetch can
+  // say "discarded" instead of "unknown id" — Chrome's error is identical for both.
+  const noteDiscarded = (requestId: string): void => {
+    discardedRequestIds.add(requestId);
+    if (discardedRequestIds.size > MAX_DISCARDED_REQUEST_IDS) {
+      // Set iterates in insertion order, so this drops the oldest.
+      discardedRequestIds.delete(discardedRequestIds.values().next().value as string);
+    }
+  };
+
+  const pushNetworkRecord = (record: NetworkRecord): void => {
+    networkRequests.push(record);
+    networkByRequestId.set(record.requestId, record);
+    if (networkRequests.length > MAX_NETWORK_REQUESTS) {
+      const dropped = networkRequests.shift()!;
+      // Only orphan the map entry if this record was still the current hop.
+      if (networkByRequestId.get(dropped.requestId) === dropped) {
+        networkByRequestId.delete(dropped.requestId);
+      }
+      noteDiscarded(dropped.requestId);
+    }
+  };
+
+  // All handlers here are intentionally synchronous — no source-map resolution, no body
+  // fetches. Anything async would race with the events that follow it.
+  const attachNetworkTo = async (client: CDP.Client): Promise<void> => {
+    resetNetworkCapture();
+
+    client.Network.on('requestWillBeSent', (event: any) => {
+      const prev = networkByRequestId.get(event.requestId);
+
+      // A redirect re-fires requestWillBeSent with the SAME requestId, carrying the
+      // response of the PREVIOUS hop. Close that hop out and start a new record.
+      if (event.redirectResponse && prev) {
+        prev.state = 'redirect';
+        prev.status = event.redirectResponse.status;
+        prev.statusText = event.redirectResponse.statusText || undefined;
+        prev.mimeType = event.redirectResponse.mimeType || undefined;
+        prev.responseHeaders = headersToObject(event.redirectResponse.headers);
+        prev.redirectedTo =
+          event.redirectResponse.headers?.location ?? event.redirectResponse.headers?.Location ?? event.documentURL;
+        prev.durationMs = Number(((event.timestamp - prev.startMono) * 1000).toFixed(1));
+      }
+
+      pushNetworkRecord({
+        requestId: event.requestId,
+        loaderId: event.loaderId,
+        hop: event.redirectResponse && prev ? prev.hop + 1 : 0,
+        method: event.request?.method ?? 'GET',
+        url: event.request?.url ?? '',
+        resourceType: event.type ?? 'Other',
+        requestHeaders: headersToObject(event.request?.headers),
+        initiator: formatInitiator(event.initiator),
+        startedAt: new Date((event.wallTime ?? Date.now() / 1000) * 1000).toISOString(),
+        startMono: event.timestamp,
+        state: 'pending',
+      });
+    });
+
+    client.Network.on('responseReceived', (event: any) => {
+      const record = networkByRequestId.get(event.requestId);
+      if (!record) return;
+      record.status = event.response?.status;
+      record.statusText = event.response?.statusText || undefined;
+      record.mimeType = event.response?.mimeType || undefined;
+      record.responseHeaders = headersToObject(event.response?.headers);
+      if (event.response?.fromDiskCache || event.response?.fromPrefetchCache) {
+        record.fromCache = true;
+      }
+      // The type on responseReceived is more reliable than the one on requestWillBeSent.
+      if (event.type) record.resourceType = event.type;
+    });
+
+    client.Network.on('requestServedFromCache', (event: any) => {
+      const record = networkByRequestId.get(event.requestId);
+      if (record) record.fromCache = true;
+    });
+
+    client.Network.on('loadingFinished', (event: any) => {
+      const record = networkByRequestId.get(event.requestId);
+      if (!record) return;
+      record.state = 'complete';
+      // encodedDataLength here is the full transferred size; the one on the response
+      // object counts headers only.
+      record.size = event.encodedDataLength;
+      record.durationMs = Number(((event.timestamp - record.startMono) * 1000).toFixed(1));
+    });
+
+    client.Network.on('loadingFailed', (event: any) => {
+      const record = networkByRequestId.get(event.requestId);
+      if (!record) return;
+      record.state = 'failed';
+      record.errorText = event.errorText || event.blockedReason || 'unknown error';
+      if (event.canceled) record.canceled = true;
+      record.durationMs = Number(((event.timestamp - record.startMono) * 1000).toFixed(1));
+    });
+
+    // Prune the previous page on navigation, mirroring the DevTools Network panel default.
+    //
+    // A blanket clear would be wrong: Chrome reports requestWillBeSent for the new
+    // document BEFORE it reports frameNavigated, so the document request the user most
+    // wants after a reload would be the first thing deleted. Keeping the committed
+    // loaderId's records preserves it.
+    client.Page.on('frameNavigated', (event: any) => {
+      const frame = event.frame;
+      if (!frame || frame.parentId) return; // subframe — leave the buffer alone
+      const keepLoaderId: string = frame.loaderId;
+      for (let i = networkRequests.length - 1; i >= 0; i--) {
+        if (networkRequests[i].loaderId === keepLoaderId) continue;
+        const [dropped] = networkRequests.splice(i, 1);
+        if (networkByRequestId.get(dropped.requestId) === dropped) {
+          networkByRequestId.delete(dropped.requestId);
+        }
+        noteDiscarded(dropped.requestId);
+      }
+    });
+
+    await client.Network.enable({
+      maxTotalBufferSize: NETWORK_MAX_TOTAL_BUFFER_SIZE,
+      maxResourceBufferSize: NETWORK_MAX_RESOURCE_BUFFER_SIZE,
+    });
+  };
+
+  // Attached eagerly from index.ts at connect time, because Network.enable() does NOT
+  // replay history the way Console.enable() does — anything before enable is lost
+  // forever. Unlike Debugger.enable() it has no page-observable side effect (no JIT
+  // deoptimisation) and no handshake to wait on, so paying for it on every connection
+  // is cheap. Never rejects: a network failure must not fail the whole connection.
+  const ensureNetworkEvents = (client: CDP.Client): Promise<void> => {
+    if (networkRegisteredOnClient === client) return networkAttachInFlight;
+    networkRegisteredOnClient = client;
+    networkAttachInFlight = attachNetworkTo(client).catch((e) => {
+      console.error('[chrome-dev-mcp] Network capture unavailable:', (e as Error).message);
+      // Allow a later call to retry rather than leaving the client marked as attached
+      // with no listeners.
+      if (networkRegisteredOnClient === client) networkRegisteredOnClient = null;
+    });
+    return networkAttachInFlight;
   };
 
   const fetchTraceMap = async (scriptUrl: string, sourceMapURL: string): Promise<TraceMap | null> => {
@@ -235,7 +536,8 @@ export function createServer(
   server.registerTool(
     'list_tabs',
     {
-      description: 'List all open Chrome page tabs with their targetIds, titles, and URLs. When you are unsure which tab to inspect, call this proactively to discover available tabs, then present the list to the user and ask which one to switch to — do NOT tell the user to switch tabs manually in Chrome.',
+      description:
+        'List all open Chrome page tabs with their targetIds, titles, and URLs. When you are unsure which tab to inspect, call this proactively to discover available tabs, then present the list to the user and ask which one to switch to — do NOT tell the user to switch tabs manually in Chrome.',
       inputSchema: z.object({}),
       outputSchema: z.object({
         tabs: z.array(
@@ -282,7 +584,8 @@ export function createServer(
   server.registerTool(
     'switch_tab',
     {
-      description: 'Switch the MCP connection to a specific Chrome tab. Use list_tabs first to get available targetIds.',
+      description:
+        'Switch the MCP connection to a specific Chrome tab. Use list_tabs first to get available targetIds.',
       inputSchema: z.object({
         targetId: z.string().describe('Target ID from list_tabs'),
       }),
@@ -299,7 +602,9 @@ export function createServer(
       const client = await switchToTarget(targetId);
       if (!client) {
         return {
-          content: [{ type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` }],
+          content: [
+            { type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` },
+          ],
           isError: true,
         };
       }
@@ -379,7 +684,8 @@ export function createServer(
   server.registerTool(
     'evaluate_js',
     {
-      description: 'Evaluate javascript in page. To access the currently selected element in the Elements panel ($0), use get_inspected_element instead.',
+      description:
+        'Evaluate javascript in page. To access the currently selected element in the Elements panel ($0), use get_inspected_element instead.',
       inputSchema: z.object({ expression: z.string() }),
       annotations: {
         title: 'Evaluate JS',
@@ -397,10 +703,7 @@ export function createServer(
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
       const { value, type, description } = result.result;
-      const text =
-        value !== undefined
-          ? JSON.stringify(value, null, 2)
-          : description ?? type ?? 'undefined';
+      const text = value !== undefined ? JSON.stringify(value, null, 2) : (description ?? type ?? 'undefined');
       return { content: [{ type: 'text', text }] };
     },
   );
@@ -408,14 +711,10 @@ export function createServer(
   server.registerTool(
     'get_computed_style',
     {
-      description:
-        'Get computed CSS values for the given properties on the element matched by selector.',
+      description: 'Get computed CSS values for the given properties on the element matched by selector.',
       inputSchema: z.object({
         selector: z.string().describe('CSS selector for the target element'),
-        properties: z
-          .array(z.string())
-          .min(1)
-          .describe('CSS property names to return (kebab-case or camelCase)'),
+        properties: z.array(z.string()).min(1).describe('CSS property names to return (kebab-case or camelCase)'),
       }),
       outputSchema: z.object({
         styles: z
@@ -519,7 +818,12 @@ export function createServer(
       });
       if (result.result.value === null) {
         return {
-          content: [{ type: 'text', text: 'No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.' }],
+          content: [
+            {
+              type: 'text',
+              text: 'No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.',
+            },
+          ],
           isError: true,
         };
       }
@@ -547,7 +851,10 @@ export function createServer(
       inputSchema: z.object({}),
       outputSchema: z.object({
         paused: z.boolean(),
-        reason: z.string().optional().describe('Pause reason (e.g. "breakpoint", "exception"). Present only when paused.'),
+        reason: z
+          .string()
+          .optional()
+          .describe('Pause reason (e.g. "breakpoint", "exception"). Present only when paused.'),
         hitBreakpoints: z.array(z.string()).optional().describe('IDs of breakpoints hit. Present only when paused.'),
         callStack: z
           .array(
@@ -672,16 +979,8 @@ export function createServer(
           .optional()
           .describe('Exact script URL. Provide this or urlRegex; if both, urlRegex takes precedence.'),
         lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
-        columnNumber: z
-          .number()
-          .int()
-          .min(1)
-          .optional()
-          .describe('Column number, 1-indexed (optional)'),
-        condition: z
-          .string()
-          .optional()
-          .describe('JS expression; breakpoint triggers only when truthy'),
+        columnNumber: z.number().int().min(1).optional().describe('Column number, 1-indexed (optional)'),
+        condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
         urlRegex: z
           .string()
           .optional()
@@ -697,7 +996,9 @@ export function createServer(
               columnNumber: z.number().optional(),
             }),
           )
-          .describe('May be empty if the script is not loaded yet; the breakpoint will bind automatically when Chrome parses the script'),
+          .describe(
+            'May be empty if the script is not loaded yet; the breakpoint will bind automatically when Chrome parses the script',
+          ),
       }),
       annotations: {
         title: 'Set breakpoint',
@@ -878,8 +1179,7 @@ export function createServer(
   server.registerTool(
     'step_into',
     {
-      description:
-        'Step into the function call on the current line. Returns the new call stack position.',
+      description: 'Step into the function call on the current line. Returns the new call stack position.',
       inputSchema: z.object({}),
       annotations: {
         title: 'Step into',
@@ -920,7 +1220,10 @@ export function createServer(
         'Evaluate a JavaScript expression in the scope of a paused call frame. Unlike evaluate_js, this has access to local variables, closure variables, and the current `this`. Only works when execution is paused.',
       inputSchema: z.object({
         expression: z.string().describe('JS expression to evaluate'),
-        frameIndex: z.number().default(0).describe('Call frame index (0 = top frame); use get_debugger_state to find available frames'),
+        frameIndex: z
+          .number()
+          .default(0)
+          .describe('Call frame index (0 = top frame); use get_debugger_state to find available frames'),
       }),
       annotations: {
         title: 'Evaluate at frame',
@@ -932,7 +1235,10 @@ export function createServer(
       await ensureDebuggerEvents(client);
 
       if (!debuggerState.paused) {
-        return { content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }], isError: true };
+        return {
+          content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }],
+          isError: true,
+        };
       }
       const frame = debuggerState.callFrames[frameIndex];
       if (!frame) {
@@ -956,9 +1262,7 @@ export function createServer(
       if (r.value !== undefined) {
         text = JSON.stringify(r.value, null, 2);
       } else if (r.preview) {
-        const props = (r.preview.properties ?? [])
-          .map((p: any) => `  ${p.name}: ${p.value}`)
-          .join(',\n');
+        const props = (r.preview.properties ?? []).map((p: any) => `  ${p.name}: ${p.value}`).join(',\n');
         text = `${r.preview.description ?? r.type} {\n${props}\n}`;
       } else {
         text = r.description ?? r.type ?? 'undefined';
@@ -970,8 +1274,7 @@ export function createServer(
   server.registerTool(
     'step_out',
     {
-      description:
-        'Step out of the current function and pause at the caller. Returns the new call stack position.',
+      description: 'Step out of the current function and pause at the caller. Returns the new call stack position.',
       inputSchema: z.object({}),
       annotations: {
         title: 'Step out',
@@ -1027,10 +1330,7 @@ export function createServer(
           .enum(['log', 'info', 'debug', 'warning', 'error', 'exception'])
           .optional()
           .describe('Filter by log level / type. Omit to return all levels.'),
-        clear: z
-          .boolean()
-          .default(false)
-          .describe('Clear the buffer after returning entries'),
+        clear: z.boolean().default(false).describe('Clear the buffer after returning entries'),
       }),
       outputSchema: z.object({
         logs: z.array(
@@ -1067,13 +1367,230 @@ export function createServer(
       if (clear) consoleLogs.length = 0;
 
       return {
-        content: logs.length === 0
-          ? [{ type: 'text' as const, text: 'No console entries captured yet.' }]
-          : [{ type: 'text' as const, text: JSON.stringify(logs, null, 2) }],
+        content:
+          logs.length === 0
+            ? [{ type: 'text' as const, text: 'No console entries captured yet.' }]
+            : [{ type: 'text' as const, text: JSON.stringify(logs, null, 2) }],
         structuredContent: { logs },
       };
     },
   );
 
-  return server;
+  // ── Network tools ───────────────────────────────────────────────────────────
+
+  server.registerTool(
+    'get_network_requests',
+    {
+      description:
+        'Return HTTP requests captured from the connected tab — method, URL, resource type, status, transferred size, duration, initiator, and failure reason. ' +
+        'Capture starts when this server connects to the tab: requests issued before that are NOT visible (unlike get_console_logs, which replays pre-connect history). ' +
+        'Requests belonging to a previous page are pruned on navigation, mirroring the DevTools Network panel default; the new document request itself is kept. ' +
+        'A redirect chain appears as one record per hop, sharing a requestId and distinguished by `hop`. ' +
+        'Headers are omitted unless includeHeaders is set. WebSocket frames are not captured.',
+      inputSchema: z.object({
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_NETWORK_REQUESTS_PER_CALL)
+          .default(50)
+          .describe('Maximum number of most-recent requests to return'),
+        urlFilter: z
+          .string()
+          .optional()
+          .describe('Case-insensitive substring match on the full (untruncated) request URL'),
+        resourceType: caseInsensitiveEnum(RESOURCE_TYPES)
+          .optional()
+          .describe('Filter by CDP resource type. Any casing is accepted.'),
+        status: caseInsensitiveEnum(['2xx', '3xx', '4xx', '5xx', 'failed', 'pending'])
+          .optional()
+          .describe(
+            'Filter by response status class, or by outcome: `failed` = network error/blocked, `pending` = still in flight.',
+          ),
+        includeHeaders: z
+          .boolean()
+          .default(false)
+          .describe('Include request and response headers (verbose — roughly triples output size)'),
+        clear: z.boolean().default(false).describe('Clear the capture buffer after returning entries'),
+      }),
+      outputSchema: z.object({
+        requests: z.array(
+          z.object({
+            requestId: z.string(),
+            method: z.string(),
+            url: z.string(),
+            resourceType: z.string(),
+            state: z.enum(['pending', 'complete', 'failed', 'redirect']),
+            initiator: z.string().describe('Flattened initiator; compiled position, not source-mapped'),
+            startedAt: z.string(),
+            hop: z.number().optional().describe('Redirect hop index; omitted for the first hop'),
+            status: z.number().optional(),
+            statusText: z.string().optional(),
+            mimeType: z.string().optional(),
+            size: z.number().optional().describe('Transferred bytes (encodedDataLength)'),
+            durationMs: z.number().optional(),
+            fromCache: z.boolean().optional(),
+            redirectedTo: z.string().optional(),
+            errorText: z.string().optional(),
+            canceled: z.boolean().optional(),
+            requestHeaders: z.record(z.string(), z.string()).optional(),
+            responseHeaders: z.record(z.string(), z.string()).optional(),
+          }),
+        ),
+      }),
+      annotations: {
+        title: 'Get network requests',
+        readOnlyHint: true,
+      },
+    },
+    async ({ limit, urlFilter, resourceType, status, includeHeaders, clear }) => {
+      const client = await getClient();
+      if (!client) return NOT_CONNECTED;
+      // Detect a reconnect before attaching, so an empty buffer can be explained
+      // rather than looking like "no traffic".
+      const reattached = networkRegisteredOnClient !== client;
+      await ensureNetworkEvents(client);
+
+      const needle = urlFilter?.toLowerCase();
+      const wantedType = resourceType?.toLowerCase();
+      const filtered = networkRequests.filter((r) => {
+        if (needle && !r.url.toLowerCase().includes(needle)) return false;
+        if (wantedType && r.resourceType.toLowerCase() !== wantedType) return false;
+        if (status) {
+          if (status === 'failed') return r.state === 'failed';
+          if (status === 'pending') return r.state === 'pending';
+          if (r.status == null) return false;
+          if (Math.floor(r.status / 100) !== Number(status[0])) return false;
+        }
+        return true;
+      });
+
+      const requests = filtered.slice(-limit).map((r) => toOutputRecord(r, includeHeaders));
+
+      // Mirrors get_console_logs: `clear` empties the whole buffer, not the filtered slice.
+      if (clear) resetNetworkCapture();
+
+      const emptyMessage = reattached
+        ? 'Network capture (re)started for a new Chrome session — the previous buffer was discarded. Reload the page or re-trigger the requests, then call this tool again.'
+        : networkRequests.length === 0
+          ? 'No network requests captured yet. Capture began when this server connected to the tab — reload the page to collect its requests.'
+          : 'No network requests match the given filters.';
+
+      return {
+        content:
+          requests.length === 0
+            ? [{ type: 'text' as const, text: emptyMessage }]
+            : [{ type: 'text' as const, text: JSON.stringify(requests, null, 2) }],
+        structuredContent: { requests },
+      };
+    },
+  );
+
+  server.registerTool(
+    'get_network_response_body',
+    {
+      description:
+        'Fetch the response body for one requestId from get_network_requests. ' +
+        'Bodies are never buffered by this server — they are read from Chrome on demand, and Chrome discards them on navigation or when its own buffer limits are exceeded, so fetch promptly and before navigating away. ' +
+        'Chrome stores at most one body per requestId, so for a redirect chain only the final hop has a body. ' +
+        'Binary bodies are reported as metadata only, not returned.',
+      inputSchema: z.object({
+        requestId: z.string().describe('requestId from get_network_requests'),
+      }),
+      annotations: {
+        title: 'Get network response body',
+        readOnlyHint: true,
+      },
+    },
+    async ({ requestId }) => {
+      const client = await getClient();
+      if (!client) return NOT_CONNECTED;
+      await ensureNetworkEvents(client);
+
+      const record = networkByRequestId.get(requestId);
+
+      // Answer from our own record where it already settles the question, so we don't
+      // report a confusing CDP error for a request that simply has no body yet.
+      if (record?.state === 'pending') {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Request ${requestId} has not finished loading yet (no loadingFinished event). Retry in a moment.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (record?.state === 'failed') {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Request ${requestId} failed (${record.errorText ?? 'unknown error'}); no response body is available.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      let body: string;
+      let base64Encoded: boolean;
+      try {
+        const result = await client.Network.getResponseBody({ requestId });
+        body = result.body;
+        base64Encoded = result.base64Encoded;
+      } catch (e) {
+        const message = (e as Error).message ?? '';
+
+        // Chrome's message is identical for "unknown id" and "already discarded", so the
+        // tombstone set is what lets us tell the user which one actually happened.
+        if (!record) {
+          const text = discardedRequestIds.has(requestId)
+            ? `Request ${requestId} was captured but its data has been discarded (page navigation, or the capture buffer overflowed). Re-trigger the request and fetch its body before navigating.`
+            : `Unknown requestId ${requestId}. It is not in the capture buffer (last ${MAX_NETWORK_REQUESTS} requests, pruned on navigation) and Chrome has no data for it. Call get_network_requests for current requestIds.`;
+          return { content: [{ type: 'text' as const, text }], isError: true };
+        }
+
+        const text = /evicted/i.test(message)
+          ? `Response body for ${requestId} was discarded by Chrome (exceeded its network buffer limits — ${Math.round(NETWORK_MAX_TOTAL_BUFFER_SIZE / 1024 / 1024)} MB total / ${Math.round(NETWORK_MAX_RESOURCE_BUFFER_SIZE / 1024 / 1024)} MB per resource). Fetch bodies promptly after a request completes.`
+          : `Chrome has no body for ${requestId} (status ${record.status ?? 'unknown'}${
+              record.state === 'redirect' ? ', redirect hop' : ''
+            }). The response may have had no body, or be a resource Chrome does not buffer. CDP said: ${message}`;
+        return { content: [{ type: 'text' as const, text }], isError: true };
+      }
+
+      const meta: Record<string, unknown> = {
+        requestId,
+        ...(record
+          ? {
+              method: record.method,
+              url: formatUrl(record.url),
+              status: record.status,
+              mimeType: record.mimeType,
+            }
+          : { note: 'Metadata for this request was evicted from the capture buffer; body came from Chrome.' }),
+        base64Encoded,
+        byteLength: body.length,
+      };
+
+      // Dumping base64 image/font data into an agent's context is pure waste.
+      if (base64Encoded && !/^text\/|json|xml|javascript|ecmascript/i.test(record?.mimeType ?? '')) {
+        meta.omitted = 'binary body not returned';
+        return { content: [{ type: 'text' as const, text: JSON.stringify(meta, null, 2) }] };
+      }
+
+      const truncated = body.length > MAX_RESPONSE_BODY_LENGTH;
+      if (truncated) meta.truncated = true;
+
+      return {
+        content: [
+          { type: 'text' as const, text: JSON.stringify(meta, null, 2) },
+          { type: 'text' as const, text: truncated ? body.slice(0, MAX_RESPONSE_BODY_LENGTH) : body },
+        ],
+      };
+    },
+  );
+
+  return { server, attachNetwork: ensureNetworkEvents };
 }

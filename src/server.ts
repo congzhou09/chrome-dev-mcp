@@ -64,6 +64,7 @@ const NOT_CONNECTED = {
 };
 
 const MAX_CONSOLE_LOGS = 500;
+const MAX_HTML_LENGTH = 20_000;
 
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
@@ -119,11 +120,21 @@ const RESOURCE_TYPES = [
 
 // Long URLs are collapsed rather than silently cut: a truncated URL buried in a JSON
 // record would otherwise be reported or re-fetched as if it were complete.
-const formatUrl = (url: string): string => {
+//
+// `collapseLong` is off for single-request drill-downs (a `requestId` query,
+// get_network_response_body), where the output is bounded to a handful of records and the
+// tail of a long URL — a signed token, a GraphQL query in the querystring — is often the
+// very thing under investigation. Nothing else can recover it: the record stores the full
+// URL, but no tool returns it.
+//
+// data: URIs collapse in BOTH modes. Their length is unbounded (megabytes of inline
+// base64) and their tail carries no diagnostic value, so the reason to collapse them has
+// nothing to do with how many records are being returned.
+const formatUrl = (url: string, collapseLong = true): string => {
   if (url.startsWith('data:')) {
     return `${url.slice(0, 64)}… (data URI, ${url.length} chars)`;
   }
-  if (url.length > MAX_URL_LENGTH) {
+  if (collapseLong && url.length > MAX_URL_LENGTH) {
     return `${url.slice(0, MAX_URL_LENGTH)}… (+${url.length - MAX_URL_LENGTH} chars)`;
   }
   return url;
@@ -150,12 +161,37 @@ const headersToObject = (headers: any): Record<string, string> => {
   return { ...headers } as Record<string, string>;
 };
 
+const HEADER_WILDCARD = '*';
+
+// Callers name the headers they want, the way get_computed_style takes `properties` —
+// returning every header on every record is what makes a 200-record response unusable.
+//
+// Lookups normalise case because the casing Chrome reports depends on the protocol:
+// HTTP/2 lowercases every name, HTTP/1.1 preserves whatever the origin sent. Output keys
+// echo the caller's spelling so the response lines up with the request.
+//
+// Unlike get_computed_style, a header that is not present is OMITTED rather than returned
+// as an empty string: an absent header and a header with an empty value are different
+// things in HTTP, and conflating them would misreport the absent case.
+const projectHeaders = (headers: Record<string, string> | undefined, keys: string[]): Record<string, string> => {
+  if (!headers) return {};
+  if (keys.includes(HEADER_WILDCARD)) return { ...headers };
+  const byLowerName = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) byLowerName.set(name.toLowerCase(), value);
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    const value = byLowerName.get(key.toLowerCase());
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+};
+
 // Projection for tool output. Every conditional field is omitted (not null) when absent,
 // which is why the matching zod outputSchema marks them `.optional()`.
-const toOutputRecord = (r: NetworkRecord, includeHeaders: boolean) => ({
+const toOutputRecord = (r: NetworkRecord, headerKeys?: string[], collapseLongUrls = true) => ({
   requestId: r.requestId,
   method: r.method,
-  url: formatUrl(r.url),
+  url: formatUrl(r.url, collapseLongUrls),
   resourceType: r.resourceType,
   state: r.state,
   initiator: r.initiator,
@@ -167,10 +203,15 @@ const toOutputRecord = (r: NetworkRecord, includeHeaders: boolean) => ({
   ...(r.size != null ? { size: r.size } : {}),
   ...(r.durationMs != null ? { durationMs: r.durationMs } : {}),
   ...(r.fromCache ? { fromCache: true } : {}),
-  ...(r.redirectedTo ? { redirectedTo: formatUrl(r.redirectedTo) } : {}),
+  ...(r.redirectedTo ? { redirectedTo: formatUrl(r.redirectedTo, collapseLongUrls) } : {}),
   ...(r.errorText ? { errorText: r.errorText } : {}),
   ...(r.canceled ? { canceled: true } : {}),
-  ...(includeHeaders ? { requestHeaders: r.requestHeaders, responseHeaders: r.responseHeaders ?? {} } : {}),
+  ...(headerKeys?.length
+    ? {
+        requestHeaders: projectHeaders(r.requestHeaders, headerKeys),
+        responseHeaders: projectHeaders(r.responseHeaders, headerKeys),
+      }
+    : {}),
 });
 
 export function createServer(
@@ -451,16 +492,29 @@ export function createServer(
   // forever. Unlike Debugger.enable() it has no page-observable side effect (no JIT
   // deoptimisation) and no handshake to wait on, so paying for it on every connection
   // is cheap. Never rejects: a network failure must not fail the whole connection.
-  const ensureNetworkEvents = (client: CDP.Client): Promise<void> => {
-    if (networkRegisteredOnClient === client) return networkAttachInFlight;
-    networkRegisteredOnClient = client;
-    networkAttachInFlight = attachNetworkTo(client).catch((e) => {
-      console.error('[chrome-dev-mcp] Network capture unavailable:', (e as Error).message);
-      // Allow a later call to retry rather than leaving the client marked as attached
-      // with no listeners.
-      if (networkRegisteredOnClient === client) networkRegisteredOnClient = null;
-    });
-    return networkAttachInFlight;
+  //
+  // Resolves true when THIS call performed the attach, which also means attachNetworkTo
+  // just reset the capture buffer and the tombstone set. Callers turn that into a
+  // "capture (re)started" explanation instead of reporting an empty buffer or an unknown
+  // requestId. Returning it from here keeps the client-identity check in one place —
+  // every caller previously had to re-derive it, and specifically BEFORE attaching,
+  // since attaching is what makes the two clients compare equal.
+  const ensureNetworkEvents = async (client: CDP.Client): Promise<boolean> => {
+    // Everything up to the await must stay synchronous: it is what makes a concurrent
+    // caller see networkRegisteredOnClient already set and await the same attach instead
+    // of starting a second one. Do not move the check or the assignment below the await.
+    const alreadyAttached = networkRegisteredOnClient === client;
+    if (!alreadyAttached) {
+      networkRegisteredOnClient = client;
+      networkAttachInFlight = attachNetworkTo(client).catch((e) => {
+        console.error('[chrome-dev-mcp] Network capture unavailable:', (e as Error).message);
+        // Allow a later call to retry rather than leaving the client marked as attached
+        // with no listeners.
+        if (networkRegisteredOnClient === client) networkRegisteredOnClient = null;
+      });
+    }
+    await networkAttachInFlight;
+    return !alreadyAttached;
   };
 
   const fetchTraceMap = async (scriptUrl: string, sourceMapURL: string): Promise<TraceMap | null> => {
@@ -663,7 +717,8 @@ export function createServer(
     'get_html',
     {
       description:
-        'Get the full HTML source of the currently connected tab (`document.documentElement.outerHTML`). Truncated to 20 000 characters for large pages.',
+        'Get the full HTML source of the currently connected tab (`document.documentElement.outerHTML`). ' +
+        `Truncated to ${MAX_HTML_LENGTH} characters for large pages.`,
       inputSchema: z.object({}),
       annotations: {
         title: 'Get page HTML',
@@ -677,7 +732,7 @@ export function createServer(
         expression: 'document.documentElement.outerHTML',
         returnByValue: true,
       });
-      return { content: [{ type: 'text', text: String(result.result.value).slice(0, 20000) }] };
+      return { content: [{ type: 'text', text: String(result.result.value).slice(0, MAX_HTML_LENGTH) }] };
     },
   );
 
@@ -1386,7 +1441,7 @@ export function createServer(
         'Capture starts when this server connects to the tab: requests issued before that are NOT visible (unlike get_console_logs, which replays pre-connect history). ' +
         'Requests belonging to a previous page are pruned on navigation, mirroring the DevTools Network panel default; the new document request itself is kept. ' +
         'A redirect chain appears as one record per hop, sharing a requestId and distinguished by `hop`. ' +
-        'Headers are omitted unless includeHeaders is set. WebSocket frames are not captured.',
+        'WebSocket frames are not captured.',
       inputSchema: z.object({
         limit: z
           .number()
@@ -1395,6 +1450,12 @@ export function createServer(
           .max(MAX_NETWORK_REQUESTS_PER_CALL)
           .default(50)
           .describe('Maximum number of most-recent requests to return'),
+        requestId: z
+          .string()
+          .optional()
+          .describe(
+            'Return only this request, including every hop of its redirect chain. Pair with headerKeys to inspect one request in full.',
+          ),
         urlFilter: z
           .string()
           .optional()
@@ -1407,10 +1468,13 @@ export function createServer(
           .describe(
             'Filter by response status class, or by outcome: `failed` = network error/blocked, `pending` = still in flight.',
           ),
-        includeHeaders: z
-          .boolean()
-          .default(false)
-          .describe('Include request and response headers (verbose — roughly triples output size)'),
+        headerKeys: z
+          .array(z.string())
+          .min(1)
+          .optional()
+          .describe(
+            'Return only these headers, matched case-insensitively, on both requestHeaders and responseHeaders. Omit to return no headers. Pass ["*"] for every header — that is bounded only by `limit`, so use it with `requestId` or a small limit.',
+          ),
         clear: z.boolean().default(false).describe('Clear the capture buffer after returning entries'),
       }),
       outputSchema: z.object({
@@ -1418,23 +1482,70 @@ export function createServer(
           z.object({
             requestId: z.string(),
             method: z.string(),
-            url: z.string(),
-            resourceType: z.string(),
-            state: z.enum(['pending', 'complete', 'failed', 'redirect']),
-            initiator: z.string().describe('Flattened initiator; compiled position, not source-mapped'),
-            startedAt: z.string(),
+            url: z
+              .string()
+              .describe(
+                'data: URIs are always collapsed; in a bulk listing long URLs are truncated too. Both are marked with `…`, and a marked value is NOT a usable URL — query a single `requestId` to get long URLs in full. `urlFilter` always matches the full URL.',
+              ),
+            resourceType: z
+              .string()
+              .describe('CDP resource type (Document, Script, XHR, …); same vocabulary as the `resourceType` filter'),
+            state: z
+              .enum(['pending', 'complete', 'failed', 'redirect'])
+              .describe(
+                'Lifecycle of this hop: `pending` = no terminal event yet (stays pending forever if the page navigated away mid-flight), `complete` = loaded, `failed` = network error or blocked, `redirect` = returned 3xx and continued on the next hop.',
+              ),
+            initiator: z
+              .string()
+              .describe(
+                'Flattened to "<type> <url>:<line>", or just the type when no location is known. Compiled position, not source-mapped; capped at 200 chars.',
+              ),
+            startedAt: z.string().describe('ISO-8601 wall-clock time the request was sent'),
             hop: z.number().optional().describe('Redirect hop index; omitted for the first hop'),
-            status: z.number().optional(),
-            statusText: z.string().optional(),
+            status: z
+              .number()
+              .optional()
+              .describe(
+                'HTTP status of this hop — the 3xx itself when state is `redirect`. Absent until a response arrives.',
+              ),
+            statusText: z.string().optional().describe('Reason phrase; usually absent over HTTP/2+, which has none'),
             mimeType: z.string().optional(),
-            size: z.number().optional().describe('Transferred bytes (encodedDataLength)'),
-            durationMs: z.number().optional(),
-            fromCache: z.boolean().optional(),
-            redirectedTo: z.string().optional(),
-            errorText: z.string().optional(),
-            canceled: z.boolean().optional(),
-            requestHeaders: z.record(z.string(), z.string()).optional(),
-            responseHeaders: z.record(z.string(), z.string()).optional(),
+            size: z
+              .number()
+              .optional()
+              .describe('Transferred on-the-wire bytes (encodedDataLength) — compressed, not the decoded body size'),
+            durationMs: z
+              .number()
+              .optional()
+              .describe('Milliseconds from request start to its terminal event (finish, failure, or redirect)'),
+            fromCache: z
+              .boolean()
+              .optional()
+              .describe('Served from Chrome cache rather than the network; `size` is then typically 0'),
+            redirectedTo: z
+              .string()
+              .optional()
+              .describe('Redirect target from the `Location` header; same truncation rules as `url`'),
+            errorText: z
+              .string()
+              .optional()
+              .describe('CDP failure or block reason (e.g. `net::ERR_ABORTED`); present only when state is `failed`'),
+            canceled: z
+              .boolean()
+              .optional()
+              .describe(
+                'The failure was a cancellation (navigating away, an aborted fetch), not a genuine network error — usually not worth reporting as a problem',
+              ),
+            requestHeaders: z
+              .record(z.string(), z.string())
+              .optional()
+              .describe(
+                'The headers named by `headerKeys`, keyed by your own spelling; absent when `headerKeys` is omitted. A requested header missing from this map was not sent.',
+              ),
+            responseHeaders: z
+              .record(z.string(), z.string())
+              .optional()
+              .describe('Same projection as `requestHeaders`; empty when no response arrived'),
           }),
         ),
       }),
@@ -1443,17 +1554,17 @@ export function createServer(
         readOnlyHint: true,
       },
     },
-    async ({ limit, urlFilter, resourceType, status, includeHeaders, clear }) => {
+    async ({ limit, requestId, urlFilter, resourceType, status, headerKeys, clear }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      // Detect a reconnect before attaching, so an empty buffer can be explained
+      // True when this call performed the attach, so an empty buffer can be explained
       // rather than looking like "no traffic".
-      const reattached = networkRegisteredOnClient !== client;
-      await ensureNetworkEvents(client);
+      const reattached = await ensureNetworkEvents(client);
 
       const needle = urlFilter?.toLowerCase();
       const wantedType = resourceType?.toLowerCase();
       const filtered = networkRequests.filter((r) => {
+        if (requestId && r.requestId !== requestId) return false;
         if (needle && !r.url.toLowerCase().includes(needle)) return false;
         if (wantedType && r.resourceType.toLowerCase() !== wantedType) return false;
         if (status) {
@@ -1465,7 +1576,8 @@ export function createServer(
         return true;
       });
 
-      const requests = filtered.slice(-limit).map((r) => toOutputRecord(r, includeHeaders));
+      // A requestId query is a drill-down: bounded output, so long URLs stay intact.
+      const requests = filtered.slice(-limit).map((r) => toOutputRecord(r, headerKeys, requestId == null));
 
       // Mirrors get_console_logs: `clear` empties the whole buffer, not the filtered slice.
       if (clear) resetNetworkCapture();
@@ -1493,9 +1605,12 @@ export function createServer(
         'Fetch the response body for one requestId from get_network_requests. ' +
         'Bodies are never buffered by this server — they are read from Chrome on demand, and Chrome discards them on navigation or when its own buffer limits are exceeded, so fetch promptly and before navigating away. ' +
         'Chrome stores at most one body per requestId, so for a redirect chain only the final hop has a body. ' +
-        'Binary bodies are reported as metadata only, not returned.',
+        'Returns a JSON metadata block, then the body as a separate text block — kept separate so a large body is not JSON-escaped. ' +
+        'Metadata carries requestId, base64Encoded, byteLength and method/url/status/mimeType, the last four replaced by a `note` when the capture buffer no longer holds the request, plus `truncated: true` when the body was cut at ' +
+        `${MAX_RESPONSE_BODY_LENGTH} characters. ` +
+        'A binary body is never returned: metadata carries `omitted` and there is no second content block.',
       inputSchema: z.object({
-        requestId: z.string().describe('requestId from get_network_requests'),
+        requestId: z.string(),
       }),
       annotations: {
         title: 'Get network response body',
@@ -1505,7 +1620,10 @@ export function createServer(
     async ({ requestId }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await ensureNetworkEvents(client);
+      // True when this call performed the attach, which resets the capture buffer AND the
+      // tombstone set — otherwise a perfectly valid id from the previous session would be
+      // reported as invented.
+      const reattached = await ensureNetworkEvents(client);
 
       const record = networkByRequestId.get(requestId);
 
@@ -1546,9 +1664,11 @@ export function createServer(
         // Chrome's message is identical for "unknown id" and "already discarded", so the
         // tombstone set is what lets us tell the user which one actually happened.
         if (!record) {
-          const text = discardedRequestIds.has(requestId)
-            ? `Request ${requestId} was captured but its data has been discarded (page navigation, or the capture buffer overflowed). Re-trigger the request and fetch its body before navigating.`
-            : `Unknown requestId ${requestId}. It is not in the capture buffer (last ${MAX_NETWORK_REQUESTS} requests, pruned on navigation) and Chrome has no data for it. Call get_network_requests for current requestIds.`;
+          const text = reattached
+            ? `Network capture (re)started for a new Chrome session, discarding every request captured before it — ${requestId} belonged to the previous session and is not invalid. Re-trigger the request, then fetch the body under its new requestId.`
+            : discardedRequestIds.has(requestId)
+              ? `Request ${requestId} was captured but its data has been discarded (page navigation, or the capture buffer overflowed). Re-trigger the request and fetch its body before navigating.`
+              : `Unknown requestId ${requestId}. It is not in the capture buffer (last ${MAX_NETWORK_REQUESTS} requests, pruned on navigation) and Chrome has no data for it. Call get_network_requests for current requestIds.`;
           return { content: [{ type: 'text' as const, text }], isError: true };
         }
 
@@ -1565,7 +1685,7 @@ export function createServer(
         ...(record
           ? {
               method: record.method,
-              url: formatUrl(record.url),
+              url: formatUrl(record.url, false),
               status: record.status,
               mimeType: record.mimeType,
             }

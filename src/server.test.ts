@@ -43,11 +43,12 @@ function makeMockClient(
 // Exposes attachNetwork alongside the MCP client. In production index.ts calls it at
 // connect time; tests have to call it explicitly to start network capture.
 async function setupServer(
-  cdpClient: CDP.Client | null,
+  cdpClient: CDP.Client | null | (() => CDP.Client | null),
   switchToTarget: (targetId: string) => Promise<CDP.Client | null> = vi.fn(),
   getCurrentTargetId: () => string | null = () => null,
 ) {
-  const { server, attachNetwork } = createServer(async () => cdpClient, switchToTarget, getCurrentTargetId);
+  const getClient = typeof cdpClient === 'function' ? cdpClient : () => cdpClient;
+  const { server, attachNetwork } = createServer(async () => getClient(), switchToTarget, getCurrentTargetId);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const mcpClient = new Client({ name: 'test', version: '0.0.0' });
@@ -442,7 +443,7 @@ function sentEvent(over: any = {}) {
   };
 }
 
-async function captureOne(cdpClient: CDP.Client, attachNetwork: (c: CDP.Client) => Promise<void>, over: any = {}) {
+async function captureOne(cdpClient: CDP.Client, attachNetwork: (c: CDP.Client) => Promise<boolean>, over: any = {}) {
   await attachNetwork(cdpClient);
   fireCdp(cdpClient, 'Network', 'requestWillBeSent', sentEvent(over));
   fireCdp(cdpClient, 'Network', 'responseReceived', {
@@ -731,22 +732,101 @@ describe('get_network_requests', () => {
     expect(requests[0].requestId).toBe('b');
   });
 
-  it('omits headers unless includeHeaders is set', async () => {
+  it('omits headers unless headerKeys is given', async () => {
     const cdpClient = makeMockClient();
     const { mcpClient, attachNetwork } = await setupServer(cdpClient);
     await captureOne(cdpClient, attachNetwork);
 
-    const without = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
-    const withHeaders = await mcpClient.callTool({
-      name: 'get_network_requests',
-      arguments: { includeHeaders: true },
+    const result = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
+
+    const record = (result.structuredContent as any).requests[0];
+    expect(record.requestHeaders).toBeUndefined();
+    expect(record.responseHeaders).toBeUndefined();
+  });
+
+  // The fixtures deliver lowercase header names, the way HTTP/2 does. Asking for canonical
+  // casing proves the lookup normalises AND that output keys echo the caller's spelling.
+  it('projects only the named headers, matched case-insensitively', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork, {
+      request: {
+        method: 'GET',
+        url: 'https://api.example.com/users',
+        headers: { accept: 'application/json', authorization: 'Bearer tok' },
+      },
     });
 
-    expect((without.structuredContent as any).requests[0].requestHeaders).toBeUndefined();
-    expect((withHeaders.structuredContent as any).requests[0]).toMatchObject({
-      requestHeaders: { accept: 'application/json' },
-      responseHeaders: { 'content-type': 'application/json' },
+    const result = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { headerKeys: ['Accept', 'Content-Type'] },
     });
+
+    const record = (result.structuredContent as any).requests[0];
+    // toEqual, not toMatchObject: the unnamed `authorization` must be absent, and a named
+    // header the message never carried must be omitted rather than returned as an empty string.
+    expect(record.requestHeaders).toEqual({ Accept: 'application/json' });
+    expect(record.responseHeaders).toEqual({ 'Content-Type': 'application/json' });
+  });
+
+  it('returns every header for headerKeys ["*"]', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork, {
+      request: {
+        method: 'GET',
+        url: 'https://api.example.com/users',
+        headers: { accept: 'application/json', authorization: 'Bearer tok' },
+      },
+    });
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { headerKeys: ['*'] },
+    });
+
+    const record = (result.structuredContent as any).requests[0];
+    expect(record.requestHeaders).toEqual({ accept: 'application/json', authorization: 'Bearer tok' });
+    expect(record.responseHeaders).toEqual({ 'content-type': 'application/json' });
+  });
+
+  it('filters to one request by requestId, keeping every redirect hop', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await attachNetwork(cdpClient);
+    fireCdp(cdpClient, 'Network', 'requestWillBeSent', sentEvent({ requestId: 'other-1' }));
+    fireCdp(
+      cdpClient,
+      'Network',
+      'requestWillBeSent',
+      sentEvent({ request: { method: 'GET', url: 'https://example.com/old', headers: {} } }),
+    );
+    fireCdp(
+      cdpClient,
+      'Network',
+      'requestWillBeSent',
+      sentEvent({
+        timestamp: 100.05,
+        request: { method: 'GET', url: 'https://example.com/new', headers: {} },
+        redirectResponse: {
+          status: 301,
+          statusText: 'Moved Permanently',
+          mimeType: 'text/html',
+          headers: { location: 'https://example.com/new' },
+        },
+      }),
+    );
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { requestId: 'req-1' },
+    });
+
+    const { requests } = result.structuredContent as any;
+    expect(requests).toHaveLength(2);
+    expect(requests.every((r: any) => r.requestId === 'req-1')).toBe(true);
+    expect(requests[0].hop).toBeUndefined();
+    expect(requests[1].hop).toBe(1);
   });
 
   it('collapses long data URIs in the url field', async () => {
@@ -765,6 +845,52 @@ describe('get_network_requests', () => {
 
     const { requests } = result.structuredContent as any;
     expect(requests[0].url).toMatch(/^data:image\/png;base64,A+… \(data URI, 5022 chars\)$/);
+  });
+
+  it('returns a long url in full when filtered to one requestId', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await attachNetwork(cdpClient);
+    const longUrl = 'https://example.com/' + 'q'.repeat(600) + '/tail';
+    fireCdp(
+      cdpClient,
+      'Network',
+      'requestWillBeSent',
+      sentEvent({ request: { method: 'GET', url: longUrl, headers: {} } }),
+    );
+
+    const bulk = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
+    const single = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { requestId: 'req-1' },
+    });
+
+    const bulkUrl = (bulk.structuredContent as any).requests[0].url;
+    expect(bulkUrl).toContain('… (+');
+    expect(bulkUrl.length).toBeLessThan(longUrl.length);
+    expect((single.structuredContent as any).requests[0].url).toBe(longUrl);
+  });
+
+  // The reason to collapse a data URI is its unbounded length and uninformative tail.
+  // Neither changes when only one record comes back, so this stays collapsed either way.
+  it('still collapses a data URI when filtered to one requestId', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await attachNetwork(cdpClient);
+    const dataUri = 'data:image/png;base64,' + 'A'.repeat(5000);
+    fireCdp(
+      cdpClient,
+      'Network',
+      'requestWillBeSent',
+      sentEvent({ type: 'Image', request: { method: 'GET', url: dataUri, headers: {} } }),
+    );
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { requestId: 'req-1' },
+    });
+
+    expect((result.structuredContent as any).requests[0].url).toContain('(data URI, 5022 chars)');
   });
 
   it('matches filters against the full url, not the truncated one', async () => {
@@ -845,6 +971,35 @@ describe('get_network_requests', () => {
 });
 
 describe('get_network_response_body', () => {
+  // A reconnect resets the tombstone set too, so without the reattached check this valid
+  // id would be reported as "Unknown requestId" — telling the model it invented the id.
+  it('blames the reconnect, not the requestId, after the client is swapped', async () => {
+    const first = makeMockClient();
+    const second = makeMockClient(
+      undefined,
+      undefined,
+      {},
+      {
+        getResponseBody: vi.fn().mockRejectedValue(new Error('No resource with given identifier found')),
+      },
+    );
+    let current: CDP.Client = first;
+    const { mcpClient, attachNetwork } = await setupServer(() => current);
+    await captureOne(first, attachNetwork);
+
+    current = second;
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_response_body',
+      arguments: { requestId: 'req-1' },
+    });
+
+    const text = (result.content as any)[0].text;
+    expect(result.isError).toBe(true);
+    expect(text).toContain('new Chrome session');
+    expect(text).not.toContain('Unknown requestId');
+  });
+
   it('returns the body with metadata for a completed request', async () => {
     const getResponseBody = vi.fn().mockResolvedValue({ body: '{"ok":true}', base64Encoded: false });
     const cdpClient = makeMockClient(undefined, undefined, {}, { getResponseBody });
@@ -859,6 +1014,8 @@ describe('get_network_response_body', () => {
     expect(getResponseBody).toHaveBeenCalledWith({ requestId: 'req-1' });
     const meta = JSON.parse((result.content as any)[0].text);
     expect(meta).toMatchObject({ requestId: 'req-1', status: 200, byteLength: 11 });
+    // Single-request tool, so the metadata url is not length-truncated either.
+    expect(meta.url).toBe('https://api.example.com/users');
     expect((result.content as any)[1].text).toBe('{"ok":true}');
   });
 

@@ -769,6 +769,30 @@ describe('get_network_requests', () => {
     expect(record.responseHeaders).toEqual({ 'Content-Type': 'application/json' });
   });
 
+  // The schema promises that a missing key means "not sent" while an empty-string value means
+  // "sent, but empty". Both halves are asserted together because the distinction is the point:
+  // a truthy check inside projectHeaders would collapse them, and nothing else would notice.
+  it('keeps a header sent with an empty value, distinct from an absent one', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork, {
+      request: {
+        method: 'GET',
+        url: 'https://api.example.com/users',
+        headers: { 'x-empty': '' },
+      },
+    });
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_requests',
+      arguments: { headerKeys: ['X-Empty', 'X-Missing'] },
+    });
+
+    const record = (result.structuredContent as any).requests[0];
+    expect(record.requestHeaders).toEqual({ 'X-Empty': '' });
+    expect(record.responseHeaders).toEqual({});
+  });
+
   it('returns every header for headerKeys ["*"]', async () => {
     const cdpClient = makeMockClient();
     const { mcpClient, attachNetwork } = await setupServer(cdpClient);

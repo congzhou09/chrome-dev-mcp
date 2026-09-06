@@ -140,8 +140,13 @@ const formatUrl = (url: string, collapseLong = true): string => {
   return url;
 };
 
-// Flattened to a single line at capture time so the CDP handlers stay synchronous.
-// Positions are compiled positions — not source-mapped.
+// The CDP initiator is a nested stack trace (callFrames plus a parent chain); only the
+// topmost frame survives, as one string — the full tree on every record would dominate a
+// 200-request response.
+//
+// The position is COMPILED, not source-mapped: resolving needs an await, and this runs in a
+// capture handler that must stay synchronous. Deferring to return time would not help —
+// scriptRegistry is filled only by Debugger.scriptParsed, so it would take Debugger.enable().
 const formatInitiator = (initiator: any): string => {
   if (!initiator) return 'unknown';
   const type = initiator.type ?? 'unknown';
@@ -496,9 +501,7 @@ export function createServer(
   // Resolves true when THIS call performed the attach, which also means attachNetworkTo
   // just reset the capture buffer and the tombstone set. Callers turn that into a
   // "capture (re)started" explanation instead of reporting an empty buffer or an unknown
-  // requestId. Returning it from here keeps the client-identity check in one place —
-  // every caller previously had to re-derive it, and specifically BEFORE attaching,
-  // since attaching is what makes the two clients compare equal.
+  // requestId. Returning it from here keeps the client-identity check in one place.
   const ensureNetworkEvents = async (client: CDP.Client): Promise<boolean> => {
     // Everything up to the await must stay synchronous: it is what makes a concurrent
     // caller see networkRegisteredOnClient already set and await the same attach instead
@@ -1517,7 +1520,9 @@ export function createServer(
             durationMs: z
               .number()
               .optional()
-              .describe('Milliseconds from request start to its terminal event (finish, failure, or redirect)'),
+              .describe(
+                'Milliseconds from request start until this hop was closed out — by loadingFinished, loadingFailed, or the next hop taking over on a redirect',
+              ),
             fromCache: z
               .boolean()
               .optional()
@@ -1540,12 +1545,12 @@ export function createServer(
               .record(z.string(), z.string())
               .optional()
               .describe(
-                'The headers named by `headerKeys`, keyed by your own spelling; absent when `headerKeys` is omitted. A requested header missing from this map was not sent.',
+                'The headers named by `headerKeys`, keyed by your own spelling; absent when `headerKeys` is omitted. A requested header missing from this map was not sent; one present with an empty string WAS sent, with an empty value.',
               ),
             responseHeaders: z
               .record(z.string(), z.string())
               .optional()
-              .describe('Same projection as `requestHeaders`; empty when no response arrived'),
+              .describe('Same projection as `requestHeaders`; `{}` when no response arrived'),
           }),
         ),
       }),

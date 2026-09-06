@@ -1,7 +1,9 @@
 # server.ts 拆分方案
 
-> 状态：**待实施**（下个迭代）。本文档只记录方案，代码未改动。
-> 起点：`src/server.ts` 1596 行，21 + 2 = 23 个工具，56 个测试全绿。
+> 状态：**已实施**。`server.ts` 39 行（纯装配），23 个工具、63 个测试全绿，
+> 真实 Chrome 端到端 14 项全过。落地时相对本文档有两处调整，见下方「实施记录」。
+> 起点：`src/server.ts` 1721 行，21 + 2 = 23 个工具，63 个测试全绿。
+> （本文档写作时是 1596 行 / 56 个测试；network 的两次 refine 之后变成 1721 / 63。）
 
 ## 为什么拆
 
@@ -252,22 +254,61 @@ export function createServer(
   不要碰用户正在用的 tab）：确认 eager attach 抓到文档请求、reload 后
   loaderId 剪枝仍是「旧请求 0 残留 + 新 Document 保留」、body 能取回。
 
-## 待定项
+## 待定项（已定）
 
-动手前需要定的三件事：
+1. **`DebuggerSession` 的命名** → 改叫 **`InspectorSession`**（`src/inspector-session.ts`）。
+   它同时拥有 console 缓冲区，因为 `Console.enable()` 和 `Debugger.enable()` 共享同一个
+   懒注册入口和同一个复位块；拆成两个会话就得复制这两处。文件头的注释写明了这个理由。
+2. **`get_computed_style` / `get_inspected_element`** → 留在 `tools/page.ts`。
+   保持纯搬迁，不在结构重构里顺手改分组语义。真要加 DOM 类工具时再单开 `tools/dom.ts`。
+3. **`tools/debugger.ts` 478 行** → 先接受。10 个工具共享同一套依赖
+   （`getClient` + `session`），按行数切开不减少任何耦合。
 
-1. **`DebuggerSession` 的命名。** 它同时拥有 console 缓冲区（因为 `Console.enable()` 和
-   `Debugger.enable()` 共享同一个懒注册入口）。叫 `DebuggerSession` 名不副实，
-   `InspectorSession` 更准确但和 CDP 术语有歧义。也可以拆成两个会话共享一个 attach，
-   但要复制身份判断和复位逻辑。
-2. **`get_computed_style` 和 `get_inspected_element` 归哪组。** 现在按 banner 划进 page 组，
-   但它们语义上更偏 DOM 检查。如果以后要加 DOM 类工具，可能值得单开 `tools/dom.ts`。
-3. **`tools/debugger.ts` 拆完仍有 ~475 行**，是 5 个文件里最大的。要不要再切
-   （断点 / 步进 / 作用域求值 三块），还是先接受这个尺寸。
+## 实施记录
+
+相对上面方案的两处调整（都是方案写作后 network 迭代造成的，不是设计变更）：
+
+1. **`NetworkCapture.attach()` 返回 `boolean`，`isAttachedTo()` 不存在。**
+   `ensureNetworkEvents` 早已改成返回「本次调用是否真的执行了 attach」，两个 network 工具
+   都用它来解释空 buffer / 陌生 requestId，测试 harness 的类型也已经是 `Promise<boolean>`。
+   方案里的 `attach(): Promise<void>` + 独立 `isAttachedTo()` 合并成了一个方法。
+2. **`format.ts` 还吃下了 `projectHeaders` + `HEADER_WILDCARD`**（headerKeys 那次迭代新加），
+   `toOutputRecord` 依赖它们。
+
+最终行数：`server.ts` 39、`types.ts` 48、`constants.ts` 66、`sourcemap.ts` 68、
+`tools/console.ts` 78、`format.ts` 104、`tools/tabs.ts` 106、`network-capture.ts` 217、
+`inspector-session.ts` 221、`tools/page.ts` 230、`tools/network.ts` 304、
+`tools/debugger.ts` 478。`index.ts` 一行未改。
+
+### 端到端时顺带发现的既有 bug（已修）
+
+发现过程：`switch_tab` 紧跟服务启动时，每个请求在 `get_network_requests` 里出现**两条**，
+且第一条永远没有 status / headers（`headerKeys` 返回 `{}`）。
+`git stash` 回重构前的代码跑同一个脚本**完全一致地复现**，确认与本次拆分无关。
+
+根因在 `src/index.ts`：`switchToTarget` 既不等待也无法取消在飞的 `connectingPromise`。
+启动时首次 `getClient()` 还没把 `cdpClient` 赋值时，`if (cdpClient)` 为假 → 旧 client
+不会被关掉，于是同一个 target 上留下两个活着的 CDP client，两套 Network 监听喂同一个
+buffer；`networkByRequestId` 只指向后写入的那条，前一条再也收不到 `responseReceived`。
+
+修法（`src/index.ts`，`server.ts` 及拆分出的模块一行未动）：
+
+- 用 `pending` + `queueTransition()` 把**所有**连接变更串行化，替掉原来只做去重的
+  `connectingPromise`。`switch_tab` 因此排在启动连接之后，close 才真的能关到那个 client。
+- `getClient()` 在有变更在飞时返回同一个 promise，不再另起一次连接；
+  若在飞的是 `switch_tab`，它会正确落在被切过去的那个 tab 上。
+- `switch_tab` 切到**当前已连接的同一个 tab** 时直接返回现有 client，不再重建 ——
+  重建会无谓清空 network 抓包缓冲和 debugger 状态，还会把 client 从并发调用者手里抽走。
+- 关闭 client 时一并清掉 `currentTargetId`，避免切换失败后 `list_tabs` 仍把旧 tab 标成 active。
+
+验证：真实 Chrome 端到端 19 项全过（含刻意让 `switch_tab` ×2 与一个 `getClient()`
+调用同时抢跑启动连接）；启动日志里 `Connected to Chrome` 从 3 次降到 1 次。
+另有 10 项专门覆盖切换路径：A→B→A、同 tab 重复切换为 no-op、切换到不存在的 target
+后不残留 active tab 且下次调用能自愈。`src/index.ts` 仍无单元测试覆盖。
 
 ## 已知不在本次范围
 
-- `src/server.test.ts` 1040 行、56 个测试是否跟着拆（镜像成 `tools/*.test.ts` +
-  抽出 `test-helpers.ts`），本次未决。源码拆完后测试仍能从 MCP 边界正常工作，
-  不拆也不阻塞 —— 而且不动它正是它能当安全网的前提。
+- `src/server.test.ts` 1221 行、63 个测试是否跟着拆（镜像成 `tools/*.test.ts` +
+  抽出 `test-helpers.ts`），仍未决。源码拆完后测试仍从 MCP 边界正常工作，
+  一行都没改 —— 而不动它正是它能当安全网的前提。
 - WebSocket / EventSource 帧捕获（Network 那次迭代明确排除的范围）。

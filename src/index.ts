@@ -5,8 +5,29 @@ import { createServer } from './server.js';
 
 let cdpClient: CDP.Client | null = null;
 let currentTargetId: string | null = null;
-// Shared promise while a connection attempt is in flight — prevents duplicate attempts.
-let connectingPromise: Promise<CDP.Client | null> | null = null;
+
+// Serialises every connection transition, and is also the shared promise that stops two
+// callers from starting duplicate attempts.
+//
+// Serialising matters because a transition tears down `cdpClient` and builds a new one:
+// two of them interleaving can leave a client that nobody holds a reference to but that is
+// still open, with its Network listeners still feeding the one shared capture buffer —
+// every request then lands in the buffer twice, and the duplicate that responseReceived
+// does NOT update stays without status or headers forever.
+let pending: Promise<CDP.Client | null> | null = null;
+
+// Runs `work` after whatever transition is already in flight, never concurrently with it.
+const queueTransition = (work: () => Promise<CDP.Client | null>): Promise<CDP.Client | null> => {
+  // A failed predecessor must not poison the queue; each transition reports its own errors.
+  const run = (pending ?? Promise.resolve(null)).catch(() => null).then(work);
+  pending = run;
+  // Only clear if nothing else has queued behind us in the meantime.
+  const settle = () => {
+    if (pending === run) pending = null;
+  };
+  run.then(settle, settle);
+  return run;
+};
 
 // Created up here (not next to server.connect below) because connectToTarget needs
 // attachNetwork, and connectToTarget can run before the transport is wired up.
@@ -61,9 +82,11 @@ async function connectToTarget(targetId: string): Promise<CDP.Client> {
 
 async function getClient(): Promise<CDP.Client | null> {
   if (cdpClient) return cdpClient;
-  if (connectingPromise) return connectingPromise;
+  // Share whatever transition is in flight instead of racing it. If that is a switch_tab,
+  // this call correctly ends up on the tab being switched to.
+  if (pending) return pending;
 
-  connectingPromise = (async () => {
+  return queueTransition(async () => {
     try {
       const targetId = await findActivePageTargetId();
       if (targetId === undefined) {
@@ -74,26 +97,35 @@ async function getClient(): Promise<CDP.Client | null> {
     } catch (e) {
       console.error('[chrome-dev-mcp] Chrome unavailable:', (e as Error).message);
       return null;
-    } finally {
-      connectingPromise = null;
     }
-  })();
-
-  return connectingPromise;
+  });
 }
 
 async function switchToTarget(targetId: string): Promise<CDP.Client | null> {
-  if (cdpClient) {
-    await cdpClient.close().catch(() => {});
-    cdpClient = null;
-  }
-  connectingPromise = null;
-  try {
-    return await connectToTarget(targetId);
-  } catch (e) {
-    console.error('[chrome-dev-mcp] Failed to switch to target:', (e as Error).message);
-    return null;
-  }
+  // Queued rather than run immediately: the eager connect from startup can still be in
+  // flight with `cdpClient` not yet assigned, and closing before it lands would close
+  // nothing and leave that client open on the old target.
+  return queueTransition(async () => {
+    // Already on this target: hand back the live client instead of rebuilding. A rebuild
+    // would reset the network capture buffer and the debugger state for nothing, and it
+    // would pull the client out from under a concurrent caller still using it. A client
+    // that actually died is already null here — the 'disconnect' handler clears it.
+    if (cdpClient && currentTargetId === targetId) return cdpClient;
+
+    if (cdpClient) {
+      await cdpClient.close().catch(() => {});
+      cdpClient = null;
+      // Cleared together with the client: a failed switch below must not leave a targetId
+      // that list_tabs would still report as the active tab.
+      currentTargetId = null;
+    }
+    try {
+      return await connectToTarget(targetId);
+    } catch (e) {
+      console.error('[chrome-dev-mcp] Failed to switch to target:', (e as Error).message);
+      return null;
+    }
+  });
 }
 
 // Start MCP transport before attempting Chrome connection so Claude Code

@@ -31,7 +31,6 @@ export function registerConsoleTools(
           .enum(['log', 'info', 'debug', 'warning', 'error', 'exception'])
           .optional()
           .describe('Filter by log level / type. Omit to return all levels.'),
-        clear: z.boolean().default(false).describe('Clear the buffer after returning entries'),
       }),
       outputSchema: z.object({
         logs: z.array(
@@ -57,14 +56,12 @@ export function registerConsoleTools(
         readOnlyHint: true,
       },
     },
-    async ({ limit, level, clear }) => {
+    async ({ limit, level }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       await session.attach(client);
 
       const logs = session.readConsoleLogs({ limit, level });
-
-      if (clear) session.clearConsoleLogs();
 
       return {
         content:

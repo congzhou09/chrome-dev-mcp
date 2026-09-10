@@ -146,7 +146,9 @@ export function createInspectorSession() {
             return filtered.slice(-limit);
         },
         clearConsoleLogs() {
+            const dropped = consoleLogs.length;
             consoleLogs.length = 0;
+            return dropped;
         },
     };
 }

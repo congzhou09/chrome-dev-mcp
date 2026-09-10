@@ -25,6 +25,16 @@ export function createNetworkCapture() {
             discardedRequestIds.delete(discardedRequestIds.values().next().value);
         }
     };
+    // Unlike reset(), the ids stay tombstoned: clearing our buffer does not make the
+    // requests imaginary, and Chrome may still hold their bodies.
+    const clearBuffer = () => {
+        const dropped = networkRequests.length;
+        for (const record of networkRequests)
+            noteDiscarded(record.requestId);
+        networkRequests.length = 0;
+        networkByRequestId.clear();
+        return dropped;
+    };
     const pushNetworkRecord = (record) => {
         networkRequests.push(record);
         networkByRequestId.set(record.requestId, record);
@@ -169,6 +179,7 @@ export function createNetworkCapture() {
         wasDiscarded(requestId) {
             return discardedRequestIds.has(requestId);
         },
+        clearBuffer,
         reset,
     };
 }

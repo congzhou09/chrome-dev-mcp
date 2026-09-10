@@ -38,6 +38,8 @@
 
 ■ **Iframes, workers, and service workers are not supported at present.**
 
+■ **WebSocket frames are not captured.**
+
 ■ **Not designed to run alongside chrome-devtools-mcp**. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
 ## Prerequisites
@@ -168,7 +170,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 | Tool               | Description                                                                                                                                                                                                                                                                                                                                               |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_console_logs` | All messages visible in the DevTools Console — including output that existed before this server connected. Exceptions are reported with their full stack trace (source-mapped when available). Supports filtering by level (`log` / `info` / `debug` / `warning` / `error` / `exception`) and an optional `clear` flag to flush the buffer after reading. |
+| `get_console_logs` | All messages visible in the DevTools Console — including output that existed before this server connected. Exceptions are reported with their full stack trace (source-mapped when available). Supports filtering by level (`log` / `info` / `debug` / `warning` / `error` / `exception`). Not pruned on navigation — use `clear_captures` to start fresh. |
 
 ### Debugger
 
@@ -190,19 +192,18 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 | Tool                        | Description                                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_network_requests`      | HTTP requests captured from the connected tab — method, URL, resource type, status, transferred size, duration, initiator, and failure reason. Redirects appear as one record per hop. Filter by URL substring, resource type, or status class (`2xx` / `3xx` / `4xx` / `5xx` / `failed` / `pending`); `includeHeaders` adds request/response headers, `clear` flushes the buffer. |
-| `get_network_response_body` | Response body for one `requestId` from `get_network_requests`. Fetched from Chrome on demand — never buffered by this server. Binary bodies are reported as metadata only.                                                                                                                                                                                                             |
+| `get_network_requests`      | HTTP requests captured from the connected tab — method, URL, resource type, status, transferred size, duration, initiator, and failure reason. Redirects appear as one record per hop. Filter by URL substring, resource type, or status class (`2xx` / `3xx` / `4xx` / `5xx` / `failed` / `pending`). `headerKeys` returns the named request/response headers (omit for none, `["*"]` for all). |
+| `get_network_response_body` | Response body for one `requestId` from `get_network_requests`. Fetched from Chrome on demand — never buffered by this server, and Chrome discards it on navigation, so fetch while the page is still up. Binary bodies are reported as metadata only.                                                                                                                                                                                                             |
 
-Unlike `get_console_logs`, network capture is **not** retroactive: `Network.enable()` has no
-history replay, so capture begins when this server connects to the tab and nothing before
-that is visible. Reload the page to collect its requests.
+▲Unlike `get_console_logs`, network capture is **not** retroactive: `Network.enable()` has no history replay, so capture begins when this server connects to the tab and nothing before that is visible. Requests belonging to a previous page are then pruned on navigation, mirroring the DevTools Network panel default — the new document's own request is kept.
 
-Requests belonging to a previous page are pruned on navigation, mirroring the DevTools
-Network panel default — the new document's own request is kept. WebSocket frames are not
-captured.
+### Capture buffers
 
-Response bodies live in Chrome's own buffer (100 MB total / 10 MB per resource here), which
-it clears on navigation, so fetch a body while the page is still up.
+| Tool             | Description                                                                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clear_captures` | Discard the console and/or network buffers this server holds, so the next read shows only what happens afterwards. Pick with `targets`; defaults to both. |
+
+▲Affects this server only — nothing is cleared in Chrome or in the DevTools UI, and capture keeps running. Clearing cannot be undone: console entries are gone for good, since `Console.enable()` replays history only at attach time, while cleared network `requestId`s still resolve in `get_network_response_body` for as long as Chrome itself holds the body.
 
 ## Typical debugging workflow
 

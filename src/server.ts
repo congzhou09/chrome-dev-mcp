@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import pkgInfo from '../package.json' with { type: 'json' };
 import { createInspectorSession } from './inspector-session.js';
 import { createNetworkCapture } from './network-capture.js';
+import { registerCaptureTools } from './tools/capture.js';
 import { registerConsoleTools } from './tools/console.js';
 import { registerDebuggerTools } from './tools/debugger.js';
 import { registerNetworkTools } from './tools/network.js';
@@ -34,6 +35,7 @@ export function createServer(
   registerDebuggerTools(server, getClient, session);
   registerConsoleTools(server, getClient, session);
   registerNetworkTools(server, getClient, networkCapture);
+  registerCaptureTools(server, session, networkCapture);
 
   return { server, attachNetwork: networkCapture.attach };
 }

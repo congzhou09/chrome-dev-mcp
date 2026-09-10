@@ -29,6 +29,18 @@ export interface NetworkCapture {
    *  "discarded" from "unknown id", which Chrome reports identically. */
   wasDiscarded(requestId: string): boolean;
 
+  /**
+   * User-requested clear (`get_network_requests` with `clear: true`). Drops every
+   * record, but tombstones their ids and keeps the tombstones already recorded, so a
+   * later body fetch still says "discarded" instead of accusing the caller of an
+   * invented requestId. Returns how many records were dropped.
+   */
+  clearBuffer(): number;
+
+  /**
+   * Full reset, performed on attach to a new client: records AND tombstones go, because
+   * ids from a previous Chrome session must not be claimed as ours.
+   */
   reset(): void;
 }
 
@@ -59,6 +71,16 @@ export function createNetworkCapture(): NetworkCapture {
       // Set iterates in insertion order, so this drops the oldest.
       discardedRequestIds.delete(discardedRequestIds.values().next().value as string);
     }
+  };
+
+  // Unlike reset(), the ids stay tombstoned: clearing our buffer does not make the
+  // requests imaginary, and Chrome may still hold their bodies.
+  const clearBuffer = (): number => {
+    const dropped = networkRequests.length;
+    for (const record of networkRequests) noteDiscarded(record.requestId);
+    networkRequests.length = 0;
+    networkByRequestId.clear();
+    return dropped;
   };
 
   const pushNetworkRecord = (record: NetworkRecord): void => {
@@ -211,6 +233,8 @@ export function createNetworkCapture(): NetworkCapture {
     wasDiscarded(requestId) {
       return discardedRequestIds.has(requestId);
     },
+
+    clearBuffer,
 
     reset,
   };

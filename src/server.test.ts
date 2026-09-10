@@ -937,21 +937,6 @@ describe('get_network_requests', () => {
     expect((result.structuredContent as any).requests).toHaveLength(1);
   });
 
-  it('clears the buffer when clear is true', async () => {
-    const cdpClient = makeMockClient();
-    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
-    await captureOne(cdpClient, attachNetwork);
-
-    const first = await mcpClient.callTool({
-      name: 'get_network_requests',
-      arguments: { clear: true },
-    });
-    const second = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
-
-    expect((first.structuredContent as any).requests).toHaveLength(1);
-    expect((second.structuredContent as any).requests).toHaveLength(0);
-  });
-
   it('evicts the oldest record beyond the buffer cap', async () => {
     const cdpClient = makeMockClient();
     const { mcpClient, attachNetwork } = await setupServer(cdpClient);
@@ -1109,6 +1094,23 @@ describe('get_network_response_body', () => {
     expect(result.isError).toBe(true);
   });
 
+  it('reports a cleared request as discarded, not unknown', async () => {
+    const getResponseBody = vi.fn().mockRejectedValue(new Error('No resource with given identifier found'));
+    const cdpClient = makeMockClient(undefined, undefined, {}, { getResponseBody });
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork);
+    await mcpClient.callTool({ name: 'clear_captures', arguments: { targets: ['network'] } });
+
+    const result = await mcpClient.callTool({
+      name: 'get_network_response_body',
+      arguments: { requestId: 'req-1' },
+    });
+
+    expect((result.content as any)[0].text).toMatch(/was captured but its data has been discarded/);
+    expect((result.content as any)[0].text).not.toContain('Unknown requestId');
+    expect(result.isError).toBe(true);
+  });
+
   it('still returns a body Chrome kept after the record was evicted', async () => {
     const getResponseBody = vi.fn().mockResolvedValue({ body: 'late but present', base64Encoded: false });
     const cdpClient = makeMockClient(undefined, undefined, {}, { getResponseBody });
@@ -1217,5 +1219,43 @@ describe('get_network_response_body', () => {
 
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
     expect(result.isError).toBe(true);
+  });
+});
+
+describe('clear_captures', () => {
+  it('clears the network buffer and reports how many records went', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork);
+
+    const cleared = await mcpClient.callTool({ name: 'clear_captures', arguments: {} });
+    const after = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
+
+    expect((cleared.structuredContent as any).cleared).toEqual({ console: 0, network: 1 });
+    expect((after.structuredContent as any).requests).toHaveLength(0);
+  });
+
+  it('touches only the targets it was given', async () => {
+    const cdpClient = makeMockClient();
+    const { mcpClient, attachNetwork } = await setupServer(cdpClient);
+    await captureOne(cdpClient, attachNetwork);
+
+    const result = await mcpClient.callTool({
+      name: 'clear_captures',
+      arguments: { targets: ['console'] },
+    });
+    const after = await mcpClient.callTool({ name: 'get_network_requests', arguments: {} });
+
+    expect((result.structuredContent as any).cleared).toEqual({ console: 0 });
+    expect((after.structuredContent as any).requests).toHaveLength(1);
+  });
+
+  it('works without a connected tab', async () => {
+    const mcpClient = await setupMcpClient(null);
+
+    const result = await mcpClient.callTool({ name: 'clear_captures', arguments: {} });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as any).cleared).toEqual({ console: 0, network: 0 });
   });
 });

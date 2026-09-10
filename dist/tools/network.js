@@ -36,7 +36,6 @@ export function registerNetworkTools(server, getClient, capture) {
                 .min(1)
                 .optional()
                 .describe('Return only these headers, matched case-insensitively, on both requestHeaders and responseHeaders. Omit to return no headers. Pass ["*"] for every header — that is bounded only by `limit`, so use it with `requestId` or a small limit.'),
-            clear: z.boolean().default(false).describe('Clear the capture buffer after returning entries'),
         }),
         outputSchema: z.object({
             requests: z.array(z.object({
@@ -100,7 +99,7 @@ export function registerNetworkTools(server, getClient, capture) {
             title: 'Get network requests',
             readOnlyHint: true,
         },
-    }, async ({ limit, requestId, urlFilter, resourceType, status, headerKeys, clear }) => {
+    }, async ({ limit, requestId, urlFilter, resourceType, status, headerKeys }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
@@ -130,9 +129,6 @@ export function registerNetworkTools(server, getClient, capture) {
         });
         // A requestId query is a drill-down: bounded output, so long URLs stay intact.
         const requests = filtered.slice(-limit).map((r) => toOutputRecord(r, headerKeys, requestId == null));
-        // Mirrors get_console_logs: `clear` empties the whole buffer, not the filtered slice.
-        if (clear)
-            capture.reset();
         const emptyMessage = reattached
             ? 'Network capture (re)started for a new Chrome session — the previous buffer was discarded. Reload the page or re-trigger the requests, then call this tool again.'
             : capture.requests.length === 0
@@ -150,7 +146,7 @@ export function registerNetworkTools(server, getClient, capture) {
             'Bodies are never buffered by this server — they are read from Chrome on demand, and Chrome discards them on navigation or when its own buffer limits are exceeded, so fetch promptly and before navigating away. ' +
             'Chrome stores at most one body per requestId, so for a redirect chain only the final hop has a body. ' +
             'Returns a JSON metadata block, then the body as a separate text block — kept separate so a large body is not JSON-escaped. ' +
-            'Metadata carries requestId, base64Encoded, byteLength and method/url/status/mimeType, the last four replaced by a `note` when the capture buffer no longer holds the request, plus `truncated: true` when the body was cut at ' +
+            'Metadata carries requestId, `base64Encoded` (boolean; true when the body is base64, as CDP reports it), byteLength and method/url/status/mimeType, the last four replaced by a `note` when the capture buffer no longer holds the request, plus `truncated: true` when the body was cut at ' +
             `${MAX_RESPONSE_BODY_LENGTH} characters. ` +
             'A binary body is never returned: metadata carries `omitted` and there is no second content block.',
         inputSchema: z.object({
@@ -208,7 +204,7 @@ export function registerNetworkTools(server, getClient, capture) {
                 const text = reattached
                     ? `Network capture (re)started for a new Chrome session, discarding every request captured before it — ${requestId} belonged to the previous session and is not invalid. Re-trigger the request, then fetch the body under its new requestId.`
                     : capture.wasDiscarded(requestId)
-                        ? `Request ${requestId} was captured but its data has been discarded (page navigation, or the capture buffer overflowed). Re-trigger the request and fetch its body before navigating.`
+                        ? `Request ${requestId} was captured but its data has been discarded (page navigation, a clear_captures call, or the capture buffer overflowed). Re-trigger the request and fetch its body before navigating.`
                         : `Unknown requestId ${requestId}. It is not in the capture buffer (last ${MAX_NETWORK_REQUESTS} requests, pruned on navigation) and Chrome has no data for it. Call get_network_requests for current requestIds.`;
                 return { content: [{ type: 'text', text }], isError: true };
             }

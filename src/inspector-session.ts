@@ -39,7 +39,9 @@ export interface InspectorSession {
   waitForNextPause(client: CDP.Client, timeoutMs?: number): Promise<boolean>;
 
   readConsoleLogs(opts: { limit: number; level?: string }): ConsoleEntry[];
-  clearConsoleLogs(): void;
+
+  /** Drops every buffered entry. Returns how many were dropped. */
+  clearConsoleLogs(): number;
 }
 
 export function createInspectorSession(): InspectorSession {
@@ -215,7 +217,9 @@ export function createInspectorSession(): InspectorSession {
     },
 
     clearConsoleLogs() {
+      const dropped = consoleLogs.length;
       consoleLogs.length = 0;
+      return dropped;
     },
   };
 }

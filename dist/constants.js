@@ -10,6 +10,22 @@ export const NOT_CONNECTED = {
 };
 export const MAX_CONSOLE_LOGS = 500;
 export const MAX_HTML_LENGTH = 20_000;
+// ── Connection timeouts ───────────────────────────────────────────────────────
+//
+// Chrome is never assumed to be in a clean debugging state. A renderer that is paused at a
+// breakpoint, stuck in a synchronous loop, or blocked on a modal answers NO CDP command —
+// not even Runtime.enable — and never rejects either. Every command issued while building
+// a connection is therefore bounded; without that, one wedged tab parks the shared
+// connection promise forever and every tool that needs a client times out at the MCP layer
+// while browser-level tools like list_tabs keep working.
+// Per-target visibility probe. Only has to survive one round-trip to a healthy renderer.
+export const TARGET_PROBE_TIMEOUT_MS = 2000;
+// Runtime.enable + Page.enable + Network.enable against the chosen target, as a group.
+export const CONNECT_TIMEOUT_MS = 10_000;
+// Backstop on the transition queue itself: how long a queued transition waits for its
+// predecessor before giving up on serialisation and running anyway. Serialisation is worth
+// having, but not at the price of a permanent deadlock.
+export const TRANSITION_WAIT_TIMEOUT_MS = 15_000;
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
 // as the zod `.max()` on `limit`: 1000 records would be ~60-100k tokens in one response.

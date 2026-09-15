@@ -1,7 +1,7 @@
 {
   "name": "chrome-dev-mcp",
   "version": "1.4.0",
-  "description": "An MCP server for Chrome runtime debugging",
+  "description": "Attach to an already-running Chrome tab for real runtime debugging: breakpoints, stepping, scope variables. Plain CDP, minimal dependencies.",
   "main": "dist/index.js",
   "bin": {
     "chrome-dev-mcp": "dist/index.js"

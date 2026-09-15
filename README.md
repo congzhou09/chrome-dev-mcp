@@ -2,9 +2,9 @@
 
 [![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp)
 
-●An MCP server for inspecting and debugging web pages in Chrome, especially useful for web frontend development.
+●An MCP server that attaches to an already-running Chrome tab for real runtime debugging: breakpoints, stepping, and scope variables — plus JS/CSS inspection, console logs, and network capture. Built for web frontend development.
 
-●This project focuses on Chrome runtime debugging, supports JS/CSS inspection, console log access, and runtime debugging (breakpoints, stepping, scope variables) in open Chrome tabs.
+●It talks plain CDP through chrome-remote-interface — no DevTools SDK, no bundled browser — so it debugs the tab you already have open, in your own Chrome, instead of launching an isolated instance.
 
 ## Demo video
 

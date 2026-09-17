@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { MAX_HTML_LENGTH, NOT_CONNECTED } from '../constants.js';
+import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 // ── Page inspection tools ─────────────────────────────────────────────────────
 //
 // Every tool here is a bare Runtime.evaluate / Page.captureScreenshot, so this group
@@ -61,16 +62,20 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
+        // Evaluated exactly once, in preview mode. Asking for the value here instead would
+        // silently flatten DOM nodes, Errors, Maps and class instances, and retrying after
+        // its -32000 would re-run the expression — see remote-object.ts.
         const result = await client.Runtime.evaluate({
             expression,
-            returnByValue: true,
+            returnByValue: false,
+            generatePreview: true,
         });
         if (result.exceptionDetails) {
             const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
             return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
         }
-        const { value, type, description } = result.result;
-        const text = value !== undefined ? JSON.stringify(value, null, 2) : (description ?? type ?? 'undefined');
+        const text = await renderValueFirst(client, result.result);
+        await releaseRemoteObject(client, result.result);
         return { content: [{ type: 'text', text }] };
     });
     server.registerTool('get_computed_style', {

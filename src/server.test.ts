@@ -10,6 +10,7 @@ function makeMockClient(
   captureScreenshot = vi.fn(),
   debuggerMethods: Record<string, ReturnType<typeof vi.fn>> = {},
   networkMethods: Record<string, ReturnType<typeof vi.fn>> = {},
+  runtimeMethods: Record<string, ReturnType<typeof vi.fn>> = {},
 ): CDP.Client {
   const debugger_ = {
     on: vi.fn(),
@@ -32,7 +33,14 @@ function makeMockClient(
   };
 
   return Object.assign(new EventEmitter(), {
-    Runtime: { enable: vi.fn(), evaluate, getProperties: vi.fn() },
+    Runtime: {
+      enable: vi.fn(),
+      evaluate,
+      getProperties: vi.fn(),
+      callFunctionOn: vi.fn().mockResolvedValue({ result: { type: 'object', value: {} } }),
+      releaseObject: vi.fn().mockResolvedValue({}),
+      ...runtimeMethods,
+    },
     Page: { enable: vi.fn(), captureScreenshot, on: vi.fn() },
     Console: { on: vi.fn(), enable: vi.fn().mockResolvedValue({}) },
     Debugger: debugger_,
@@ -116,17 +124,156 @@ describe('get_html', () => {
 });
 
 describe('evaluate_js', () => {
-  it('passes expression to Runtime.evaluate and JSON-stringifies the result', async () => {
-    const evaluate = vi.fn().mockResolvedValue({ result: { value: { count: 42 } } });
+  // Mock shapes below are copied from real Chrome responses, not invented: preview mode is
+  // what the tool now asks for, and by-value serialisation of a DOM node / Error / Map is
+  // what it deliberately avoids. See remote-object.ts for the measurements.
+  const PREVIEW_MODE = { returnByValue: false, generatePreview: true };
+
+  it('evaluates once, in preview mode', async () => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { type: 'number', value: 42, description: '42' } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
-    const result = await client.callTool({
-      name: 'evaluate_js',
-      arguments: { expression: 'window.__myData' },
-    });
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: '40 + 2' } });
 
-    expect(evaluate).toHaveBeenCalledWith({ expression: 'window.__myData', returnByValue: true });
-    expect(result.content).toEqual([{ type: 'text', text: JSON.stringify({ count: 42 }, null, 2) }]);
+    expect(evaluate).toHaveBeenCalledWith({ expression: '40 + 2', ...PREVIEW_MODE });
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect((result.content as any)[0].text).toBe('42');
+  });
+
+  it('upgrades a plain object to its full deep value without re-evaluating the expression', async () => {
+    const value = { a: 1, b: { c: [1, 2, { d: 3 }] } };
+    const evaluate = vi.fn().mockResolvedValue({
+      result: { type: 'object', className: 'Object', objectId: 'obj-1' },
+    });
+    const callFunctionOn = vi.fn().mockResolvedValue({ result: { type: 'object', value } });
+    const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { callFunctionOn }));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: '({a:1,b:{c:[1,2,{d:3}]}})' } });
+
+    expect((result.content as any)[0].text).toBe(JSON.stringify(value, null, 2));
+    // The whole point of going through callFunctionOn: one evaluation, so `n++` increments once.
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(callFunctionOn).toHaveBeenCalledWith({
+      objectId: 'obj-1',
+      functionDeclaration: 'function () { return this; }',
+      returnByValue: true,
+    });
+  });
+
+  it('falls back to the preview when the value cannot be serialised (reference cycle)', async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {
+        type: 'object',
+        className: 'Object',
+        objectId: 'obj-1',
+        preview: {
+          description: 'Object',
+          overflow: false,
+          properties: [
+            { name: 'n', type: 'number', value: '1' },
+            { name: 'self', type: 'object', value: 'Object' },
+          ],
+        },
+      },
+    });
+    // Real Chrome rejects with -32000 "Object reference chain is too long".
+    const callFunctionOn = vi.fn().mockRejectedValue(new Error('Object reference chain is too long'));
+    const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { callFunctionOn }));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'cyclic' } });
+
+    expect((result.content as any)[0].text).toBe('Object {\n  n: 1,\n  self: Object\n}');
+    expect(result.isError).toBeFalsy();
+  });
+
+  it('renders a DOM node as its shape instead of the empty object a by-value round-trip yields', async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {
+        type: 'object',
+        subtype: 'node',
+        className: 'HTMLDivElement',
+        description: 'div#root',
+        objectId: 'obj-1',
+        preview: {
+          type: 'object',
+          subtype: 'node',
+          description: 'div#root',
+          overflow: true,
+          properties: [{ name: 'id', type: 'string', value: 'root' }],
+        },
+      },
+    });
+    const callFunctionOn = vi.fn();
+    const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { callFunctionOn }));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: "document.querySelector('div')" } });
+
+    // Trailing marker: Chrome caps a preview, and a partial listing must not read as complete.
+    expect((result.content as any)[0].text).toBe('div#root {\n  id: root,\n  …\n}');
+    // Anything that is not a plain container must never be sent through a by-value round-trip.
+    expect(callFunctionOn).not.toHaveBeenCalled();
+  });
+
+  it('renders Map contents from preview entries rather than its size property', async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {
+        type: 'object',
+        subtype: 'map',
+        className: 'Map',
+        description: 'Map(1)',
+        objectId: 'obj-1',
+        preview: {
+          description: 'Map(1)',
+          overflow: false,
+          properties: [{ name: 'size', type: 'number', value: '1' }],
+          entries: [{ key: { description: 'k' }, value: { description: '1' } }],
+        },
+      },
+    });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'new Map([["k",1]])' } });
+
+    expect((result.content as any)[0].text).toBe('Map(1) {\n  k => 1\n}');
+  });
+
+  it('releases the remote object preview mode pinned in the renderer', async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: { type: 'object', className: 'Object', objectId: 'obj-1' },
+    });
+    const releaseObject = vi.fn().mockResolvedValue({});
+    const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { releaseObject }));
+
+    await client.callTool({ name: 'evaluate_js', arguments: { expression: '({})' } });
+
+    expect(releaseObject).toHaveBeenCalledWith({ objectId: 'obj-1' });
+  });
+
+  it('renders an Error as its stack, not as a brace layout repeating the stack', async () => {
+    const description = 'Error: boom\n    at <anonymous>:1:1';
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {
+        type: 'object',
+        subtype: 'error',
+        className: 'Error',
+        description,
+        objectId: 'obj-1',
+        preview: {
+          subtype: 'error',
+          description,
+          overflow: false,
+          properties: [
+            { name: 'stack', type: 'string', value: description },
+            { name: 'message', type: 'string', value: 'boom' },
+          ],
+        },
+      },
+    });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'new Error("boom")' } });
+
+    expect((result.content as any)[0].text).toBe(description);
   });
 
   it('returns error message when expression throws', async () => {
@@ -139,15 +286,6 @@ describe('evaluate_js', () => {
     const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'x' } });
 
     expect((result.content as any)[0].text).toBe('Error: ReferenceError: x is not defined');
-  });
-
-  it('returns description when value is undefined (e.g. non-serializable object)', async () => {
-    const evaluate = vi.fn().mockResolvedValue({ result: { type: 'object', description: 'HTMLDivElement' } });
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'document.body' } });
-
-    expect((result.content as any)[0].text).toBe('HTMLDivElement');
   });
 
   it('returns "undefined" string when expression result is undefined', async () => {
@@ -249,6 +387,75 @@ describe('get_debugger_state', () => {
     expect(parsed.callStack[0].lineNumber).toBe(10); // converted from 0-indexed
   });
 });
+
+describe('evaluate_at_frame', () => {
+  async function pauseAt(cdpClient: CDP.Client, mcpClient: Awaited<ReturnType<typeof setupMcpClient>>) {
+    // First call triggers ensureDebuggerEvents, which registers handlers on the mock.
+    await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    const pausedHandler = (cdpClient as any).Debugger.on.mock.calls.find(
+      ([event]: [string]) => event === 'paused',
+    )?.[1];
+    pausedHandler?.({
+      reason: 'breakpoint',
+      hitBreakpoints: ['b:1:0'],
+      callFrames: [
+        {
+          callFrameId: 'cf-1',
+          functionName: 'handleClick',
+          url: 'http://localhost:3000/app.js',
+          location: { scriptId: '1', lineNumber: 9, columnNumber: 2 },
+          scopeChain: [{ type: 'local', object: { objectId: 'obj-1' } }],
+        },
+      ],
+    });
+  }
+
+  it('renders the shape of an object rather than serialising it by value', async () => {
+    const evaluateOnCallFrame = vi.fn().mockResolvedValue({
+      result: {
+        type: 'object',
+        className: 'Foo',
+        description: 'Foo',
+        objectId: 'frame-obj-1',
+        preview: {
+          description: 'Foo',
+          overflow: false,
+          properties: [{ name: 'a', type: 'number', value: '1' }],
+        },
+      },
+    });
+    const cdpClient = makeMockClient(vi.fn(), undefined, { evaluateOnCallFrame });
+    const mcpClient = await setupMcpClient(cdpClient);
+    await pauseAt(cdpClient, mcpClient);
+
+    const result = await mcpClient.callTool({ name: 'evaluate_at_frame', arguments: { expression: 'obj' } });
+
+    // Shape, not value: a by-value round-trip would flatten this to {"a":1} and lose `Foo`.
+    expect((result.content as any)[0].text).toBe('Foo {\n  a: 1\n}');
+    expect(evaluateOnCallFrame).toHaveBeenCalledWith({
+      callFrameId: 'cf-1',
+      expression: 'obj',
+      returnByValue: false,
+      generatePreview: true,
+    });
+  });
+
+  it('refuses to evaluate when the debugger is not paused', async () => {
+    const evaluateOnCallFrame = vi.fn();
+    const cdpClient = makeMockClient(vi.fn(), undefined, { evaluateOnCallFrame });
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const result = await mcpClient.callTool({ name: 'evaluate_at_frame', arguments: { expression: 'obj' } });
+
+    // The precondition is the reason this is a separate tool from evaluate_js: it is
+    // session state the caller cannot see, so it is reported rather than silently
+    // falling back to global scope.
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toContain('not paused');
+    expect(evaluateOnCallFrame).not.toHaveBeenCalled();
+  });
+});
+
 
 describe('set_breakpoint', () => {
   it('calls setBreakpointByUrl and returns the breakpointId', async () => {

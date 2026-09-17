@@ -2,6 +2,7 @@ import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { NOT_CONNECTED } from '../constants.js';
+import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import type { InspectorSession } from '../inspector-session.js';
 
 // ── Debugger tools ────────────────────────────────────────────────────────────
@@ -425,16 +426,10 @@ export function registerDebuggerTools(
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
 
-      const r = result.result;
-      let text: string;
-      if (r.value !== undefined) {
-        text = JSON.stringify(r.value, null, 2);
-      } else if (r.preview) {
-        const props = (r.preview.properties ?? []).map((p: any) => `  ${p.name}: ${p.value}`).join(',\n');
-        text = `${r.preview.description ?? r.type} {\n${props}\n}`;
-      } else {
-        text = r.description ?? r.type ?? 'undefined';
-      }
+      // Shape-first, unlike evaluate_js: at a breakpoint the question is almost always
+      // "what is this object", not "give me its bytes".
+      const text = renderRemoteObject(result.result);
+      await releaseRemoteObject(client, result.result);
       return { content: [{ type: 'text', text }] };
     },
   );

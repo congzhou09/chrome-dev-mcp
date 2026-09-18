@@ -186,7 +186,7 @@ describe('evaluate_js', () => {
     expect(result.isError).toBeFalsy();
   });
 
-  it('renders a DOM node as its shape instead of the empty object a by-value round-trip yields', async () => {
+  it('renders a DOM node as a preview instead of the empty object a by-value round-trip yields', async () => {
     const evaluate = vi.fn().mockResolvedValue({
       result: {
         type: 'object',
@@ -410,7 +410,7 @@ describe('evaluate_at_frame', () => {
     });
   }
 
-  it('renders the shape of an object rather than serialising it by value', async () => {
+  it('renders a preview of an object rather than serialising it by value', async () => {
     const evaluateOnCallFrame = vi.fn().mockResolvedValue({
       result: {
         type: 'object',

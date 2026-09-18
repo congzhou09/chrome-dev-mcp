@@ -1,8 +1,13 @@
 // Rendering for CDP RemoteObjects, shared by evaluate_js and evaluate_at_frame.
 //
 // It lives in one place so the two tools differ only where they are MEANT to — evaluate_js
-// is value-first (a Console: you want the real value), evaluate_at_frame is shape-first
+// is value-first (a Console: you want the real value), evaluate_at_frame is preview-first
 // (a Watch pane: you want to see what the object is) — and never by accident.
+//
+// "Preview" is CDP's own noun, not a coinage here: `RemoteObject.preview` is a
+// `Runtime.ObjectPreview`, requested with `generatePreview` and flagged `overflow` when
+// Chrome truncates it. It carries a class name and one level of properties — enough to
+// read, never enough to parse back into the value.
 //
 // Why neither tool asks for `returnByValue: true` up front, even though that is the
 // obvious way to get a value: the serialisation it performs is lossy in a way the response
@@ -27,7 +32,7 @@
 // then upgrade to a value only for objects that survive the round-trip, reusing the
 // objectId already in hand so the expression is never evaluated a second time.
 // Containers whose entire meaning IS their contents, and which therefore lose nothing by
-// value. Everything else is shown as shape. `Object.create(null)` reports className
+// value. Everything else is shown as a preview. `Object.create(null)` reports className
 // 'Object' too, so it lands here correctly.
 const isPlainData = (r) => r.subtype === 'array' || (r.className === 'Object' && r.subtype === undefined);
 const previewLine = (entry) => entry.key ? `  ${entry.key.description} => ${entry.value.description}` : `  ${entry.value.description}`;
@@ -48,7 +53,7 @@ const deepValue = async (client, objectId) => {
         return { ok: false };
     }
 };
-// Shape-first: what the value IS, one level deep. Used as-is by evaluate_at_frame.
+// Preview-first: what the value IS, one level deep. Used as-is by evaluate_at_frame.
 export const renderRemoteObject = (r) => {
     if (r.value !== undefined)
         return JSON.stringify(r.value, null, 2);
@@ -72,7 +77,7 @@ export const renderRemoteObject = (r) => {
     }
     return r.description ?? r.type ?? 'undefined';
 };
-// Value-first: the real value when it survives serialisation, the shape when it does not.
+// Value-first: the real value when it survives serialisation, a preview when it does not.
 // Used by evaluate_js. `r` must come from an evaluate with generatePreview.
 export const renderValueFirst = async (client, r) => {
     if (r.value === undefined && r.objectId && isPlainData(r)) {

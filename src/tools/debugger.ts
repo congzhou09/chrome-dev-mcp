@@ -386,7 +386,11 @@ export function registerDebuggerTools(
     'evaluate_at_frame',
     {
       description:
-        'Evaluate a JavaScript expression in the scope of a paused call frame. Unlike evaluate_js, this has access to local variables, closure variables, and the current `this`. Only works when execution is paused.',
+        'Evaluate a JavaScript expression in the scope of a paused call frame — it reads local variables, closure ' +
+        'variables and the current `this`, which evaluate_js cannot. Only works while execution is paused: when it is ' +
+        'not, this returns an error rather than silently falling back to global scope. Results come back as a ' +
+        'preview — class name plus a first level of properties, marked `…` where Chrome truncated it — readable, ' +
+        'not parseable as the value. Use get_debugger_state to find frame indices.',
       inputSchema: z.object({
         expression: z.string().describe('JS expression to evaluate'),
         frameIndex: z
@@ -426,7 +430,7 @@ export function registerDebuggerTools(
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
 
-      // Shape-first, unlike evaluate_js: at a breakpoint the question is almost always
+      // Preview-first, unlike evaluate_js: at a breakpoint the question is almost always
       // "what is this object", not "give me its bytes".
       const text = renderRemoteObject(result.result);
       await releaseRemoteObject(client, result.result);

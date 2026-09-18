@@ -73,7 +73,11 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
     'evaluate_js',
     {
       description:
-        'Evaluate javascript in page. To access the currently selected element in the Elements panel ($0), use get_inspected_element instead.',
+        'Evaluate a JavaScript expression in the page, in global scope. Returns the real value when it serialises; ' +
+        'objects that cannot (DOM nodes, Errors, Maps, class instances) come back as a preview instead: class name plus a ' +
+        'first level of properties, marked `…` where Chrome truncated it — readable, not parseable as the value. ' +
+        'At a breakpoint this still evaluates globally and cannot see local or closure variables — use evaluate_at_frame for those. ' +
+        'For the element selected in the Elements panel ($0), use get_inspected_element.',
       inputSchema: z.object({ expression: z.string() }),
       annotations: {
         title: 'Evaluate JS',
@@ -169,6 +173,24 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
     },
   );
 
+  // Reads `window.$0` — a real page global the user has to create — rather than `$0` itself,
+  // because `$0` is out of this server's reach entirely.
+  //
+  // `$0` is not a page variable. It resolves from the inspector's selected-node state, which is
+  // held PER CDP SESSION, and nothing here ever sets it. Measured against a live Chrome with an
+  // h2 selected in DevTools, from a separate session:
+  //
+  //   typeof window.$0                            -> "undefined"   (never a page global)
+  //   typeof $0   with includeCommandLineAPI      -> "undefined"   (selection not shared)
+  //   typeof $$   with includeCommandLineAPI      -> "function"    (the API itself IS live)
+  //   ...then this session calls DOM.setInspectedNode itself:
+  //   typeof $0   with includeCommandLineAPI      -> "object"
+  //   $0.tagName                                  -> "H2"
+  //
+  // So turning on includeCommandLineAPI would not help: it hands over `$$` and not `$0`.
+  // Neither would calling DOM.setInspectedNode — that WRITES the state, so we would have to
+  // already know which node the user means, and CDP offers no way to read which node DevTools
+  // has selected. Hence the manual `window.$0 = $0` step, which runs where the binding lives.
   server.registerTool(
     'get_inspected_element',
     {

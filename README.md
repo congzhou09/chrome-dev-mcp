@@ -147,6 +147,19 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ## MCP Tools
 
+24 tools in six groups — five domains plus one cross-cutting tool:
+
+| Group | Tools | Covers |
+| --- | --- | --- |
+| Tab management | 2 | Discovering tabs, and choosing which one this server is attached to |
+| Page inspection | 7 | The live page: title, URL, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
+| Console | 1 | Console messages and uncaught exceptions, including output from before this server connected |
+| Debugger | 11 | Breakpoints, stepping, call stack, scopes, frame-scoped evaluation |
+| Network | 2 | Requests captured from connect time onward, plus response bodies fetched on demand |
+| Capture buffers | 1 | `clear_captures` — cross-cutting: resets the console and network buffers above |
+
+All 24 serve the same workflow: get the page into the state where it misbehaves, then read whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Several pairs below look mergeable and are deliberately not — [docs/tool-boundaries.md](docs/tool-boundaries.md) records which, and why.
+
 ### Tab management
 
 | Tool         | Description                                                                                                                                 |
@@ -161,7 +174,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `get_title`             | Current page title                                                                                             |
 | `get_url`               | Current page URL                                                                                               |
 | `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
-| `evaluate_js`           | Run arbitrary JavaScript and return the result                                                                 |
+| `evaluate_js`           | Run arbitrary JavaScript in global scope. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value                                                                 |
 | `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
 | `screenshot`            | PNG screenshot of the current viewport                                                                         |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
@@ -178,7 +191,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line (map to source code if possible) |
 | `get_scope_variables` | Variable values inside a call frame scope (`local`, `closure`, `block`, `global`, …)                                |
-| `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — has access to local variables, closures, and `this`       |
+| `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — reads local variables, closures, and `this`. Errors out when not paused rather than falling back to global scope       |
 | `set_breakpoint`      | Set a breakpoint by URL + line number; supports conditions and URL regex                                            |
 | `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                       |
 | `list_breakpoints`    | All breakpoints active in this session                                                                              |
@@ -227,6 +240,8 @@ evaluate_at_frame           → expression: "dropTargets.map(t => t.id)"  →  [
 ```
 
 > `evaluate_at_frame` runs in the paused frame's scope and can read local variables, whereas `evaluate_js` runs in the global scope and cannot.
+> They stay separate tools so that the pause state — which the caller cannot see — is carried by the tool name instead of an optional
+> parameter: `evaluate_js` never silently answers from the wrong scope, and `evaluate_at_frame` never silently answers from the global one.
 
 ## Development
 

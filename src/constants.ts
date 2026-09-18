@@ -33,6 +33,73 @@ export const CONNECT_TIMEOUT_MS = 10_000;
 // having, but not at the price of a permanent deadlock.
 export const TRANSITION_WAIT_TIMEOUT_MS = 15_000;
 
+// ── evaluate_js timeouts ──────────────────────────────────────────────────────
+//
+// An arbitrary expression can hang in two ways that need two different bounds. They cover
+// disjoint cases and neither substitutes for the other. Measured against Chrome 141:
+//
+//   expression                      renderer      Runtime.evaluate `timeout`   client-side race
+//   while (Date.now()-t < 5000) {}  WEDGED        fires, 1008ms for 1000       useless
+//   await new Promise(() => {})     idle          never fires (>6000ms)        the only bound
+//
+// Row 2 is the case that matters, and it holds for a structural reason: `timeout` bounds
+// EXECUTION, and time suspended at an `await` is not execution. An `await sleep(800)` under
+// `timeout: 200` was not terminated — it returned its value ~1000ms later, five times over
+// its own bound. Suspended time is simply not counted, so an expression that never resumes
+// never accumulates any, and `timeout` has nothing to fire on however long we wait. The
+// client-side race is the only thing that ends that call.
+//
+// The reverse is just as one-sided. A synchronous loop wedges the renderer, which then
+// answers no CDP command at all — the client-side race hands control back to the caller but
+// leaves the tab spinning, and every later tool call inherits a dead target. Only `timeout`
+// actually stops it.
+
+// Server-side: how long the expression may hold the renderer in ONE uninterrupted stretch.
+//
+// Not a budget for the whole expression — the clock is per-slice, and every `await` resets
+// it. Measured: ten 700ms busy loops separated by awaits, 7177ms of real execution, ran to
+// completion under `timeout: 5000`. So what this actually catches is five continuous seconds
+// of a blocked main thread, which no legitimate debugging expression reaches and which is
+// already a broken page. Total runtime is bounded by EVAL_SETTLE_TIMEOUT_MS instead.
+export const EVAL_EXECUTION_TIMEOUT_MS = 5000;
+
+// Client-side: the wall-clock bound on the whole call, covering an expression suspended on a
+// promise that never settles — and a context destroyed mid-evaluate by a navigation, which
+// drops the command without ever answering it.
+//
+// Sized for what top-level `await` invites people to write: awaiting a slow fetch, an
+// animation, a poll for an element. 30s matches the de-facto convention for browser
+// automation (Playwright's default action timeout, Puppeteer's default navigation timeout).
+//
+// The ceiling is the MCP client's own request timeout, DEFAULT_REQUEST_TIMEOUT_MSEC = 60s.
+// Staying well under it is the point: whichever timer fires first writes the error message,
+// and ours names the cause while the client's only says the call took too long.
+export const EVAL_SETTLE_TIMEOUT_MS = 30_000;
+
+// Bound on the optional deep-value upgrade in remote-object.ts, which runs AFTER the two
+// above have already been satisfied — so it has to be small enough that the two cannot add
+// up past the MCP client's 60s. 30 + 5 leaves real headroom.
+//
+// Generous against measured cost: an array of 500,000 small objects deep-serialises in
+// 1631ms (10,000 -> 35ms, 100,000 -> 355ms), so 5s covers anything a person would sit and
+// wait for, and falling back to the preview is a correct answer rather than an error.
+//
+// It is a stop-loss, not a cure. `Runtime.callFunctionOn` takes no `timeout` of its own, so
+// nothing can terminate the renderer once serialisation is spinning. Two measurements, and
+// they answer different questions — the second one alone would prove nothing:
+//
+//   get slow() { busy(3000); return 'GETTER_RAN' }   3001ms, and 'GETTER_RAN' came back
+//   get boom() { while (true) {} }                   never returned
+//
+// The first is the evidence that serialisation INVOKES getters, and it had to TERMINATE to
+// be evidence at all: a hang on its own is equally consistent with the call failing for some
+// unrelated reason, whereas a getter that costs exactly its own 3000ms and hands back the
+// value it computed can only have been called. The second is then the consequence — and
+// afterwards the renderer answered no command at all, not even a `1+1` carrying its own
+// timeout. The race saves this call; the tab stays wedged either way. Without it the call
+// simply never returns.
+export const EVAL_DEEP_VALUE_TIMEOUT_MS = 5000;
+
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
 // as the zod `.max()` on `limit`: 1000 records would be ~60-100k tokens in one response.

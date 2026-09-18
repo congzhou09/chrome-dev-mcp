@@ -348,7 +348,7 @@ export function registerDebuggerTools(server, getClient, session) {
         // Preview-first, unlike evaluate_js: at a breakpoint the question is almost always
         // "what is this object", not "give me its bytes".
         const text = renderRemoteObject(result.result);
-        await releaseRemoteObject(client, result.result);
+        releaseRemoteObject(client, result.result);
         return { content: [{ type: 'text', text }] };
     });
     server.registerTool('step_out', {

@@ -174,7 +174,7 @@ All 24 serve the same workflow: get the page into the state where it misbehaves,
 | `get_title`             | Current page title                                                                                             |
 | `get_url`               | Current page URL                                                                                               |
 | `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
-| `evaluate_js`           | Run arbitrary JavaScript in global scope. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value                                                                 |
+| `evaluate_js`           | Run arbitrary JavaScript in global scope, with DevTools console semantics: top-level `await` works, and an expression that merely returns a promise stays pending rather than being awaited for you. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value |
 | `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
 | `screenshot`            | PNG screenshot of the current viewport                                                                         |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |

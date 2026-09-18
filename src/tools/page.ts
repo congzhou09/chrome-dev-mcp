@@ -1,8 +1,30 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { MAX_HTML_LENGTH, NOT_CONNECTED } from '../constants.js';
+import {
+  EVAL_EXECUTION_TIMEOUT_MS,
+  EVAL_SETTLE_TIMEOUT_MS,
+  MAX_HTML_LENGTH,
+  NOT_CONNECTED,
+} from '../constants.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
+import { TIMED_OUT, withTimeout } from '../timeout.js';
+
+// Chrome reports a `timeout` kill as a REJECTED command rather than through
+// `exceptionDetails`, so it bypasses the normal error path entirely. The code it rejects
+// with also degrades once replMode is on — measured, Chrome 141, reproducible over repeats:
+//
+//   replMode: false  ->  -32000  "Execution was terminated"
+//   replMode: true   ->  -32603  "Internal error"
+//
+// Neither message is worth putting in front of a caller, and the second one says nothing at
+// all, so both are recognised here and answered with our own text.
+const isExecutionTerminated = (err: unknown): boolean => {
+  const response = (err as { response?: { code?: number; message?: string } })?.response;
+  return response?.message === 'Execution was terminated' || response?.code === -32603;
+};
+
+const timedOut = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true });
 
 // ── Page inspection tools ─────────────────────────────────────────────────────
 //
@@ -73,9 +95,16 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
     'evaluate_js',
     {
       description:
-        'Evaluate a JavaScript expression in the page, in global scope. Returns the real value when it serialises; ' +
-        'objects that cannot (DOM nodes, Errors, Maps, class instances) come back as a preview instead: class name plus a ' +
-        'first level of properties, marked `…` where Chrome truncated it — readable, not parseable as the value. ' +
+        'Evaluate a JavaScript expression in the page, in global scope, with the same semantics as the DevTools console. ' +
+        'Returns the real value when it serialises; objects that cannot (DOM nodes, Errors, Maps, class instances) come back ' +
+        'as a preview instead: class name plus a first level of properties, marked `…` where Chrome truncated it — readable, ' +
+        'not parseable as the value. ' +
+        'Top-level `await` works. An expression that merely RETURNS a promise is NOT awaited for you — it comes back as a ' +
+        'pending Promise, exactly as in the console; `await` it yourself to get the value. ' +
+        'Everything else is evaluated synchronously, so state a click triggers is not visible in the same call: a React ' +
+        're-render commits in a microtask that runs after this returns. Put `await Promise.resolve()` between the click and ' +
+        'the read, or read in a second call. ' +
+        `Terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution, or ${EVAL_SETTLE_TIMEOUT_MS}ms without settling. ` +
         'At a breakpoint this still evaluates globally and cannot see local or closure variables — use evaluate_at_frame for those. ' +
         'For the element selected in the Elements panel ($0), use get_inspected_element.',
       inputSchema: z.object({ expression: z.string() }),
@@ -89,17 +118,57 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
       // Evaluated exactly once, in preview mode. Asking for the value here instead would
       // silently flatten DOM nodes, Errors, Maps and class instances, and retrying after
       // its -32000 would re-run the expression — see remote-object.ts.
-      const result = await client.Runtime.evaluate({
+      //
+      // `replMode` is what the DevTools console itself passes, and it is the switch that
+      // enables top-level `await`; `awaitPromise` is deliberately NOT set alongside it.
+      // The two are not freely combinable — measured, Chrome 141:
+      //
+      //   replMode  awaitPromise   `(async () => { await sleep(800); return 'R' })()`
+      //   false     false          Promise            (3ms)
+      //   false     true           'R'                (1217ms — really waited)
+      //   true      false          Promise            (2ms)
+      //   true      true           Promise            (2ms — awaitPromise is INERT)
+      //
+      // replMode wraps the expression in an async function and resolves that wrapper itself,
+      // which is both how top-level `await` works under `awaitPromise: false` and why
+      // `awaitPromise` has nothing left to act on. So "console semantics plus auto-await" is
+      // not a reachable combination, and passing awaitPromise here would only be dead weight
+      // that reads as if it did something.
+      const evaluation = client.Runtime.evaluate({
         expression,
         returnByValue: false,
         generatePreview: true,
+        replMode: true,
+        timeout: EVAL_EXECUTION_TIMEOUT_MS,
       });
+      // The settle race below abandons this promise on timeout. Without a handler of its own,
+      // a later rejection would surface as an unhandledRejection with nobody listening.
+      evaluation.catch(() => {});
+
+      let result;
+      try {
+        const settled = await withTimeout(evaluation, EVAL_SETTLE_TIMEOUT_MS);
+        if (settled === TIMED_OUT) {
+          return timedOut(
+            `Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. It is suspended on something ` +
+              'that has not resolved — a pending promise, a request that never returns. The page is still running it.',
+          );
+        }
+        result = settled;
+      } catch (err) {
+        if (!isExecutionTerminated(err)) throw err;
+        return timedOut(
+          `Error: expression was terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution — it was still ` +
+            'running (an infinite loop, or a blocking computation). The tab was not left spinning.',
+        );
+      }
+
       if (result.exceptionDetails) {
         const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
       const text = await renderValueFirst(client, result.result);
-      await releaseRemoteObject(client, result.result);
+      releaseRemoteObject(client, result.result);
       return { content: [{ type: 'text', text }] };
     },
   );

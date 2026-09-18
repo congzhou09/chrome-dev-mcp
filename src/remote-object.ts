@@ -1,4 +1,6 @@
 import type CDP from 'chrome-remote-interface';
+import { EVAL_DEEP_VALUE_TIMEOUT_MS } from './constants.js';
+import { TIMED_OUT, withTimeout } from './timeout.js';
 
 // Rendering for CDP RemoteObjects, shared by evaluate_js and evaluate_at_frame.
 //
@@ -44,14 +46,30 @@ const previewLine = (entry: any): string =>
 
 // Deep-serialises an object already held by `objectId`, without re-evaluating anything.
 // Rejects on a reference cycle (-32000), which is a fallback signal, not an error to report.
+//
+// Bounded because serialisation is not the passive read it looks like: it INVOKES getters.
+// Measured, Chrome 141 — `({ get slow() { busy(3000); return 'x' } })` came back after
+// exactly 3001ms with the getter's value in it, and `get boom() { while (true) {} }` never
+// came back at all. `isPlainData` routes any plain object here, so a single hostile or
+// merely expensive getter is enough. See EVAL_DEEP_VALUE_TIMEOUT_MS for what the bound can
+// and cannot rescue.
+//
+// Every failure lands on the same `ok: false`, and that is the point: this is an optional
+// upgrade over a preview that is already a correct answer, so timing out degrades the
+// output rather than turning into an error the caller has to handle.
 const deepValue = async (client: CDP.Client, objectId: string): Promise<{ ok: boolean; value?: unknown }> => {
   try {
-    const res = await client.Runtime.callFunctionOn({
+    const call = client.Runtime.callFunctionOn({
       objectId,
       functionDeclaration: 'function () { return this; }',
       returnByValue: true,
     });
-    if (res.exceptionDetails) return { ok: false };
+    // The race abandons this promise on timeout. Without a handler of its own, a later
+    // rejection would surface as an unhandledRejection with nobody listening.
+    call.catch(() => {});
+
+    const res = await withTimeout(call, EVAL_DEEP_VALUE_TIMEOUT_MS);
+    if (res === TIMED_OUT || res.exceptionDetails) return { ok: false };
     return { ok: true, value: res.result.value };
   } catch {
     return { ok: false };
@@ -73,7 +91,13 @@ export const renderRemoteObject = (r: any): string => {
     // so reading properties alone renders `Map(1) { size: 1 }` — true, and useless.
     const lines: string[] = preview.entries?.length
       ? preview.entries.map(previewLine)
-      : (preview.properties ?? []).map((p: any) => `  ${p.name}: ${p.value}`);
+      : (preview.properties ?? []).map((p: any) =>
+          // An accessor carries no `value` in a preview — Chrome does not call getters to
+          // build one. Interpolating the absent value prints `name: undefined`, which reads
+          // as "this property IS undefined" rather than "this is a getter nobody called".
+          // DevTools writes `(...)` here, and so do we.
+          p.type === 'accessor' ? `  ${p.name}: (...)` : `  ${p.name}: ${p.value}`,
+        );
     // Chrome caps a preview at five-ish properties; without this marker a partial listing
     // reads as a complete one.
     if (preview.overflow) lines.push('  …');
@@ -96,6 +120,13 @@ export const renderValueFirst = async (client: CDP.Client, r: any): Promise<stri
 // Preview mode pins the object in the renderer heap until it is released. Failure is
 // ignored on purpose: the object is already rendered, and a stale objectId (navigation,
 // context destroyed) is exactly when this rejects.
-export const releaseRemoteObject = async (client: CDP.Client, r: any): Promise<void> => {
-  if (r?.objectId) await client.Runtime.releaseObject({ objectId: r.objectId }).catch(() => {});
+//
+// Fire-and-forget, deliberately not awaited. Nothing in the response depends on the release,
+// and a renderer wedged inside a blocking getter answers this command exactly as reluctantly
+// as the one that wedged it: measured, `releaseObject` on such a target had still not
+// answered after 5000ms. Awaiting it was what carried a single evaluate_js past the MCP
+// client's 60s limit even with the deep-value upgrade already bounded — bounding this one
+// too would only trade a hang for a fixed tax on every call after a wedge.
+export const releaseRemoteObject = (client: CDP.Client, r: any): void => {
+  if (r?.objectId) void client.Runtime.releaseObject({ objectId: r.objectId }).catch(() => {});
 };

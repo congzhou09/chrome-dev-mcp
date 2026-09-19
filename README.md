@@ -1,6 +1,6 @@
 # chrome-dev-mcp
 
-[![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp)
+[![npm chrome-dev-mcp package](https://img.shields.io/npm/v/chrome-dev-mcp.svg)](https://npmjs.org/package/chrome-dev-mcp) [![chrome-dev-mcp MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/congzhou09/chrome-dev-mcp/badges/score.svg)](https://glama.ai/mcp/servers/congzhou09/chrome-dev-mcp)
 
 ●An MCP server that attaches to an already-running Chrome tab for real runtime debugging: breakpoints, stepping, and scope variables — plus JS/CSS inspection, console logs, and network capture. Built for web frontend development.
 

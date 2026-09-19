@@ -11,9 +11,18 @@ import { TIMED_OUT, withTimeout } from '../timeout.js';
 //
 // Neither message is worth putting in front of a caller, and the second one says nothing at
 // all, so both are recognised here and answered with our own text.
-const isExecutionTerminated = (err) => {
+//
+// -32603 is JSON-RPC's generic "Internal error" though, not a fingerprint for termination:
+// every other internal failure in the protocol can carry it too. Claiming a timeout kill on
+// the code alone would answer an unrelated fault with a confident, fully wrong sentence and
+// swallow the real error, so it is only trusted once the kill we asked for is actually due.
+// `elapsedMs` is measured from before the command is sent, while Chrome starts its own
+// `timeout` clock only after receiving it, so a genuine kill always lands on the far side.
+const isExecutionTerminated = (err, elapsedMs) => {
     const response = err?.response;
-    return response?.message === 'Execution was terminated' || response?.code === -32603;
+    if (response?.message === 'Execution was terminated')
+        return true;
+    return response?.code === -32603 && elapsedMs >= EVAL_EXECUTION_TIMEOUT_MS;
 };
 const timedOut = (text) => ({ content: [{ type: 'text', text }], isError: true });
 // ── Page inspection tools ─────────────────────────────────────────────────────
@@ -72,12 +81,11 @@ export function registerPageTools(server, getClient) {
             'Returns the real value when it serialises; objects that cannot (DOM nodes, Errors, Maps, class instances) come back ' +
             'as a preview instead: class name plus a first level of properties, marked `…` where Chrome truncated it — readable, ' +
             'not parseable as the value. ' +
-            'Top-level `await` works. An expression that merely RETURNS a promise is NOT awaited for you — it comes back as a ' +
-            'pending Promise, exactly as in the console; `await` it yourself to get the value. ' +
-            'Everything else is evaluated synchronously, so state a click triggers is not visible in the same call: a React ' +
-            're-render commits in a microtask that runs after this returns. Put `await Promise.resolve()` between the click and ' +
+            'Top-level `await` works, but an expression that merely RETURNS a promise is NOT awaited — it comes back as a ' +
+            'pending Promise, exactly as in the console. ' +
+            'The call returns as soon as your expression finishes its synchronous work, before queued microtasks run, so the state ' +
+            'triggered by a click is not visible in the same call: put `await Promise.resolve()` between the click and ' +
             'the read, or read in a second call. ' +
-            `Terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution, or ${EVAL_SETTLE_TIMEOUT_MS}ms without settling. ` +
             'At a breakpoint this still evaluates globally and cannot see local or closure variables — use evaluate_at_frame for those. ' +
             'For the element selected in the Elements panel ($0), use get_inspected_element.',
         inputSchema: z.object({ expression: z.string() }),
@@ -107,6 +115,7 @@ export function registerPageTools(server, getClient) {
         // `awaitPromise` has nothing left to act on. So "console semantics plus auto-await" is
         // not a reachable combination, and passing awaitPromise here would only be dead weight
         // that reads as if it did something.
+        const startedAt = Date.now();
         const evaluation = client.Runtime.evaluate({
             expression,
             returnByValue: false,
@@ -127,7 +136,7 @@ export function registerPageTools(server, getClient) {
             result = settled;
         }
         catch (err) {
-            if (!isExecutionTerminated(err))
+            if (!isExecutionTerminated(err, Date.now() - startedAt))
                 throw err;
             return timedOut(`Error: expression was terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution — it was still ` +
                 'running (an infinite loop, or a blocking computation). The tab was not left spinning.');

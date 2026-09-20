@@ -1,7 +1,8 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { NOT_CONNECTED } from '../constants.js';
+import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut } from '../constants.js';
+import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
 
 // ── Tab management tools ──────────────────────────────────────────────────────
@@ -92,10 +93,16 @@ export function registerTabTools(
         };
       }
       await session.attach(client);
-      const result = await client.Runtime.evaluate({
-        expression: '({ title: document.title, url: location.href })',
-        returnByValue: true,
-      });
+      // connectToTarget already proved this target answers, so a hang here means it wedged in
+      // between — bounded anyway, because reporting the switch is not worth parking the call.
+      const result = await withTimeout(
+        client.Runtime.evaluate({
+          expression: '({ title: document.title, url: location.href })',
+          returnByValue: true,
+        }),
+        PAGE_COMMAND_TIMEOUT_MS,
+      );
+      if (result === TIMED_OUT) return rendererTimedOut(`switch_tab (connected to ${targetId}, but reading its title)`);
       const { title, url } = result.result.value as { title: string; url: string };
       return {
         content: [{ type: 'text', text: `Switched to: ${title} — ${url}` }],

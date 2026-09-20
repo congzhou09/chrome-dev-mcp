@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, } from '../constants.js';
+import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 // Chrome reports a `timeout` kill as a REJECTED command rather than through
@@ -29,6 +29,11 @@ const timedOut = (text) => ({ content: [{ type: 'text', text }], isError: true }
 //
 // Every tool here is a bare Runtime.evaluate / Page.captureScreenshot, so this group
 // needs nothing but getClient — no session state at all.
+//
+// Every one of them is also bounded. A CDP command sent to a renderer that is paused,
+// looping, or sitting on a modal neither returns nor rejects (see timeout.ts), so "read the
+// title" is just as capable of hanging forever as evaluating an arbitrary expression is —
+// the difference is only in how surprising it looks when it happens.
 export function registerPageTools(server, getClient) {
     server.registerTool('get_title', {
         description: 'Get the title of the currently connected tab (`document.title`).',
@@ -41,7 +46,9 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        const result = await client.Runtime.evaluate({ expression: 'document.title', returnByValue: true });
+        const result = await withTimeout(client.Runtime.evaluate({ expression: 'document.title', returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS);
+        if (result === TIMED_OUT)
+            return rendererTimedOut('get_title');
         return { content: [{ type: 'text', text: String(result.result.value) }] };
     });
     server.registerTool('get_url', {
@@ -55,12 +62,16 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        const result = await client.Runtime.evaluate({ expression: 'location.href', returnByValue: true });
+        const result = await withTimeout(client.Runtime.evaluate({ expression: 'location.href', returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS);
+        if (result === TIMED_OUT)
+            return rendererTimedOut('get_url');
         return { content: [{ type: 'text', text: String(result.result.value) }] };
     });
     server.registerTool('get_html', {
         description: 'Get the full HTML source of the currently connected tab (`document.documentElement.outerHTML`). ' +
-            `Truncated to ${MAX_HTML_LENGTH} characters for large pages.`,
+            `Truncated to ${MAX_HTML_LENGTH} characters for large pages; a truncated result ends with a ` +
+            '`…` marker giving how much was cut and the real length of the document, so a short result is never ' +
+            'ambiguous between "small page" and "cut off here".',
         inputSchema: z.object({}),
         annotations: {
             title: 'Get page HTML',
@@ -70,11 +81,36 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        const result = await client.Runtime.evaluate({
-            expression: 'document.documentElement.outerHTML',
+        const result = await withTimeout(client.Runtime.evaluate({
+            // Truncated in the page, not on arrival. Slicing here would mean serialising the
+            // whole document AND putting all of it on the wire, only to keep the first 20k.
+            // Measured, Chrome 141, a 500,000-node document — 25.5MB of outerHTML: 482ms to
+            // serialise, 1127ms to transfer. Slicing at the source drops that second number
+            // entirely, ~70% of the call, for a byte-identical result.
+            //
+            // The serialisation itself is not avoidable: `outerHTML` has to build the whole
+            // string before anything can take a slice of it. `length` is read off that same
+            // string, so reporting the real size costs one number rather than a second pass.
+            expression: `
+            (() => {
+              const html = document.documentElement.outerHTML;
+              return { html: html.slice(0, ${MAX_HTML_LENGTH}), totalLength: html.length };
+            })()
+          `,
             returnByValue: true,
-        });
-        return { content: [{ type: 'text', text: String(result.result.value).slice(0, MAX_HTML_LENGTH) }] };
+        }), PAGE_COMMAND_TIMEOUT_MS);
+        if (result === TIMED_OUT)
+            return rendererTimedOut('get_html');
+        const { html, totalLength } = result.result.value;
+        // Marked rather than silently cut, and marked in the same `… (+N chars)` idiom formatUrl
+        // uses. Without it a 20,000-character result is indistinguishable from a page that
+        // happens to be exactly that size, and reading truncated markup as the whole document is
+        // how "the element isn't in the DOM" gets concluded about an element that is.
+        const text = totalLength > MAX_HTML_LENGTH
+            ? `${html}
+… (+${totalLength - MAX_HTML_LENGTH} chars truncated — document is ${totalLength} characters)`
+            : html;
+        return { content: [{ type: 'text', text }] };
     });
     server.registerTool('evaluate_js', {
         description: 'Evaluate a JavaScript expression in the page, in global scope, with the same semantics as the DevTools console. ' +
@@ -180,7 +216,9 @@ export function registerPageTools(server, getClient) {
           return out;
         })()
       `;
-        const result = await client.Runtime.evaluate({ expression, returnByValue: true });
+        const result = await withTimeout(client.Runtime.evaluate({ expression, returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS);
+        if (result === TIMED_OUT)
+            return rendererTimedOut('get_computed_style');
         if (result.result.value === null) {
             return {
                 content: [{ type: 'text', text: `No element matches selector: ${selector}` }],
@@ -193,8 +231,25 @@ export function registerPageTools(server, getClient) {
             structuredContent: { styles },
         };
     });
+    // `Page.captureScreenshot` is the one command here that is not a query: it waits for the
+    // compositor to hand over a frame. A tab whose frames are not being produced — backgrounded
+    // within its window, its window minimised or fully occluded — answers it with neither a
+    // value nor an error, and the renderer itself is perfectly healthy throughout. So this tool
+    // gets a recovery step rather than only a bound.
+    //
+    // Bringing the tab forward is what actually ends that wait, and it is the RETRY rather than
+    // a precondition because it steals whatever tab the user is looking at — too rude to pay on
+    // every call for a fault that is occasional. Measured, Chrome 141, against a page target
+    // reporting `document.visibilityState === "hidden"` whose window was still on screen:
+    // capture returned in 137ms. So `hidden` is not the trigger and a pre-emptive activate would
+    // be spent for nothing nearly every time; frames were still being produced. What the hang
+    // needs is the surface to be gone, which is why it reads as "worked all session, then one
+    // call didn't".
+    //
+    // The abandoned first capture is left pending deliberately. Once the tab comes forward both
+    // captures resolve off the same frame; nothing is listening to the first one.
     server.registerTool('screenshot', {
-        description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools).',
+        description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools). If the tab is not on screen it is brought to the front first, which changes what the user is looking at.',
         inputSchema: z.object({}),
         annotations: {
             title: 'Screenshot',
@@ -204,7 +259,28 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        const result = await client.Page.captureScreenshot({ format: 'png' });
+        const capture = () => {
+            const shot = client.Page.captureScreenshot({ format: 'png' });
+            // Abandoned by the race on timeout; without a handler of its own a later rejection
+            // would surface as an unhandledRejection with nobody listening.
+            shot.catch(() => { });
+            return withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
+        };
+        let result = await capture();
+        if (result === TIMED_OUT) {
+            const front = client.Page.bringToFront();
+            front.catch(() => { });
+            if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) === TIMED_OUT) {
+                return timedOut(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
+                    'to the front either. Chrome is not answering for this target at all — check the window still exists.');
+            }
+            result = await capture();
+        }
+        if (result === TIMED_OUT) {
+            return timedOut(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, twice — once before bringing the tab ` +
+                'to the front and once after. The tab is not producing frames (minimised or fully occluded window), ' +
+                'or its renderer is blocked. Nothing was captured.');
+        }
         return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
     });
     // Reads `window.$0` — a real page global the user has to create — rather than `$0` itself,
@@ -243,7 +319,7 @@ export function registerPageTools(server, getClient) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        const result = await client.Runtime.evaluate({
+        const result = await withTimeout(client.Runtime.evaluate({
             expression: `
           (() => {
             const el = window.$0;
@@ -260,7 +336,9 @@ export function registerPageTools(server, getClient) {
           })()
         `,
             returnByValue: true,
-        });
+        }), PAGE_COMMAND_TIMEOUT_MS);
+        if (result === TIMED_OUT)
+            return rendererTimedOut('get_inspected_element');
         if (result.result.value === null) {
             return {
                 content: [

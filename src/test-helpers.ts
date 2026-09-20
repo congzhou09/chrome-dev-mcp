@@ -11,6 +11,7 @@ export function makeMockClient(
   debuggerMethods: Record<string, ReturnType<typeof vi.fn>> = {},
   networkMethods: Record<string, ReturnType<typeof vi.fn>> = {},
   runtimeMethods: Record<string, ReturnType<typeof vi.fn>> = {},
+  pageMethods: Record<string, ReturnType<typeof vi.fn>> = {},
 ): CDP.Client {
   const debugger_ = {
     on: vi.fn(),
@@ -41,7 +42,13 @@ export function makeMockClient(
       releaseObject: vi.fn().mockResolvedValue({}),
       ...runtimeMethods,
     },
-    Page: { enable: vi.fn(), captureScreenshot, on: vi.fn() },
+    Page: {
+      enable: vi.fn(),
+      captureScreenshot,
+      bringToFront: vi.fn().mockResolvedValue({}),
+      on: vi.fn(),
+      ...pageMethods,
+    },
     Console: { on: vi.fn(), enable: vi.fn().mockResolvedValue({}) },
     Debugger: debugger_,
     Network: network,
@@ -101,7 +108,11 @@ export function sentEvent(over: any = {}) {
   };
 }
 
-export async function captureOne(cdpClient: CDP.Client, attachNetwork: (c: CDP.Client) => Promise<boolean>, over: any = {}) {
+export async function captureOne(
+  cdpClient: CDP.Client,
+  attachNetwork: (c: CDP.Client) => Promise<boolean>,
+  over: any = {},
+) {
   await attachNetwork(cdpClient);
   fireCdp(cdpClient, 'Network', 'requestWillBeSent', sentEvent(over));
   fireCdp(cdpClient, 'Network', 'responseReceived', {

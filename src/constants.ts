@@ -100,6 +100,78 @@ export const EVAL_SETTLE_TIMEOUT_MS = 30_000;
 // simply never returns.
 export const EVAL_DEEP_VALUE_TIMEOUT_MS = 5000;
 
+// ── Page / tab command timeouts ───────────────────────────────────────────────
+
+// One CDP round-trip that has no reason to be slow: read document.title, read location.href,
+// serialise outerHTML, read a computed style, list a scope's properties. A renderer blocked in
+// a synchronous loop or sitting on a modal dialog answers none of them and rejects none of
+// them either, so without a bound the tool call hangs until the MCP client's own 60s timeout
+// writes a message that names nothing.
+//
+// Two of them are not constant-time: get_html scales with the size of the document, and
+// get_scope_variables with the number of properties in the scope. get_html is the one measured
+// here — the other's numbers live at its call site in debugger.ts, since they are about an
+// object's width and not about a page at all. Chrome 141, build cost subtracted so these are
+// what the call itself pays:
+//
+//   document                     outerHTML   serialise   transport
+//   real app page, 196 nodes       171 KB        —           —       (21ms all in)
+//   synthetic, 100,000 nodes       4.9 MB      103ms       251ms
+//   synthetic, 500,000 nodes      25.5 MB      482ms      1127ms
+//
+// It truncates inside the page, so it pays the serialise column and not the transport one —
+// 482ms at 500,000 nodes, which is itself two orders of magnitude past the DOM size Lighthouse
+// already calls excessive. The bound sits ~20x above that absurd page and ~475x above a real one.
+//
+// get_scope_variables is the tighter of the two, and so the one that really sets this value: a
+// pathologically wide object outruns 10s where no document can. A real scope does not come close.
+//
+// The margin is deliberate and close to free: a bound too large only lengthens the wait
+// before an error that was coming anyway, while a bound too small kills work that was going to
+// succeed. The ceiling that matters is the MCP client's 60s, and 10s stays well inside it.
+export const PAGE_COMMAND_TIMEOUT_MS = 10_000;
+
+// `Page.captureScreenshot` waits for the compositor to hand over a frame, which is a wait no
+// other command in this server makes. Measured, Chrome 141: a normal capture of a 1-tab page
+// took 189ms and 137ms. A tab that is not producing frames never answers at all — hence a
+// bound well above the real cost but far below anything a caller would sit through.
+export const SCREENSHOT_TIMEOUT_MS = 10_000;
+
+// Bound on `Page.bringToFront`. It is a tab activation handled by the browser rather than work
+// queued onto the page's main thread, so it stays answerable on a target that has stopped
+// answering everything else. Measured, Chrome 141, one throwaway tab over one CDP session,
+// the wedged column taken with the renderer held in a synchronous loop:
+//
+//   command                  healthy   wedged renderer
+//   Runtime.evaluate `1+1`       2ms   no answer in 3000ms
+//   Page.captureScreenshot     122ms   no answer in 5000ms
+//   Page.bringToFront            2ms   answered in 1ms
+//
+// A timeout here therefore has only one reading left: with the page's main thread ruled out as
+// the cause, an activation that goes unanswered means the target itself is gone.
+//
+// 3s rather than tighter because 1-2ms is a happy-path sample of a command that still crosses a
+// process boundary; rather than looser because nothing arrives late — it answers or it is gone.
+export const BRING_TO_FRONT_TIMEOUT_MS = 3000;
+
+// The answer to a CDP round-trip that outlived its bound. Deliberately a normal tool error
+// rather than a thrown one: "this renderer never answered" is a state the caller can act on
+// (resume the debugger, dismiss the dialog, reload the tab), not a fault in this server.
+export const rendererTimedOut = (
+  what: string,
+  causes = 'paused at a breakpoint, blocked in a synchronous loop, or blocked on a modal dialog',
+) => ({
+  content: [
+    {
+      type: 'text' as const,
+      text:
+        `Error: ${what} did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms. ` +
+        `The tab's renderer is not responding — it may be ${causes}.`,
+    },
+  ],
+  isError: true,
+});
+
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
 // as the zod `.max()` on `limit`: 1000 records would be ~60-100k tokens in one response.

@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import { NOT_CONNECTED } from '../constants.js';
+import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut } from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
+import { TIMED_OUT, withTimeout } from '../timeout.js';
 // ── Debugger tools ────────────────────────────────────────────────────────────
 export function registerDebuggerTools(server, getClient, session) {
     server.registerTool('get_debugger_state', {
@@ -95,11 +96,34 @@ export function registerDebuggerTools(server, getClient, session) {
                 isError: true,
             };
         }
-        const props = await client.Runtime.getProperties({
+        // The bound is not about the pause: a renderer halted at a breakpoint still services CDP,
+        // and answering this is exactly what it is halted for. Nor is it about getters — measured,
+        // Chrome 141, against an object whose getter busy-loops for 3000ms:
+        //
+        //   Runtime.getProperties + generatePreview      7ms   getter returned as an accessor
+        //   Runtime.callFunctionOn + returnByValue    3005ms   getter INVOKED, 'GETTER_RAN' came back
+        //
+        // which is the same split DevTools renders as `(...)`, and it puts the hazard that
+        // EVAL_DEEP_VALUE_TIMEOUT_MS exists for in remote-object.ts rather than in this call.
+        //
+        // What does scale here is width — own properties, previews generated for each:
+        //
+        //     1,000 properties      165ms
+        //   100,000 properties   22,579ms
+        //
+        // A scope is the first of those; a fat global is a couple of thousand entries, so 10s is
+        // ample for anything real. It is still the thinnest margin under PAGE_COMMAND_TIMEOUT_MS —
+        // a pathological object outruns the bound where no document can — which is worth knowing
+        // before widening what this tool fetches.
+        const props = await withTimeout(client.Runtime.getProperties({
             objectId: scope.object.objectId,
             ownProperties: true,
             generatePreview: true,
-        });
+        }), PAGE_COMMAND_TIMEOUT_MS);
+        if (props === TIMED_OUT) {
+            return rendererTimedOut('get_scope_variables', 'running again after the pause was read, wedged since, or holding a scope wide enough that ' +
+                'previewing it outruns the bound');
+        }
         const variables = (props.result ?? [])
             .filter((p) => !p.name.startsWith('__'))
             .map((p) => ({

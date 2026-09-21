@@ -176,7 +176,7 @@ All 24 serve the same workflow: get the page into the state where it misbehaves,
 | `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
 | `evaluate_js`           | Run arbitrary JavaScript in global scope, with DevTools console semantics: top-level `await` works, and an expression that merely returns a promise stays pending rather than being awaited for you. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value |
 | `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
-| `screenshot`            | PNG screenshot of the current viewport                                                                         |
+| `screenshot`            | PNG screenshot of the current viewport, or of one `region` of it (CSS px from the top-left of the visible area, as `getBoundingClientRect()` reports them). Native pixel size unless capped with `maxEdge` (longest side in px); a capture that was scaled or cut reports that |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
 
 ### Console

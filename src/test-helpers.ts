@@ -6,7 +6,9 @@ import CDP from 'chrome-remote-interface';
 import { createServer } from './server.js';
 
 export function makeMockClient(
-  evaluate = vi.fn(),
+  // Resolves rather than returning undefined: every tool here awaits Runtime.evaluate, and
+  // a bare vi.fn() would make them all reject on a mock that simply was not configured.
+  evaluate = vi.fn().mockResolvedValue({ result: {} }),
   captureScreenshot = vi.fn(),
   debuggerMethods: Record<string, ReturnType<typeof vi.fn>> = {},
   networkMethods: Record<string, ReturnType<typeof vi.fn>> = {},
@@ -46,6 +48,12 @@ export function makeMockClient(
       enable: vi.fn(),
       captureScreenshot,
       bringToFront: vi.fn().mockResolvedValue({}),
+      // A 1x display showing a viewport small enough that screenshot leaves it alone, so
+      // every test that is not about downscaling exercises the untouched path.
+      getLayoutMetrics: vi.fn().mockResolvedValue({
+        cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
+        layoutViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
+      }),
       on: vi.fn(),
       ...pageMethods,
     },

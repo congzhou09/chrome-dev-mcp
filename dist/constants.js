@@ -123,6 +123,16 @@ export const PAGE_COMMAND_TIMEOUT_MS = 10_000;
 // took 189ms and 137ms. A tab that is not producing frames never answers at all — hence a
 // bound well above the real cost but far below anything a caller would sit through.
 export const SCREENSHOT_TIMEOUT_MS = 10_000;
+// Bound on `Page.getLayoutMetrics` and the `devicePixelRatio` read beside it, which is what
+// turning a requested long edge into a clip needs. Measured, Chrome 153: 1ms, then 1ms on
+// each of three repeats. Both report state that already exists rather than waiting on the
+// compositor, so they do not share the frame-production stall `Page.captureScreenshot` has
+// to defend against.
+//
+// Short, and non-fatal on expiry: sizing is best-effort, capturing is the job. A timeout
+// here falls through to a native capture rather than failing the tool, so the whole cost of
+// this bound being too tight is a screenshot larger than the caller asked for.
+export const LAYOUT_METRICS_TIMEOUT_MS = 2000;
 // Bound on `Page.bringToFront`. It is a tab activation handled by the browser rather than work
 // queued onto the page's main thread, so it stays answerable on a target that has stopped
 // answering everything else. Measured, Chrome 141, one throwaway tab over one CDP session,

@@ -51,7 +51,7 @@ const pngSize = (base64: string): { width: number; height: number } | null => {
 
 type ScreenshotClip = { x: number; y: number; width: number; height: number; scale: number };
 
-// `Page.getLayoutMetrics`, narrowed to the two rectangles this needs and widened to survive
+// `Page.getLayoutMetrics`, narrowed to the two viewports this needs and widened to survive
 // their absence: `layoutViewport` is marked deprecated in the protocol, so it is read
 // defensively rather than trusted to be there.
 type LayoutMetrics = {
@@ -65,7 +65,7 @@ type Rect = { x: number; y: number; width: number; height: number };
 //
 // Measured against a page scrolled exactly one viewport down: a clip at `y: 0` captured the
 // top of the document while `y: pageY` captured what was actually on screen. Leaving the
-// origin in would quietly return the wrong part of every scrolled page — a silent wrong
+// origin(0,0) in would quietly return the wrong part of every scrolled page — a silent wrong
 // answer, which is worse than any sizing mistake.
 const viewportRect = (css: NonNullable<LayoutMetrics['cssLayoutViewport']>): Rect => ({
   x: css.pageX ?? 0,
@@ -92,26 +92,24 @@ const intersectViewport = (viewport: Rect, region: Rect): Rect | null => {
   return { x: left, y: top, width: right - left, height: bottom - top };
 };
 
-// How much to shrink a rect so its long edge lands on `maxEdge`. Never upscales: `maxEdge`
-// is a ceiling, and a caller asking for more pixels than exist cannot be given them.
+// Solves the capture law for the `scale` that lands the delivered image's long edge on
+// `maxEdge`:
 //
-// The two arguments are in DIFFERENT units, which is what the device scale factor is doing
-// here. `rect` is CSS pixels, because that is what a clip and `getBoundingClientRect()` both
-// speak; `maxEdge` counts pixels in the delivered PNG, because that is what the caller is
-// actually rationing — an image costs its reader by real pixel area, and CSS pixels do not
-// say how many of those there are. Measured: a 96x32 CSS box asked for `maxEdge: 48` came
-// back 48x16 on a 1x tab and 48x16 on a 2x one, the same picture for the same price. Without
-// the conversion the 2x tab would have returned 96x32 — twice the size that was requested.
+//   delivered px = rect css px * devicePixelRatio * scale
 //
-// Measured, Chrome 153, a 1029x729 CSS viewport on a 1.25x display:
+// Measured, Chrome 153, a 1029x729 CSS viewport on a 1.25x display: a clip at scale 1 came
+// back 1286x911, at 0.5 643x456, at 0.25 322x228. So `scale` multiplies ON TOP of the device
+// scale factor rather than replacing it.
 //
-//   no clip              1287x912      <- css size * deviceScaleFactor
-//   clip, scale 1        1286x911
-//   clip, scale 0.5       643x456
-//   clip, scale 0.25      322x228
+// That factor is also why the two arguments are in different units. `rect` is CSS pixels,
+// which is what a clip and `getBoundingClientRect()` both speak; `maxEdge` counts pixels in
+// the delivered PNG, because that is what the caller is actually rationing — an image costs
+// its reader by real pixel area, and CSS pixels do not say how many of those there are.
+// Measured: a 96x32 CSS box asked for `maxEdge: 48` came back 48x16 on a 1x tab and also 48x16 on
+// a 2x one, the same picture for the same price. Without the conversion the 2x tab would
+// have returned 96x32, twice the size that was requested.
 //
-// So `scale` multiplies ON TOP of the device scale factor instead of replacing it, and a
-// clipped capture comes out at exactly cssWidth * dpr * scale.
+// Never upscales: `maxEdge` is a ceiling, and pixels that do not exist cannot be handed over.
 const scaleToFit = (rect: Rect, devicePixelRatio: number, maxEdge: number): number => {
   if (maxEdge <= 0) return 1;
   const longEdge = Math.max(rect.width, rect.height) * devicePixelRatio;

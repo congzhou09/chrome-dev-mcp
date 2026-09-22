@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 // Chrome reports a `timeout` kill as a REJECTED command rather than through
@@ -24,7 +24,101 @@ const isExecutionTerminated = (err, elapsedMs) => {
         return true;
     return response?.code === -32603 && elapsedMs >= EVAL_EXECUTION_TIMEOUT_MS;
 };
-const timedOut = (text) => ({ content: [{ type: 'text', text }], isError: true });
+const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
+// Pixel dimensions straight out of a PNG's IHDR, which puts width at byte 16 and height at
+// byte 20 — so the first 64 base64 characters decode to more than enough to reach them and
+// the image itself is never decoded. Worth reading rather than calculating: Chrome rounds a
+// scaled capture on its own, so this is the only way to report what actually arrived.
+const pngSize = (base64) => {
+    const head = Buffer.from(base64.slice(0, 64), 'base64');
+    if (head.length < 24 || head.toString('ascii', 12, 16) !== 'IHDR')
+        return null;
+    return { width: head.readUInt32BE(16), height: head.readUInt32BE(20) };
+};
+// The visible area, in the DOCUMENT coordinates a CDP clip is expressed in.
+//
+// Measured against a page scrolled exactly one viewport down: a clip at `y: 0` captured the
+// top of the document while `y: pageY` captured what was actually on screen. Leaving the
+// origin(0,0) in would quietly return the wrong part of every scrolled page — a silent wrong
+// answer, which is worse than any sizing mistake.
+const viewportRect = (css) => ({
+    x: css.pageX ?? 0,
+    y: css.pageY ?? 0,
+    width: css.clientWidth ?? 0,
+    height: css.clientHeight ?? 0,
+});
+// A caller's region, moved into document coordinates and cut down to what is on screen.
+// Null when the two do not overlap at all.
+//
+// The region arrives VIEWPORT-relative, which is the one choice that makes it free to use:
+// it is the space `getBoundingClientRect()` reports in, so an element's box can be handed
+// over untouched. Document coordinates would have read more naturally against CDP, at the
+// price of making every caller remember to add the scroll offset — the same trap as above,
+// just moved onto them, where this server could no longer see it being sprung.
+const intersectViewport = (viewport, region) => {
+    const left = Math.max(viewport.x, viewport.x + region.x);
+    const top = Math.max(viewport.y, viewport.y + region.y);
+    const right = Math.min(viewport.x + viewport.width, viewport.x + region.x + region.width);
+    const bottom = Math.min(viewport.y + viewport.height, viewport.y + region.y + region.height);
+    if (right <= left || bottom <= top)
+        return null;
+    return { x: left, y: top, width: right - left, height: bottom - top };
+};
+// Solves the capture law for the `scale` that lands the delivered image's long edge on
+// `maxEdge`:
+//
+//   delivered px = rect css px * devicePixelRatio * scale
+//
+// Measured, Chrome 153, a 1029x729 CSS viewport on a 1.25x display: a clip at scale 1 came
+// back 1286x911, at 0.5 643x456, at 0.25 322x228. So `scale` multiplies ON TOP of the device
+// scale factor rather than replacing it.
+//
+// That factor is also why the two arguments are in different units. `rect` is CSS pixels,
+// which is what a clip and `getBoundingClientRect()` both speak; `maxEdge` counts pixels in
+// the delivered PNG, because that is what the caller is actually rationing — an image costs
+// its reader by real pixel area, and CSS pixels do not say how many of those there are.
+// Measured: a 96x32 CSS box asked for `maxEdge: 48` came back 48x16 on a 1x tab and 48x16 on
+// a 2x one, the same picture for the same price. Without the conversion the 2x tab would
+// have returned 96x32, twice the size that was requested.
+//
+// Never upscales: `maxEdge` is a ceiling, and pixels that do not exist cannot be handed over.
+const scaleToFit = (rect, devicePixelRatio, maxEdge) => {
+    if (maxEdge <= 0)
+        return 1;
+    const longEdge = Math.max(rect.width, rect.height) * devicePixelRatio;
+    return longEdge > 0 ? Math.min(1, maxEdge / longEdge) : 1;
+};
+// The device scale factor the CAPTURE will use, which is not always the display's.
+//
+// `layoutViewport` is `cssLayoutViewport` in device pixels, so their ratio looks like the
+// answer and is the answer right up until something has called
+// `Emulation.setDeviceMetricsOverride` — DevTools' device toolbar, or any other CDP client
+// sharing this tab. This server must assume that has already happened. Measured, Chrome 153,
+// on a 1.25x display, comparing each candidate against the capture actually produced:
+//
+//   emulation(setDeviceMetricsOverride)         layoutViewport ratio   window.devicePixelRatio   capture used
+//   none                                              1.251                    1.25                1.25
+//   1920x1080 @1                                      1.251                    1.0                 1.0
+//   1440x810  @2                                      1.251                    2.0                 2.0
+//   390x844   @3                                      1.251                    3.0                 3.0
+//   1280x800  @1.5                                    1.251                    1.5                 1.5
+//
+// The ratio is stuck on the host display's factor under emulation and mispredicts the
+// capture by up to 3x — enough to hand back an image far over the budget this is enforcing,
+// or a needlessly blurred one. So the page's own value is asked for first, and the ratio is
+// kept only as the fallback for when evaluation is unavailable.
+const captureScaleFactor = (metrics, reported) => {
+    if (typeof reported === 'number' && Number.isFinite(reported) && reported > 0)
+        return reported;
+    const cssWidth = metrics?.cssLayoutViewport?.clientWidth;
+    const deviceWidth = metrics?.layoutViewport?.clientWidth;
+    if (cssWidth && deviceWidth && deviceWidth > 0)
+        return deviceWidth / cssWidth;
+    // Assuming 1:1 under-states the output on a HiDPI display, so the capture comes back
+    // larger than intended — the harmless direction to be wrong in, where over-stating it
+    // would blur a screenshot that never needed shrinking.
+    return 1;
+};
 // ── Page inspection tools ─────────────────────────────────────────────────────
 //
 // Every tool here is a bare Runtime.evaluate / Page.captureScreenshot, so this group
@@ -166,7 +260,7 @@ export function registerPageTools(server, getClient) {
         try {
             const settled = await withTimeout(evaluation, EVAL_SETTLE_TIMEOUT_MS);
             if (settled === TIMED_OUT) {
-                return timedOut(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. It is suspended on something ` +
+                return toolError(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. It is suspended on something ` +
                     'that has not resolved — a pending promise, a request that never returns. The page is still running it.');
             }
             result = settled;
@@ -174,7 +268,7 @@ export function registerPageTools(server, getClient) {
         catch (err) {
             if (!isExecutionTerminated(err, Date.now() - startedAt))
                 throw err;
-            return timedOut(`Error: expression was terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution — it was still ` +
+            return toolError(`Error: expression was terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution — it was still ` +
                 'running (an infinite loop, or a blocking computation). The tab was not left spinning.');
         }
         if (result.exceptionDetails) {
@@ -248,19 +342,128 @@ export function registerPageTools(server, getClient) {
     //
     // The abandoned first capture is left pending deliberately. Once the tab comes forward both
     // captures resolve off the same frame; nothing is listening to the first one.
+    //
+    // There is no `quality` knob, and not only because the format is png. The image crosses a
+    // local pipe where bytes are close to free, while the reader is billed by pixel area — so
+    // re-encoding the same frame smaller buys nothing anyone pays for, and on png the flag is
+    // not even wired up. Measured, Chrome 153, a 1029x729 CSS viewport:
+    //
+    //   format: 'png'                  1287x912   69174 bytes
+    //   format: 'png',  quality: 50    1287x912   69174 bytes   <- byte-identical; png ignores it
+    //   format: 'jpeg', quality: 80      (same)   54359 bytes   <- 21% off the bytes, 0% off the cost
+    //
+    // Dimensions are the only lever that moves the number that matters, which is what `maxEdge`
+    // is.
+    //
+    // On sizing, this tool deliberately holds NO opinion about how large a screenshot should
+    // be. What an image costs is decided entirely on the receiving side — by which model reads
+    // it and how that model tokenises pixels — and this server cannot see any of that. Every
+    // ceiling it could pick would be a guess about someone else's budget, stale the moment that
+    // budget changed. So `maxEdge` is the caller's to set and the default is the tab's own
+    // pixels: the server reports what Chrome painted, and whoever knows the budget spends it.
+    //
+    // What stays here is the part that IS about Chrome: turning a requested long edge into a
+    // correct clip. That needs the device scale factor (see captureScaleFactor) and the scroll
+    // offset, and it is best-effort in every direction — a timeout or a rejection while asking
+    // drops through to a native capture rather than failing a tool whose job is the image.
+    //
+    // The clip is also only built when it is needed, never as the default path. At scale 1 it
+    // is not a no-op: measured on a page with a classic scrollbar, an unclipped capture came
+    // back 1920x912 and a clipped one 1900x911, the missing column being the scrollbar, which
+    // sits outside the layout viewport. So a default screenshot is byte-for-byte the plain
+    // `Page.captureScreenshot` it always was, and only a `maxEdge` call changes shape.
     server.registerTool('screenshot', {
-        description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools). If the tab is not on screen it is brought to the front first, which changes what the user is looking at.',
-        inputSchema: z.object({}),
+        description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools), or of one rectangle of it with `region`. ' +
+            "Captured at the tab's native pixel size unless you cap it with `maxEdge`; a capture that was scaled or cut reports that in a note beside the image. " +
+            'If the tab is not on screen it is brought to the front first, which changes what the user is looking at.',
+        inputSchema: z.object({
+            region: z
+                .object({
+                x: z.number(),
+                y: z.number(),
+                width: z.number().positive(),
+                height: z.number().positive(),
+            })
+                .optional()
+                .describe('Capture only this rectangle instead of the whole viewport. CSS pixels, measured from the ' +
+                'top-left of the visible area — the same space `getBoundingClientRect()` reports in, so an ' +
+                "element's box can be passed straight through. Usually the right way to answer a question " +
+                'about exact pixels: a small region at native size costs far less than the whole viewport. ' +
+                "Pad it a few pixels when judging alignment — an exact box crop puts the element's own " +
+                'antialiased edge in its outer row, and an offset only reads against its surroundings. ' +
+                'Cut down to whatever part of it is on screen; a region entirely off screen is an error.'),
+            maxEdge: z
+                .number()
+                .int()
+                .default(-1)
+                .describe('Longest side of the returned image, counted in its own pixels rather than CSS pixels, so the ' +
+                'same value gives the same image on a 1x and a 2x tab. Scales down `region` when one is given, ' +
+                "the viewport otherwise. -1 (the default), or any value at or above the capture's native " +
+                'pixel size, returns native pixels — use that when the answer ' +
+                'depends on exact pixels (1px offsets, blurred edges, subpixel text). Otherwise size it for ' +
+                'whatever will read the image: cost scales with AREA, so halving this quarters it.'),
+        }),
         annotations: {
             title: 'Screenshot',
             readOnlyHint: true,
         },
-    }, async () => {
+    }, async ({ maxEdge, region }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
+        let clip = null;
+        let cutToViewport = false;
+        // A plain full-viewport capture at native size needs to know nothing about the page,
+        // so it asks nothing. Any non-positive `maxEdge` means native, which is why -1 needs
+        // no special case and neither does a caller who sends 0.
+        if (maxEdge > 0 || region) {
+            // Both halves of the question, issued together so the pair costs one round-trip's
+            // latency rather than two. Each carries its own catch, folding a rejection into the
+            // same "no answer" shape as a timeout.
+            const metrics = client.Page.getLayoutMetrics().catch(() => undefined);
+            const ratio = client.Runtime.evaluate({ expression: 'devicePixelRatio', returnByValue: true })
+                .then((r) => r.result?.value)
+                .catch(() => undefined);
+            // The annotation keeps the sentinel's own type, which a bare arrow would widen to
+            // `symbol` and stop narrowing.
+            const probed = await withTimeout(Promise.all([metrics, ratio]), LAYOUT_METRICS_TIMEOUT_MS).catch(() => TIMED_OUT);
+            const resolved = probed === TIMED_OUT ? undefined : probed[0];
+            const reported = probed === TIMED_OUT ? undefined : probed[1];
+            const css = resolved?.cssLayoutViewport;
+            // Without the viewport, the two requests degrade differently, and the difference is
+            // whether the answer is still true. An uncapped `maxEdge` gives back a larger image
+            // of the right thing, so it falls through; a `region` placed blind would be a
+            // picture of the wrong thing, which no caller can detect from the image. So it fails.
+            if (!css?.clientWidth || !css.clientHeight) {
+                if (region) {
+                    return toolError(`Error: the viewport could not be measured within ${LAYOUT_METRICS_TIMEOUT_MS}ms, so a region ` +
+                        'cannot be placed on the page and was not guessed at. The renderer is not answering — it may ' +
+                        'be paused at a breakpoint or blocked. Retry without `region` to capture the whole viewport.');
+                }
+            }
+            else {
+                const viewport = viewportRect(css);
+                const rect = region ? intersectViewport(viewport, region) : viewport;
+                if (!rect) {
+                    return toolError(`Error: the requested region (${region.width}x${region.height} at ${region.x},${region.y}) ` +
+                        `lies entirely outside the ${viewport.width}x${viewport.height} viewport, so there is nothing ` +
+                        'to capture. Region coordinates are CSS pixels from the top-left of the visible area, as ' +
+                        '`getBoundingClientRect()` reports them — scroll the element into view first if it is off screen.');
+                }
+                cutToViewport = Boolean(region) && (rect.width !== region.width || rect.height !== region.height);
+                const scale = scaleToFit(rect, captureScaleFactor(resolved, reported), maxEdge);
+                // A clip is only built when it changes something. At scale 1 it is not a no-op:
+                // measured on a page with a classic scrollbar, an unclipped capture came back
+                // 1920x912 and a clipped one 1900x911, the missing column being the scrollbar,
+                // which sits outside the layout viewport. So a plain full-viewport request stays
+                // the plain `Page.captureScreenshot` it always was.
+                if (region || scale < 1)
+                    clip = { ...rect, scale };
+            }
+        }
+        const params = clip ? { format: 'png', clip } : { format: 'png' };
         const capture = () => {
-            const shot = client.Page.captureScreenshot({ format: 'png' });
+            const shot = client.Page.captureScreenshot(params);
             // Abandoned by the race on timeout; without a handler of its own a later rejection
             // would surface as an unhandledRejection with nobody listening.
             shot.catch(() => { });
@@ -271,17 +474,33 @@ export function registerPageTools(server, getClient) {
             const front = client.Page.bringToFront();
             front.catch(() => { });
             if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) === TIMED_OUT) {
-                return timedOut(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
+                return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
                     'to the front either. Chrome is not answering for this target at all — check the window still exists.');
             }
             result = await capture();
         }
         if (result === TIMED_OUT) {
-            return timedOut(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, twice — once before bringing the tab ` +
+            return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, twice — once before bringing the tab ` +
                 'to the front and once after. The tab is not producing frames (minimised or fully occluded window), ' +
                 'or its renderer is blocked. Nothing was captured.');
         }
-        return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+        const image = { type: 'image', data: result.data, mimeType: 'image/png' };
+        // Only what the caller did not ask for is annotated, on the same principle as
+        // get_html's truncation marker: an unmarked result is exactly what was requested, so
+        // nobody has to wonder whether they are looking at the whole thing. A region that fit
+        // and a capture that was not scaled therefore say nothing.
+        const notes = [];
+        if (cutToViewport)
+            notes.push('Note: the region ran past the visible area and was cut to the part on screen.');
+        if (clip && clip.scale < 1) {
+            const size = pngSize(result.data);
+            const percent = Math.round(clip.scale * 100);
+            notes.push(`Note: downscaled to ${size ? `${size.width}x${size.height}, ` : ''}${percent}% of native size, for the ` +
+                `requested maxEdge of ${maxEdge}px. Omit maxEdge if the answer depends on exact pixels.`);
+        }
+        if (!notes.length)
+            return { content: [image] };
+        return { content: [image, { type: 'text', text: notes.join(' ') }] };
     });
     // Reads `window.$0` — a real page global the user has to create — rather than `$0` itself,
     // because `$0` is out of this server's reach entirely.

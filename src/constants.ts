@@ -165,6 +165,15 @@ export const LAYOUT_METRICS_TIMEOUT_MS = 2000;
 // process boundary; rather than looser because nothing arrives late — it answers or it is gone.
 export const BRING_TO_FRONT_TIMEOUT_MS = 3000;
 
+// Bound on waiting for the page to paint a frame after it has been raised, which is the
+// difference between a capture that shows the page and one that shows a stale surface.
+// Measured, Chrome 153, a minimised window: the tab reported `hidden`, and after
+// `Page.bringToFront` a double-rAF resolved in 29ms and the capture that followed matched
+// the page exactly. 1s is that with room for a busy first frame; on expiry the capture goes
+// ahead anyway, because the timeout-and-raise path behind it is still there to catch a tab
+// that never paints.
+export const FRAME_WAIT_TIMEOUT_MS = 1000;
+
 // The answer to a CDP round-trip that outlived its bound. Deliberately a normal tool error
 // rather than a thrown one: "this renderer never answered" is a state the caller can act on
 // (resume the debugger, dismiss the dialog, reload the tab), not a fault in this server.

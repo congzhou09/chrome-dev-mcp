@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, FRAME_WAIT_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 // Chrome reports a `timeout` kill as a REJECTED command rather than through
@@ -77,7 +77,7 @@ const intersectViewport = (viewport, region) => {
 // which is what a clip and `getBoundingClientRect()` both speak; `maxEdge` counts pixels in
 // the delivered PNG, because that is what the caller is actually rationing — an image costs
 // its reader by real pixel area, and CSS pixels do not say how many of those there are.
-// Measured: a 96x32 CSS box asked for `maxEdge: 48` came back 48x16 on a 1x tab and 48x16 on
+// Measured: a 96x32 CSS box asked for `maxEdge: 48` came back 48x16 on a 1x tab and also 48x16 on
 // a 2x one, the same picture for the same price. Without the conversion the 2x tab would
 // have returned 96x32, twice the size that was requested.
 //
@@ -374,7 +374,7 @@ export function registerPageTools(server, getClient) {
     // `Page.captureScreenshot` it always was, and only a `maxEdge` call changes shape.
     server.registerTool('screenshot', {
         description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools), or of one rectangle of it with `region`. ' +
-            "Captured at the tab's native pixel size unless you cap it with `maxEdge`; a capture that was scaled or cut reports that in a note beside the image. " +
+            "Captured at the tab's native pixel size unless you cap it with `maxEdge`; a capture that was scaled or cut says so in a note beside the image, which for a `region` also gives the CSS rect the image covers and how many image pixels a CSS pixel became. " +
             'If the tab is not on screen it is brought to the front first, which changes what the user is looking at.',
         inputSchema: z.object({
             region: z
@@ -412,23 +412,43 @@ export function registerPageTools(server, getClient) {
         if (!client)
             return NOT_CONNECTED;
         let clip = null;
-        let cutToViewport = false;
+        // The device scale factor the capture was sized against, kept for the note below —
+        // which reports the exact factor rather than one back-solved from rounded pixels.
+        let deviceScale = null;
+        // Whether the page said it was hidden, or undefined when nothing asked it.
+        let pageHidden;
+        // What the image will actually cover, back in the viewport-relative CSS pixels the
+        // caller passed `region` in — kept because the note below has to hand those numbers
+        // back, and by then the viewport they were measured against is out of scope.
+        let captured = null;
         // A plain full-viewport capture at native size needs to know nothing about the page,
         // so it asks nothing. Any non-positive `maxEdge` means native, which is why -1 needs
         // no special case and neither does a caller who sends 0.
         if (maxEdge > 0 || region) {
             // Both halves of the question, issued together so the pair costs one round-trip's
-            // latency rather than two. Each carries its own catch, folding a rejection into the
-            // same "no answer" shape as a timeout.
-            const metrics = client.Page.getLayoutMetrics().catch(() => undefined);
-            const ratio = client.Runtime.evaluate({ expression: 'devicePixelRatio', returnByValue: true })
+            // latency rather than two. Each carries its own catch, degrading to the same "no
+            // answer" shape as a timeout — but the metrics side keeps its reason, because that
+            // is the one a caller is told about below.
+            let metricsError;
+            const metrics = client.Page.getLayoutMetrics().catch((e) => {
+                metricsError = e instanceof Error ? e.message : String(e);
+                return undefined;
+            });
+            // Two answers from one evaluate, because the second is free here and a round-trip of
+            // its own everywhere else. `hidden` decides whether the tab has to be raised before
+            // it can be captured at all (see below); the ratio decides how large the result is.
+            const ratio = client.Runtime.evaluate({
+                expression: '({ dpr: devicePixelRatio, hidden: document.hidden })',
+                returnByValue: true,
+            })
                 .then((r) => r.result?.value)
                 .catch(() => undefined);
             // The annotation keeps the sentinel's own type, which a bare arrow would widen to
             // `symbol` and stop narrowing.
             const probed = await withTimeout(Promise.all([metrics, ratio]), LAYOUT_METRICS_TIMEOUT_MS).catch(() => TIMED_OUT);
             const resolved = probed === TIMED_OUT ? undefined : probed[0];
-            const reported = probed === TIMED_OUT ? undefined : probed[1];
+            const reported = probed === TIMED_OUT ? undefined : probed[1]?.dpr;
+            pageHidden = probed === TIMED_OUT ? undefined : probed[1]?.hidden === true;
             const css = resolved?.cssLayoutViewport;
             // Without the viewport, the two requests degrade differently, and the difference is
             // whether the answer is still true. An uncapped `maxEdge` gives back a larger image
@@ -436,9 +456,18 @@ export function registerPageTools(server, getClient) {
             // picture of the wrong thing, which no caller can detect from the image. So it fails.
             if (!css?.clientWidth || !css.clientHeight) {
                 if (region) {
-                    return toolError(`Error: the viewport could not be measured within ${LAYOUT_METRICS_TIMEOUT_MS}ms, so a region ` +
-                        'cannot be placed on the page and was not guessed at. The renderer is not answering — it may ' +
-                        'be paused at a breakpoint or blocked. Retry without `region` to capture the whole viewport.');
+                    // Three different failures land here and they call for different next moves, so
+                    // the message names the one that actually happened rather than blaming the clock
+                    // for all of them.
+                    const why = probed === TIMED_OUT
+                        ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be paused at a ` +
+                            'breakpoint, blocked in a synchronous loop, or blocked on a modal dialog'
+                        : metricsError
+                            ? `Page.getLayoutMetrics failed: ${metricsError}`
+                            : 'Page.getLayoutMetrics answered without a usable layout viewport, which a tab reports when ' +
+                                'it has no rendered size of its own — it may be hidden, minimized, or still being created';
+                    return toolError(`Error: the viewport could not be measured, so a region cannot be placed on the page and was ` +
+                        `not guessed at. ${why}. Retry without \`region\` to capture the whole viewport.`);
                 }
             }
             else {
@@ -450,8 +479,11 @@ export function registerPageTools(server, getClient) {
                         'to capture. Region coordinates are CSS pixels from the top-left of the visible area, as ' +
                         '`getBoundingClientRect()` reports them — scroll the element into view first if it is off screen.');
                 }
-                cutToViewport = Boolean(region) && (rect.width !== region.width || rect.height !== region.height);
-                const scale = scaleToFit(rect, captureScaleFactor(resolved, reported), maxEdge);
+                if (region) {
+                    captured = { x: rect.x - viewport.x, y: rect.y - viewport.y, width: rect.width, height: rect.height };
+                }
+                deviceScale = captureScaleFactor(resolved, reported);
+                const scale = scaleToFit(rect, deviceScale, maxEdge);
                 // A clip is only built when it changes something. At scale 1 it is not a no-op:
                 // measured on a page with a classic scrollbar, an unclipped capture came back
                 // 1920x912 and a clipped one 1900x911, the missing column being the scrollbar,
@@ -462,14 +494,49 @@ export function registerPageTools(server, getClient) {
             }
         }
         const params = clip ? { format: 'png', clip } : { format: 'png' };
-        const capture = () => {
-            const shot = client.Page.captureScreenshot(params);
-            // Abandoned by the race on timeout; without a handler of its own a later rejection
-            // would surface as an unhandledRejection with nobody listening.
-            shot.catch(() => { });
-            return withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
-        };
-        let result = await capture();
+        let broughtToFront = false;
+        // A hidden tab is not painting, and a capture sent to a tab that is not painting does
+        // not come back until something makes it paint. Raising it first turns a 10s stall
+        // into a 700ms answer — measured, Chrome 153, a minimised window: raise, wait for a
+        // double rAF (29ms), capture (71ms), pixels exact. The wait is what makes it safe;
+        // capturing the instant the tab is raised is how a stale surface gets returned.
+        //
+        // Only on the path that already asked the page something. A plain `screenshot` with no
+        // arguments still sends nothing but the capture, and reaches the same place through the
+        // timeout below, a few seconds later.
+        if (pageHidden) {
+            const front = client.Page.bringToFront();
+            front.catch(() => { });
+            if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) !== TIMED_OUT) {
+                broughtToFront = true;
+                const painted = client.Runtime.evaluate({
+                    expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+                    returnByValue: true,
+                    awaitPromise: true,
+                });
+                painted.catch(() => { });
+                await withTimeout(painted, FRAME_WAIT_TIMEOUT_MS);
+            }
+        }
+        // ONE capture request for the life of the call, waited on twice. A tab that is not
+        // painting does not refuse a capture, it just never answers — and issuing a SECOND
+        // request while the first is still pending is what turns that into a wrong answer.
+        // Measured against a minimised window, Chrome 153, a 300x120 region on a static page:
+        //
+        //   first request, alone                       no answer in 10s
+        //   ...then bringToFront, then a NEW request   answered in 62ms, 100% of pixels wrong
+        //   ...then bringToFront, awaiting the SAME    answered in ~70ms, 0% wrong (twice)
+        //   a plain capture issued alongside a pending one    99.9% of pixels wrong
+        //
+        // The wrong images are the dangerous case: they arrive fast, they are the right size,
+        // and they carry no sign at all that they show another moment or another place. So the
+        // retry is a second WAIT, never a second request, and nothing else is sent to this
+        // target until the capture settles.
+        const shot = client.Page.captureScreenshot(params);
+        // Handled here because the wait below can be abandoned; without it a later rejection
+        // would surface as an unhandledRejection with nobody listening.
+        shot.catch(() => { });
+        let result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
         if (result === TIMED_OUT) {
             const front = client.Page.bringToFront();
             front.catch(() => { });
@@ -477,12 +544,13 @@ export function registerPageTools(server, getClient) {
                 return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
                     'to the front either. Chrome is not answering for this target at all — check the window still exists.');
             }
-            result = await capture();
+            broughtToFront = true;
+            result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
         }
         if (result === TIMED_OUT) {
-            return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, twice — once before bringing the tab ` +
-                'to the front and once after. The tab is not producing frames (minimised or fully occluded window), ' +
-                'or its renderer is blocked. Nothing was captured.');
+            return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, then still did not answer within ` +
+                `another ${SCREENSHOT_TIMEOUT_MS}ms after the tab was brought to the front. The tab is not ` +
+                'producing frames (minimised or fully occluded window), or its renderer is blocked. Nothing was captured.');
         }
         const image = { type: 'image', data: result.data, mimeType: 'image/png' };
         // Only what the caller did not ask for is annotated, on the same principle as
@@ -490,13 +558,48 @@ export function registerPageTools(server, getClient) {
         // nobody has to wonder whether they are looking at the whole thing. A region that fit
         // and a capture that was not scaled therefore say nothing.
         const notes = [];
-        if (cutToViewport)
-            notes.push('Note: the region ran past the visible area and was cut to the part on screen.');
+        const size = pngSize(result.data);
+        // Raising a tab changes what the user is looking at, whether it happened because the
+        // page said it was hidden or because the first wait ran out — so it is news, both
+        // about the browser and about why the call took as long as it did.
+        if (broughtToFront) {
+            notes.push('Note: the tab was not on screen and so was not painting, so it was brought to the front to capture ' +
+                'it. That changed which tab the user is looking at.');
+        }
+        // A region is the one capture whose image gets measured against page coordinates: it
+        // was asked for in CSS pixels and comes back in image pixels, and the two differ by
+        // the device scale factor times any `maxEdge` scaling — neither of which is visible in
+        // the image. So when they differ, the note states the conversion instead of leaving it
+        // to be back-solved, and when the rect moved, it states where the image actually
+        // starts. The full-viewport capture needs neither: it covers the viewport whatever its
+        // pixel count, so there is nothing to convert coordinates against.
+        let sizeReported = false;
+        if (captured && region) {
+            const cut = captured.width !== region.width || captured.height !== region.height;
+            // Two ways to get the factor, and they disagree in the last decimal: the delivered
+            // width over the CSS width is what the image IS, but both are rounded, so an 81 CSS
+            // px strip at 1.25 reports 101/81 = 1.247. The factor the capture was sized with is
+            // exact. Prefer it, but only while the measurement agrees — if Chrome delivered
+            // something other than what was asked for, the picture wins over the intention.
+            const measured = size && captured.width > 0 ? size.width / captured.width : 1;
+            const intended = (deviceScale ?? 1) * (clip?.scale ?? 1);
+            const perCssPx = Math.abs(measured - intended) <= intended * 0.01 ? intended : measured;
+            const rescaled = Math.abs(perCssPx - 1) > 0.005;
+            const where = `${captured.width}x${captured.height} CSS px at (${captured.x},${captured.y}), ` +
+                'measured from the top-left of the visible area';
+            if (cut) {
+                notes.push(`Note: the region ran past the visible area and was cut to ${where}.`);
+            }
+            if (rescaled && size) {
+                sizeReported = true;
+                notes.push(`Note: the ${size.width}x${size.height} image covers ${cut ? 'that' : where} — ` +
+                    `1 CSS px = ${Math.round(perCssPx * 1000) / 1000} image px.`);
+            }
+        }
         if (clip && clip.scale < 1) {
-            const size = pngSize(result.data);
             const percent = Math.round(clip.scale * 100);
-            notes.push(`Note: downscaled to ${size ? `${size.width}x${size.height}, ` : ''}${percent}% of native size, for the ` +
-                `requested maxEdge of ${maxEdge}px. Omit maxEdge if the answer depends on exact pixels.`);
+            notes.push(`Note: downscaled to ${size && !sizeReported ? `${size.width}x${size.height}, ` : ''}${percent}% of ` +
+                `native size, for the requested maxEdge of ${maxEdge}px. Omit maxEdge if the answer depends on exact pixels.`);
         }
         if (!notes.length)
             return { content: [image] };

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   BRING_TO_FRONT_TIMEOUT_MS,
+  FRAME_WAIT_TIMEOUT_MS,
   LAYOUT_METRICS_TIMEOUT_MS,
   PAGE_COMMAND_TIMEOUT_MS,
   SCREENSHOT_TIMEOUT_MS,
@@ -35,15 +36,18 @@ const layoutMetrics = (cssWidth: number, cssHeight: number, dpr = 1, pageX = 0, 
   },
 });
 
-// What the page answers when screenshot asks for `devicePixelRatio`. Kept separate from the
-// layout metrics on purpose: under device emulation the two disagree, and which one the code
-// believes is the difference between a correctly sized capture and a 3x-oversized one.
-const reportsDpr = (value: unknown = 1) => vi.fn().mockResolvedValue({ result: { value } });
+// What the page answers when screenshot asks it about itself. The ratio is kept separate
+// from the layout metrics on purpose: under device emulation the two disagree, and which one
+// the code believes is the difference between a correctly sized capture and a 3x-oversized
+// one. `hidden` rides along in the same answer because a hidden tab has to be raised before
+// it can be captured at all.
+const reportsDpr = (value: unknown = 1, hidden = false) =>
+  vi.fn().mockResolvedValue({ result: { value: { dpr: value, hidden } } });
 
 // Same shape as the other screenshot tests, with the Page overrides they need. `dpr` is what
 // the page reports; pass the one the metrics imply unless the test is about them disagreeing.
-const withMetrics = (captureScreenshot: any, getLayoutMetrics: any, dpr: unknown = 1) =>
-  makeMockClient(reportsDpr(dpr), captureScreenshot, {}, {}, {}, { getLayoutMetrics });
+const withMetrics = (captureScreenshot: any, getLayoutMetrics: any, dpr: unknown = 1, hidden = false) =>
+  makeMockClient(reportsDpr(dpr, hidden), captureScreenshot, {}, {}, {}, { getLayoutMetrics });
 
 // Asserts the contract against the pixels Chrome will actually produce (css * dpr * scale)
 // rather than against the scale factor — a test that restated the arithmetic would pass just
@@ -205,10 +209,20 @@ describe('screenshot', () => {
   });
 
   // The recovery that matters: a tab producing no frames answers the capture with nothing at
-  // all, and bringing it forward is what makes the compositor produce one.
-  it('brings the tab to the front and retries when the first capture never answers', async () => {
-    const captureScreenshot = vi.fn().mockImplementationOnce(neverAnswers).mockResolvedValueOnce({ data: 'aGk=' });
-    const cdp = makeMockClient(reportsDpr(1), captureScreenshot);
+  // all, and bringing it forward is what makes the compositor produce one — for the request
+  // already in flight. Measured against a minimised window, a SECOND request sent while the
+  // first was pending came back in 62ms with 100% of its pixels from elsewhere, so the mock
+  // here answers only the original call, exactly as Chrome did.
+  it('waits on the same capture again after bringing the tab to the front', async () => {
+    let paint: (() => void) | undefined;
+    const captureScreenshot = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          paint = () => resolve({ data: 'aGk=' });
+        }),
+    );
+    const bringToFront = vi.fn(async () => paint?.());
+    const cdp = makeMockClient(reportsDpr(1), captureScreenshot, {}, {}, {}, { bringToFront });
     const client = await setupMcpClient(cdp);
 
     vi.useFakeTimers();
@@ -217,16 +231,19 @@ describe('screenshot', () => {
       await vi.advanceTimersByTimeAsync(SCREENSHOT_TIMEOUT_MS + 1);
       const result = await pending;
 
-      expect((cdp as any).Page.bringToFront).toHaveBeenCalledTimes(1);
-      expect(captureScreenshot).toHaveBeenCalledTimes(2);
+      expect(bringToFront).toHaveBeenCalledTimes(1);
+      expect(captureScreenshot).toHaveBeenCalledTimes(1);
       expect(result.isError).toBeFalsy();
-      expect(result.content).toEqual([{ type: 'image', data: 'aGk=', mimeType: 'image/png' }]);
+      expect((result.content as any)[0]).toEqual({ type: 'image', data: 'aGk=', mimeType: 'image/png' });
+      expect((result.content as any)[1].text).toContain('brought to the front');
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('reports both attempts timing out rather than waiting on the second', async () => {
+  // The invariant that keeps a wrong image impossible: however long this waits, exactly one
+  // capture is ever sent to the target.
+  it('never sends a second capture, even when the wait runs out twice', async () => {
     const captureScreenshot = vi.fn(neverAnswers);
     const client = await setupMcpClient(makeMockClient(reportsDpr(1), captureScreenshot));
 
@@ -236,9 +253,77 @@ describe('screenshot', () => {
       await vi.advanceTimersByTimeAsync((SCREENSHOT_TIMEOUT_MS + 1) * 2);
       const result = await pending;
 
-      expect(captureScreenshot).toHaveBeenCalledTimes(2);
+      expect(captureScreenshot).toHaveBeenCalledTimes(1);
       expect(result.isError).toBe(true);
-      expect((result.content as any)[0].text).toContain('twice');
+      expect((result.content as any)[0].text).toContain('after the tab was brought to the front');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A hidden tab is not painting, so the capture sent to it would sit there until the bound
+  // below ran out. Asking the page whether it is hidden costs nothing extra — the same
+  // evaluate already fetches the pixel ratio — and turns that stall into a raise.
+  it('raises a hidden tab and waits for a frame before capturing it', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(300, 120) });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800)), 1, true);
+    const bringToFront = vi.fn().mockResolvedValue({});
+    (cdp as any).Page.bringToFront = bringToFront;
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 0, y: 0, width: 300, height: 120 } },
+    });
+
+    expect(bringToFront).toHaveBeenCalledTimes(1);
+    const evaluate = (cdp as any).Runtime.evaluate;
+    const frameWait = evaluate.mock.calls.find(([a]: [any]) => a.expression.includes('requestAnimationFrame'));
+    expect(frameWait?.[0]).toMatchObject({ awaitPromise: true });
+    // The order is the whole point: raised, painted, then captured.
+    expect(bringToFront.mock.invocationCallOrder[0]).toBeLessThan(captureScreenshot.mock.invocationCallOrder[0]);
+    expect((result.content as any)[1].text).toContain('brought to the front');
+  });
+
+  // The converse, so the raise cannot quietly become unconditional: a tab already on screen
+  // is left alone, and the note says nothing about the browser.
+  it('leaves a visible tab where it is', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(300, 120) });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800)));
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 0, y: 0, width: 300, height: 120 } },
+    });
+
+    expect((cdp as any).Page.bringToFront).not.toHaveBeenCalled();
+    expect(result.content).toHaveLength(1);
+  });
+
+  // The frame wait is an optimisation, not a gate. A tab that answers the raise but never
+  // paints must still reach the capture, where the real bound and its error message live.
+  it('captures anyway when the raised tab never reports a frame', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(300, 120) });
+    const evaluate = vi
+      .fn()
+      .mockResolvedValueOnce({ result: { value: { dpr: 1, hidden: true } } })
+      .mockImplementation(neverAnswers);
+    const getLayoutMetrics = vi.fn().mockResolvedValue(layoutMetrics(1000, 800));
+    const cdp = makeMockClient(evaluate, captureScreenshot, {}, {}, {}, { getLayoutMetrics });
+    const client = await setupMcpClient(cdp);
+
+    vi.useFakeTimers();
+    try {
+      const pending = client.callTool({
+        name: 'screenshot',
+        arguments: { region: { x: 0, y: 0, width: 300, height: 120 } },
+      });
+      await vi.advanceTimersByTimeAsync(FRAME_WAIT_TIMEOUT_MS + 1);
+      const result = await pending;
+
+      expect(captureScreenshot).toHaveBeenCalledTimes(1);
+      expect(result.isError).toBeFalsy();
     } finally {
       vi.useRealTimers();
     }
@@ -437,16 +522,20 @@ describe('screenshot', () => {
     expect(result.content).toEqual([{ type: 'image', data: 'aGk=', mimeType: 'image/png' }]);
   });
 
-  // The recovery path has to carry the same clip as the attempt it replaces, or bringing the
-  // tab forward would quietly hand back a full-size image.
-  it('retries with the same clip after bringing the tab to the front', async () => {
-    const captureScreenshot = vi
-      .fn()
-      .mockImplementationOnce(neverAnswers)
-      .mockResolvedValueOnce({ data: pngHeader(1200, 750) });
-    const client = await setupMcpClient(
-      withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1440, 900, 2)), 2),
+  // A clipped capture recovered this way is the one the bug was about: the clip belongs to
+  // the request that was already sent, so raising the tab cannot hand back a differently
+  // sized image, and there is no second request for it to belong to.
+  it('keeps the clip through a recovery without sending a second request', async () => {
+    let paint: (() => void) | undefined;
+    const captureScreenshot = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          paint = () => resolve({ data: pngHeader(1200, 750) });
+        }),
     );
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1440, 900, 2)), 2);
+    (cdp as any).Page.bringToFront = vi.fn(async () => paint?.());
+    const client = await setupMcpClient(cdp);
 
     vi.useFakeTimers();
     try {
@@ -454,8 +543,8 @@ describe('screenshot', () => {
       await vi.advanceTimersByTimeAsync(SCREENSHOT_TIMEOUT_MS + 1);
       const result = await pending;
 
-      expect(clipOf(captureScreenshot, 0)).toBeDefined();
-      expect(captureScreenshot.mock.calls[1][0]).toEqual(captureScreenshot.mock.calls[0][0]);
+      expect(captureScreenshot).toHaveBeenCalledTimes(1);
+      expectLongEdge(clipOf(captureScreenshot, 0), 2, 1200);
       expect((result.content as any)[1].text).toContain('1200x750');
     } finally {
       vi.useRealTimers();
@@ -545,7 +634,76 @@ describe('screenshot', () => {
     });
 
     expect(clipOf(captureScreenshot)).toMatchObject({ x: 900, y: 700, width: 100, height: 100 });
-    expect((result.content as any)[1].text).toContain('cut to the part on screen');
+    // The rect itself, not just the fact of cutting: without it the caller cannot say which
+    // CSS coordinate the image's top-left corner is.
+    expect((result.content as any)[1].text).toContain('cut to 100x100 CSS px at (900,700)');
+  });
+
+  // The origin the note reports is the one the caller passed — viewport-relative — and it is
+  // the cut, not the requested, origin. On a scrolled page the clip is in document
+  // coordinates, so reporting that number back would be off by the scroll offset.
+  it('reports the cut rect in the viewport-relative coordinates the region was given in', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: 'aGk=' });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800, 1, 0, 500)));
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: -40, y: -60, width: 200, height: 200 } },
+    });
+
+    expect(clipOf(captureScreenshot)).toMatchObject({ x: 0, y: 500, width: 160, height: 140 });
+    expect((result.content as any)[1].text).toContain('cut to 160x140 CSS px at (0,0)');
+  });
+
+  // The feedback this answers: a 300x120 CSS region came back 375x150 with nothing said, so
+  // the only way back to CSS coordinates was to divide the two sizes and hope.
+  it('states the CSS-to-image pixel factor when a region is not delivered 1:1', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(375, 150) });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800, 1.25)), 1.25);
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 20, y: 40, width: 300, height: 120 } },
+    });
+
+    const text = (result.content as any)[1].text;
+    expect(text).toContain('375x150 image covers 300x120 CSS px at (20,40)');
+    expect(text).toContain('1 CSS px = 1.25 image px');
+  });
+
+  // Nothing surprising happened, so nothing is said: an unmarked image is exactly the rect
+  // that was asked for, at one image pixel per CSS pixel.
+  it('says nothing about a region delivered 1:1 and uncut', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(300, 120) });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800)));
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 20, y: 40, width: 300, height: 120 } },
+    });
+
+    expect(result.content).toHaveLength(1);
+  });
+
+  // Both notes fire together, and the size is stated once — the mapping note carries it, so
+  // the maxEdge note is left with the advice that is its own job.
+  it('does not restate the delivered size in both notes', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: pngHeader(200, 100) });
+    const cdp = withMetrics(captureScreenshot, vi.fn().mockResolvedValue(layoutMetrics(1000, 800)));
+    const client = await setupMcpClient(cdp);
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 0, y: 0, width: 400, height: 200 }, maxEdge: 200 },
+    });
+
+    const text = (result.content as any)[1].text;
+    expect(text.match(/200x100/g)).toHaveLength(1);
+    expect(text).toContain('1 CSS px = 0.5 image px');
+    expect(text).toContain('maxEdge');
   });
 
   // Negative coordinates are what getBoundingClientRect() reports for something scrolled off
@@ -597,10 +755,48 @@ describe('screenshot', () => {
 
       expect(result.isError).toBe(true);
       expect((result.content as any)[0].text).toContain('region');
+      expect((result.content as any)[0].text).toContain(`within ${LAYOUT_METRICS_TIMEOUT_MS}ms`);
       expect(captureScreenshot).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // The same refusal, reached the other two ways. What the caller does next differs by cause
+  // — retry, enable the domain, raise the tab — so blaming the clock for a domain that was
+  // never enabled sends them looking in the wrong place.
+  it('says the metrics call failed, not that it timed out, when it rejects', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: 'aGk=' });
+    const getLayoutMetrics = vi.fn().mockRejectedValue(new Error('Page domain not enabled'));
+    const client = await setupMcpClient(withMetrics(captureScreenshot, getLayoutMetrics));
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 0, y: 0, width: 100, height: 100 } },
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toContain('Page domain not enabled');
+    expect((result.content as any)[0].text).not.toContain(`${LAYOUT_METRICS_TIMEOUT_MS}ms`);
+    expect(captureScreenshot).not.toHaveBeenCalled();
+  });
+
+  it('says the viewport was unusable when the metrics answer without one', async () => {
+    const captureScreenshot = vi.fn().mockResolvedValue({ data: 'aGk=' });
+    const getLayoutMetrics = vi.fn().mockResolvedValue({
+      cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 0, clientHeight: 0 },
+    });
+    const client = await setupMcpClient(withMetrics(captureScreenshot, getLayoutMetrics));
+
+    const result = await client.callTool({
+      name: 'screenshot',
+      arguments: { region: { x: 0, y: 0, width: 100, height: 100 } },
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toContain('without a usable layout viewport');
+    expect((result.content as any)[0].text).not.toContain(`${LAYOUT_METRICS_TIMEOUT_MS}ms`);
+    expect(captureScreenshot).not.toHaveBeenCalled();
   });
 
   // A zero-area rect cannot be captured and is almost certainly a bug upstream (an element

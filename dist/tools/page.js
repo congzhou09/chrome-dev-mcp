@@ -35,6 +35,27 @@ const pngSize = (base64) => {
         return null;
     return { width: head.readUInt32BE(16), height: head.readUInt32BE(20) };
 };
+// Captures take turns. `Page.captureScreenshot` carries a clip and a scale, and Chrome keeps
+// that state on the target rather than on the request, so two captures in flight at once come
+// back as each other's pictures. Measured, Chrome 153, four captures issued together on a
+// VISIBLE tab, each scored against the same page:
+//
+//   issued together, four at once   three of the four images were another call's rectangle
+//                                   (98.8%, 97.1% and 95.6% of pixels wrong)
+//   the same four, one at a time     every one exact
+//
+// An agent asking for several crops in one message is the ordinary case, not a pathological
+// one, so this cannot be left to callers to avoid — and nothing in a swapped image says it is
+// swapped. The queue is global rather than per target because the state Chrome mixes up sits
+// in the browser process, and because a screenshot is a ~100ms command: serialising costs
+// less than one extra frame each, and buys an answer that is always of what was asked for.
+let captureTurn = Promise.resolve();
+const queueCapture = (work) => {
+    // Both arms run `work`: a predecessor that failed must not cancel the queue behind it.
+    const mine = captureTurn.then(work, work);
+    captureTurn = mine.then(() => { }, () => { });
+    return mine;
+};
 // The visible area, in the DOCUMENT coordinates a CDP clip is expressed in.
 //
 // Measured against a page scrolled exactly one viewport down: a clip at `y: 0` captured the
@@ -375,7 +396,7 @@ export function registerPageTools(server, getClient) {
     server.registerTool('screenshot', {
         description: 'Capture a PNG screenshot of the current viewport (the visible page area only — not the full scrollable page, not the browser chrome, not DevTools), or of one rectangle of it with `region`. ' +
             "Captured at the tab's native pixel size unless you cap it with `maxEdge`; a capture that was scaled or cut says so in a note beside the image, which for a `region` also gives the CSS rect the image covers and how many image pixels a CSS pixel became. " +
-            'If the tab is not on screen it is brought to the front first, which changes what the user is looking at.',
+            'A tab that is not painting is raised in its window first, which changes which tab is selected there.',
         inputSchema: z.object({
             region: z
                 .object({
@@ -494,77 +515,95 @@ export function registerPageTools(server, getClient) {
             }
         }
         const params = clip ? { format: 'png', clip } : { format: 'png' };
-        let broughtToFront = false;
-        // A hidden tab is not painting, and a capture sent to a tab that is not painting does
-        // not come back until something makes it paint. Raising it first turns a 10s stall
-        // into a 700ms answer — measured, Chrome 153, a minimised window: raise, wait for a
-        // double rAF (29ms), capture (71ms), pixels exact. The wait is what makes it safe;
-        // capturing the instant the tab is raised is how a stale surface gets returned.
-        //
-        // Only on the path that already asked the page something. A plain `screenshot` with no
-        // arguments still sends nothing but the capture, and reaches the same place through the
-        // timeout below, a few seconds later.
-        if (pageHidden) {
-            const front = client.Page.bringToFront();
-            front.catch(() => { });
-            if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) !== TIMED_OUT) {
+        const captureOnce = async () => {
+            let broughtToFront = false;
+            // A hidden tab is not painting, and a capture sent to a tab that is not painting does
+            // not come back until something makes it paint. Raising it first turns a 10s stall
+            // into a 700ms answer — measured, Chrome 153, a minimised window: raise, wait for a
+            // double rAF (29ms), capture (71ms), pixels exact. The wait is what makes it safe;
+            // capturing the instant the tab is raised is how a stale surface gets returned.
+            //
+            // Only on the path that already asked the page something. A plain `screenshot` with no
+            // arguments still sends nothing but the capture, and reaches the same place through the
+            // timeout below, a few seconds later.
+            if (pageHidden) {
+                const front = client.Page.bringToFront();
+                front.catch(() => { });
+                if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) !== TIMED_OUT) {
+                    broughtToFront = true;
+                    const painted = client.Runtime.evaluate({
+                        expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+                        returnByValue: true,
+                        awaitPromise: true,
+                    });
+                    painted.catch(() => { });
+                    await withTimeout(painted, FRAME_WAIT_TIMEOUT_MS);
+                }
+            }
+            // ONE capture request for the life of the call, waited on twice. A tab that is not
+            // painting does not refuse a capture, it just never answers — and issuing a SECOND
+            // request while the first is still pending is what turns that into a wrong answer.
+            // Measured against a minimised window, Chrome 153, a 300x120 region on a static page:
+            //
+            //   first request, alone                       no answer in 10s
+            //   ...then bringToFront, then a NEW request   answered in 62ms, 100% of pixels wrong
+            //   ...then bringToFront, awaiting the SAME    answered in ~70ms, 0% wrong (twice)
+            //   a plain capture issued alongside a pending one    99.9% of pixels wrong
+            //
+            // The wrong images are the dangerous case: they arrive fast, they are the right size,
+            // and they carry no sign at all that they show another moment or another place. So the
+            // retry is a second WAIT, never a second request, and nothing else is sent to this
+            // target until the capture settles.
+            const shot = client.Page.captureScreenshot(params);
+            // Handled here because the wait below can be abandoned; without it a later rejection
+            // would surface as an unhandledRejection with nobody listening.
+            shot.catch(() => { });
+            let result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
+            if (result === TIMED_OUT) {
+                const front = client.Page.bringToFront();
+                front.catch(() => { });
+                if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) === TIMED_OUT) {
+                    return {
+                        ok: false,
+                        error: toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
+                            'to the front either. Chrome is not answering for this target at all — check the window still exists.'),
+                    };
+                }
                 broughtToFront = true;
-                const painted = client.Runtime.evaluate({
-                    expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
-                    returnByValue: true,
-                    awaitPromise: true,
-                });
-                painted.catch(() => { });
-                await withTimeout(painted, FRAME_WAIT_TIMEOUT_MS);
+                result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
             }
-        }
-        // ONE capture request for the life of the call, waited on twice. A tab that is not
-        // painting does not refuse a capture, it just never answers — and issuing a SECOND
-        // request while the first is still pending is what turns that into a wrong answer.
-        // Measured against a minimised window, Chrome 153, a 300x120 region on a static page:
-        //
-        //   first request, alone                       no answer in 10s
-        //   ...then bringToFront, then a NEW request   answered in 62ms, 100% of pixels wrong
-        //   ...then bringToFront, awaiting the SAME    answered in ~70ms, 0% wrong (twice)
-        //   a plain capture issued alongside a pending one    99.9% of pixels wrong
-        //
-        // The wrong images are the dangerous case: they arrive fast, they are the right size,
-        // and they carry no sign at all that they show another moment or another place. So the
-        // retry is a second WAIT, never a second request, and nothing else is sent to this
-        // target until the capture settles.
-        const shot = client.Page.captureScreenshot(params);
-        // Handled here because the wait below can be abandoned; without it a later rejection
-        // would surface as an unhandledRejection with nobody listening.
-        shot.catch(() => { });
-        let result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
-        if (result === TIMED_OUT) {
-            const front = client.Page.bringToFront();
-            front.catch(() => { });
-            if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) === TIMED_OUT) {
-                return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, and the tab could not be brought ` +
-                    'to the front either. Chrome is not answering for this target at all — check the window still exists.');
+            // Giving up here leaves the request in flight, and the next capture will be issued
+            // alongside it — the very overlap this queue exists to prevent. It is still the right
+            // trade: a target that has ignored a capture for 20s would otherwise hold every later
+            // screenshot behind it forever, and that one has already been told it failed.
+            if (result === TIMED_OUT) {
+                return {
+                    ok: false,
+                    error: toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, then still did not answer within ` +
+                        `another ${SCREENSHOT_TIMEOUT_MS}ms after the tab was brought to the front. The tab is not ` +
+                        'producing frames (minimised or fully occluded window), or its renderer is blocked. Nothing was captured.'),
+                };
             }
-            broughtToFront = true;
-            result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
-        }
-        if (result === TIMED_OUT) {
-            return toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms, then still did not answer within ` +
-                `another ${SCREENSHOT_TIMEOUT_MS}ms after the tab was brought to the front. The tab is not ` +
-                'producing frames (minimised or fully occluded window), or its renderer is blocked. Nothing was captured.');
-        }
-        const image = { type: 'image', data: result.data, mimeType: 'image/png' };
+            return { ok: true, data: result.data, broughtToFront };
+        };
+        const delivered = await queueCapture(captureOnce);
+        if (!delivered.ok)
+            return delivered.error;
+        const { broughtToFront } = delivered;
+        const image = { type: 'image', data: delivered.data, mimeType: 'image/png' };
         // Only what the caller did not ask for is annotated, on the same principle as
         // get_html's truncation marker: an unmarked result is exactly what was requested, so
         // nobody has to wonder whether they are looking at the whole thing. A region that fit
         // and a capture that was not scaled therefore say nothing.
         const notes = [];
-        const size = pngSize(result.data);
+        const size = pngSize(delivered.data);
         // Raising a tab changes what the user is looking at, whether it happened because the
         // page said it was hidden or because the first wait ran out — so it is news, both
         // about the browser and about why the call took as long as it did.
         if (broughtToFront) {
-            notes.push('Note: the tab was not on screen and so was not painting, so it was brought to the front to capture ' +
-                'it. That changed which tab the user is looking at.');
+            notes.push('Note: the tab was not painting, so it was raised in its window and given a frame before the capture — ' +
+                'that changed which tab is selected there. The window itself was left alone, so if it is minimised or ' +
+                'behind another window the page can still report `document.hidden`.');
         }
         // A region is the one capture whose image gets measured against page coordinates: it
         // was asked for in CSS pixels and comes back in image pixels, and the two differ by

@@ -235,7 +235,7 @@ describe('screenshot', () => {
       expect(captureScreenshot).toHaveBeenCalledTimes(1);
       expect(result.isError).toBeFalsy();
       expect((result.content as any)[0]).toEqual({ type: 'image', data: 'aGk=', mimeType: 'image/png' });
-      expect((result.content as any)[1].text).toContain('brought to the front');
+      expect((result.content as any)[1].text).toContain('raised in its window');
     } finally {
       vi.useRealTimers();
     }
@@ -282,7 +282,7 @@ describe('screenshot', () => {
     expect(frameWait?.[0]).toMatchObject({ awaitPromise: true });
     // The order is the whole point: raised, painted, then captured.
     expect(bringToFront.mock.invocationCallOrder[0]).toBeLessThan(captureScreenshot.mock.invocationCallOrder[0]);
-    expect((result.content as any)[1].text).toContain('brought to the front');
+    expect((result.content as any)[1].text).toContain('raised in its window');
   });
 
   // The converse, so the raise cannot quietly become unconditional: a tab already on screen
@@ -327,6 +327,36 @@ describe('screenshot', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // The invariant behind the queue, and the one an agent breaks constantly: several crops
+  // asked for in one message. Measured against Chrome, four captures issued together came
+  // back with three of the four showing another call's rectangle, so overlap is not allowed
+  // to happen at all — the second capture is not sent until the first has answered.
+  it('never lets two captures overlap', async () => {
+    const answer: Array<() => void> = [];
+    const captureScreenshot = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          answer.push(() => resolve({ data: 'aGk=' }));
+        }),
+    );
+    const client = await setupMcpClient(makeMockClient(reportsDpr(1), captureScreenshot));
+
+    const first = client.callTool({ name: 'screenshot', arguments: {} });
+    const second = client.callTool({ name: 'screenshot', arguments: {} });
+
+    await vi.waitFor(() => expect(captureScreenshot).toHaveBeenCalledTimes(1));
+    // The second call has had every chance to reach Chrome by now, and must not have.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(captureScreenshot).toHaveBeenCalledTimes(1);
+
+    answer[0]();
+    await first;
+    await vi.waitFor(() => expect(captureScreenshot).toHaveBeenCalledTimes(2));
+    answer[1]();
+    const result: any = await second;
+    expect(result.content).toEqual([{ type: 'image', data: 'aGk=', mimeType: 'image/png' }]);
   });
 
   // bringToFront is handled off the page's main thread, so it answering nothing means the

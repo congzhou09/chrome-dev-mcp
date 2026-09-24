@@ -1,6 +1,6 @@
 {
   "name": "chrome-dev-mcp",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Attach to an already-running Chrome tab for real runtime debugging: breakpoints, stepping, scope variables. Plain CDP, minimal dependencies.",
   "main": "dist/index.js",
   "bin": {

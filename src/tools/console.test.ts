@@ -82,6 +82,77 @@ describe('get_console_logs', () => {
     expect(marks(await read(client))).toEqual(['was-already-in-devtools:before-connect', 'captured-live:current']);
   });
 
+  // Resolving an exception's stack trace can await a source map fetch, and a cold cache makes
+  // that a real network round trip. Anything printed during it must not overtake the
+  // exception: an error followed by the line that reacts to it is the ordering a caller reads
+  // for cause and effect.
+  it('keeps arrival order while a stack trace waits on a source map fetch', async () => {
+    let answer: (body: string) => void = () => {};
+    const fetching = new Promise<string>((resolve) => {
+      answer = resolve;
+    });
+    vi.stubGlobal('fetch', () => fetching.then((body) => ({ ok: true, text: async () => body })));
+
+    const cdp: any = makeMockClient();
+    const client = await setupMcpClient(cdp);
+    await read(client);
+
+    fireCdp(cdp, 'Debugger', 'scriptParsed', {
+      scriptId: 's1',
+      url: 'http://localhost/app.js',
+      sourceMapURL: 'app.js.map',
+    });
+
+    // Not awaited: the handler is parked on the fetch, which is the window under test.
+    void messageAdded(cdp)({
+      message: {
+        source: 'javascript',
+        level: 'error',
+        text: 'boom',
+        stackTrace: {
+          callFrames: [
+            { functionName: 'f', scriptId: 's1', url: 'http://localhost/app.js', lineNumber: 4, columnNumber: 2 },
+          ],
+        },
+      },
+    });
+    await say(cdp, 'retrying');
+
+    const during = (await read(client)).structuredContent.logs;
+    expect(during.map((l: any) => l.text)).toEqual(['boom', 'retrying']);
+    expect(during[0].stackTrace).toBeUndefined();
+
+    answer('{"version":3,"sources":[],"mappings":""}');
+    await vi.waitFor(async () => {
+      const after = (await read(client)).structuredContent.logs;
+      expect(after.map((l: any) => l.text)).toEqual(['boom', 'retrying']);
+      expect(after[0].stackTrace).toHaveLength(1);
+    });
+
+    vi.unstubAllGlobals();
+  });
+
+  // Chrome replays its console history with no time of its own (measured, Chrome 153: the
+  // messageAdded payload is source/level/text/line/column), so the only reading available for
+  // the backlog is the instant of the replay — identical for every entry, and unrelated to
+  // when they happened. Reporting it would look exactly like an occurrence time.
+  it('gives the replayed backlog no timestamp, and live entries one', async () => {
+    const { cdp, release } = withHeldEnable();
+    const client = await setupMcpClient(cdp);
+    const attaching = read(client);
+    await vi.waitFor(() => expect(messageAdded(cdp)).toBeTypeOf('function'));
+    await say(cdp, 'replayed-at-attach');
+    release();
+    await attaching;
+
+    await say(cdp, 'captured-live');
+
+    const logs = (await read(client)).structuredContent.logs;
+    expect(logs.map((l: any) => l.text)).toEqual(['replayed-at-attach', 'captured-live']);
+    expect(logs[0]).not.toHaveProperty('timestamp');
+    expect(logs[1].timestamp).toEqual(expect.any(String));
+  });
+
   it('returns only the current document for since: current-page-load', async () => {
     const { cdp, release } = withHeldEnable();
     const client = await setupMcpClient(cdp);

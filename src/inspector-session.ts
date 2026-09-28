@@ -137,15 +137,28 @@ export function createInspectorSession(): InspectorSession {
       const load = loadGeneration;
       const msg = event.message;
       const type: string = msg.source === 'javascript' && msg.level === 'error' ? 'exception' : (msg.level as string);
-      const stackTrace = msg.stackTrace ? await formatStackTrace(msg.stackTrace) : undefined;
-      consoleLogs.push({
-        timestamp: new Date().toISOString(),
+
+      // Take the slot and the clock reading now, and fill the stack trace in afterwards.
+      // Resolving one can await a source map fetch (cold cache, first exception from a
+      // bundle), and everything that arrives during that fetch would otherwise be pushed
+      // ahead of it — reversing an error and the log line that follows it, which is the one
+      // ordering a caller reads for cause and effect.
+      const entry: ConsoleEntry & { load: number } = {
+        // Generation 0 is the replay: see ConsoleEntry.timestamp for why it gets none.
+        ...(load === 0 ? {} : { timestamp: new Date().toISOString() }),
         load,
         type,
         text: msg.text as string,
-        ...(stackTrace?.length ? { stackTrace } : {}),
-      });
+      };
+      consoleLogs.push(entry);
       if (consoleLogs.length > MAX_CONSOLE_LOGS) consoleLogs.shift();
+
+      if (msg.stackTrace) {
+        const stackTrace = await formatStackTrace(msg.stackTrace);
+        // A read that lands during the fetch sees the entry without its stack, which is a
+        // better answer than not seeing the exception at all.
+        if (stackTrace?.length) entry.stackTrace = stackTrace;
+      }
     });
 
     // Console domain is marked @deprecated in CDP in favour of Runtime.consoleAPICalled +

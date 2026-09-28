@@ -6,7 +6,15 @@ export interface DebuggerState {
 }
 
 export interface ConsoleEntry {
-  timestamp: string;
+  /**
+   * When this server received the entry — within a millisecond or two of the page printing
+   * it. Absent on `before-connect` entries: Console.messageAdded carries no time of its own
+   * (measured, Chrome 153 — the payload is source/level/text/line/column), so the only clock
+   * reading available for the backlog Chrome replays at attach is the moment of the replay,
+   * which is the same instant for every one of them and says nothing about when they
+   * happened. They arrive in the order DevTools shows them.
+   */
+  timestamp?: string;
   type: string;
   text: string;
   /**

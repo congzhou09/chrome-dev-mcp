@@ -18,7 +18,8 @@ export function registerConsoleTools(
         'Return browser console messages and uncaught exceptions, including the history already visible in DevTools before this server connected. ' +
         'Exceptions are reported with their full stack trace (source-mapped when available). ' +
         'Reloading or navigating the page does NOT clear this buffer: output from the old document stays and the new one is appended to it, ' +
-        'so an entry carries `from` when it predates the document showing now.',
+        'so an entry carries `from` when it predates the document showing now. ' +
+        'Replayed entries carry no `timestamp` — Chrome hands its backlog over without one.',
       inputSchema: z.object({
         limit: z
           .number()
@@ -43,24 +44,29 @@ export function registerConsoleTools(
           ),
       }),
       outputSchema: z.object({
-        logs: z.array(
-          z.object({
-            timestamp: z.string(),
-            type: z.string(),
-            text: z.string(),
-            from: z.enum(['before-connect', 'earlier-page-load']).optional(),
-            stackTrace: z
-              .array(
-                z.object({
-                  functionName: z.string(),
-                  url: z.string(),
-                  lineNumber: z.number(),
-                  columnNumber: z.number(),
-                }),
-              )
-              .optional(),
-          }),
-        ),
+        logs: z
+          .array(
+            z.object({
+              timestamp: z
+                .string()
+                .optional()
+                .describe('When this server received the entry. Absent on `before-connect` entries.'),
+              type: z.string(),
+              text: z.string(),
+              from: z.enum(['before-connect', 'earlier-page-load']).optional(),
+              stackTrace: z
+                .array(
+                  z.object({
+                    functionName: z.string(),
+                    url: z.string(),
+                    lineNumber: z.number(),
+                    columnNumber: z.number(),
+                  }),
+                )
+                .optional(),
+            }),
+          )
+          .describe('Oldest first.'),
       }),
       annotations: {
         title: 'Get console logs',

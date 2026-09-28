@@ -183,7 +183,7 @@ All 24 serve the same workflow: get the page into the state where it misbehaves,
 
 | Tool               | Description                                                                                                                                                                                                                                                                                                                                               |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_console_logs` | All messages visible in the DevTools Console — including output that existed before this server connected. Exceptions are reported with their full stack trace (source-mapped when available). Supports filtering by level (`log` / `info` / `debug` / `warning` / `error` / `exception`). Not pruned on navigation — use `clear_captures` to start fresh. |
+| `get_console_logs` | All messages visible in the DevTools Console, including output that predates this server's connection. Exceptions are reported with their full stack trace (source-mapped when available). Filterable by level (`error`, `warning`, …). Not pruned on navigation: entries from a replaced document, or from before the connection, carry a `from` marker while the current document's are unmarked, and `since: "current-page-load"` narrows the result to those; `clear_captures` empties the buffer outright. |
 
 ### Debugger
 

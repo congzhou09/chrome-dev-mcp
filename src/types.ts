@@ -9,6 +9,14 @@ export interface ConsoleEntry {
   timestamp: string;
   type: string;
   text: string;
+  /**
+   * Which page load this came from, and only when that is not the one showing now — an
+   * unmarked entry belongs to the page as it currently stands. `before-connect` is the
+   * backlog Console.enable() replays at attach, which happened before this server could
+   * see any navigation; `earlier-page-load` is a document since replaced by a reload or a
+   * navigation, and stays that way however many loads ago it was.
+   */
+  from?: 'before-connect' | 'earlier-page-load';
   stackTrace?: Array<{
     functionName: string;
     url: string;

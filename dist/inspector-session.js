@@ -10,8 +10,22 @@ export function createInspectorSession() {
     // breakpointId -> human-readable label ("url:line")
     const activeBreakpoints = new Map();
     const sourceMaps = createSourceMapResolver();
-    // Circular buffer for console messages and uncaught exceptions.
+    // Circular buffer for console messages and uncaught exceptions, each stamped with the
+    // page load it belongs to.
+    //
+    // The stamp exists because nothing else separates one page's output from the next: a
+    // reload does not clear this buffer (measured — Chrome replays history only at
+    // Console.enable(), so after a reload the old entries simply stay and the new ones are
+    // appended), and the timestamps are this server's arrival times, which a caller would
+    // have to eyeball against a navigation it cannot see. Deleting on navigation, the way
+    // the network buffer prunes, was the alternative and is worse here: an error thrown
+    // during unload is exactly what a caller is looking for, the buffer is capped at 500
+    // small entries anyway, and the pre-connect replay is the only history there is.
     const consoleLogs = [];
+    // 0 is the backlog Console.enable() replays at attach — it predates this session, so it
+    // belongs to no load this server watched happen. Live capture starts at 1, and every
+    // main-frame navigation after that adds one.
+    let loadGeneration = 0;
     // Track which client the event listeners are registered on.
     // When getClient() returns a different instance (reconnect), we re-register
     // and reset stale debugger state — this is the "reconnect cleanup" point.
@@ -33,6 +47,7 @@ export function createInspectorSession() {
         activeBreakpoints.clear();
         sourceMaps.reset();
         consoleLogs.length = 0;
+        loadGeneration = 0;
         // ── Console / exception event listeners ──────────────────────────────────
         // Format a Runtime.StackTrace into resolved (source-mapped) frames.
         const formatStackTrace = async (stackTrace) => {
@@ -57,11 +72,16 @@ export function createInspectorSession() {
         //
         // source === 'javascript' + level === 'error' → uncaught exception (not a console.error call).
         client.Console.on('messageAdded', async (event) => {
+            // Read synchronously, before the first await. Resolving a stack trace takes a turn or
+            // two, and the replay burst that Console.enable() answers with arrives during exactly
+            // that window — stamping after the await would hand those entries the live generation.
+            const load = loadGeneration;
             const msg = event.message;
             const type = msg.source === 'javascript' && msg.level === 'error' ? 'exception' : msg.level;
             const stackTrace = msg.stackTrace ? await formatStackTrace(msg.stackTrace) : undefined;
             consoleLogs.push({
                 timestamp: new Date().toISOString(),
+                load,
                 type,
                 text: msg.text,
                 ...(stackTrace?.length ? { stackTrace } : {}),
@@ -74,6 +94,15 @@ export function createInspectorSession() {
         // only mechanism that replays all messages already visible in DevTools before this server
         // connected — which is the core requirement here.  The @deprecated hint is intentional.
         await client.Console.enable();
+        // Everything replayed above belongs to generation 0; everything from here is live.
+        loadGeneration = 1;
+        // One generation per main-frame navigation — a reload included, which is the case this
+        // whole stamp exists for. Subframes are ignored: an iframe swapping does not make the
+        // page's own output stale. (Page.enable is issued at connect time, in index.ts.)
+        client.Page.on('frameNavigated', (event) => {
+            if (event?.frame && !event.frame.parentId)
+                loadGeneration++;
+        });
         client.Debugger.on('scriptParsed', (event) => {
             if (event.url) {
                 sourceMaps.registerScript(event.scriptId, event.url, event.sourceMapURL);
@@ -141,9 +170,26 @@ export function createInspectorSession() {
                 resolve(true);
             });
         }),
-        readConsoleLogs({ limit, level }) {
-            const filtered = level ? consoleLogs.filter((e) => e.type === level) : consoleLogs;
-            return filtered.slice(-limit);
+        readConsoleLogs({ limit, level, since = 'before-connect' }) {
+            // The three buckets are ordered, so the filter and the label are the same question
+            // asked twice: which of them an entry falls in. Naming that once keeps them from
+            // drifting apart.
+            const BUCKETS = ['before-connect', 'earlier-page-load', 'current-page-load'];
+            const bucketOf = (load) => (load === 0 ? 0 : load < loadGeneration ? 1 : 2);
+            const floor = BUCKETS.indexOf(since);
+            // Filtering before the slice is the point of `since`: `limit` would otherwise be
+            // spent on a replaced page, and "no entries" is a far more useful answer than a list
+            // the caller has to scan for the absence of a marker.
+            const inScope = consoleLogs.filter((e) => bucketOf(e.load) >= floor && (level ? e.type === level : true));
+            // Stored as a number, handed out as a label: the number only means something next to
+            // the current generation, and by the time a caller reads it the page may have
+            // navigated again. Only what is NOT from the page as it stands now gets marked, so an
+            // unmarked entry is current — the same way an unmarked screenshot is exactly the
+            // rectangle that was asked for.
+            return inScope.slice(-limit).map(({ load, ...entry }) => {
+                const bucket = bucketOf(load);
+                return bucket === 2 ? entry : { ...entry, from: BUCKETS[bucket] };
+            });
         },
         clearConsoleLogs() {
             const dropped = consoleLogs.length;

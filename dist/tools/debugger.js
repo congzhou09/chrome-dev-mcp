@@ -335,7 +335,9 @@ export function registerDebuggerTools(server, getClient, session) {
             'preview — class name plus a first level of properties, marked `…` where Chrome truncated it — readable, ' +
             'not parseable as the value. Use get_debugger_state to find frame indices.',
         inputSchema: z.object({
-            expression: z.string().describe('JS expression to evaluate'),
+            expression: z
+                .string()
+                .describe('JS source evaluated as-is. A function is not called — wrap it: `(() => { ... })()`'),
             frameIndex: z
                 .number()
                 .default(0)

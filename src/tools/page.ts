@@ -298,7 +298,11 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
         'the read, or read in a second call. ' +
         'At a breakpoint this still evaluates globally and cannot see local or closure variables — use evaluate_at_frame for those. ' +
         'For the element selected in the Elements panel ($0), use get_inspected_element.',
-      inputSchema: z.object({ expression: z.string() }),
+      inputSchema: z.object({
+        expression: z
+          .string()
+          .describe('JS source evaluated as-is. A function is not called — wrap it: `(() => { ... })()`'),
+      }),
       annotations: {
         title: 'Evaluate JS',
       },

@@ -90,7 +90,7 @@ export async function setupMcpClient(
 
 // Invokes a registered CDP handler directly, the same way the get_debugger_state test
 // simulates a paused event. Handlers are synchronous, so this is not awaited.
-export function fireCdp(cdpClient: CDP.Client, domain: 'Network' | 'Page', event: string, payload: any): void {
+export function fireCdp(cdpClient: CDP.Client, domain: 'Debugger' | 'Network' | 'Page', event: string, payload: any): void {
   const handler = (cdpClient as any)[domain].on.mock.calls.find(([e]: [string]) => e === event)?.[1];
   handler?.(payload);
 }

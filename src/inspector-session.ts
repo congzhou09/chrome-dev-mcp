@@ -85,6 +85,13 @@ export function createInspectorSession(): InspectorSession {
   // and reset stale debugger state — this is the "reconnect cleanup" point.
   let registeredOnClient: CDP.Client | null = null;
 
+  const clearPause = () => {
+    debuggerState.paused = false;
+    debuggerState.callFrames = [];
+    debuggerState.pauseReason = '';
+    debuggerState.hitBreakpoints = [];
+  };
+
   const attach = async (client: CDP.Client): Promise<void> => {
     if (registeredOnClient === client) return;
     registeredOnClient = client;
@@ -95,10 +102,7 @@ export function createInspectorSession(): InspectorSession {
     // debugger/console tool call, which can be minutes after connect — clearing the
     // network buffer at that point would discard everything captured since connect.
     // Network capture has its own reset in NetworkCapture.reset().
-    debuggerState.paused = false;
-    debuggerState.callFrames = [];
-    debuggerState.pauseReason = '';
-    debuggerState.hitBreakpoints = [];
+    clearPause();
     activeBreakpoints.clear();
     sourceMaps.reset();
     consoleLogs.length = 0;
@@ -173,8 +177,19 @@ export function createInspectorSession(): InspectorSession {
     // One generation per main-frame navigation — a reload included, which is the case this
     // whole stamp exists for. Subframes are ignored: an iframe swapping does not make the
     // page's own output stale. (Page.enable is issued at connect time, in index.ts.)
+    //
+    // A main-frame navigation also ends any pause, and this is the only signal that it did.
+    // Navigating away from a paused document — the toolbar reload button, F5 in DevTools, or
+    // Page.reload / Page.navigate from any CDP session — discards the pause WITHOUT a
+    // Debugger.resumed (measured, Chrome 154: only executionContextsCleared, frameNavigated
+    // and loadEventFired follow). Only a navigation the page's own script starts, such as
+    // location.reload() via evaluate, resumes first. Without this the state would keep
+    // reporting call frames of a document that no longer exists. A breakpoint the new
+    // document hits arrives as a fresh Debugger.paused after this event, so it is not lost.
     client.Page.on('frameNavigated', (event: any) => {
-      if (event?.frame && !event.frame.parentId) loadGeneration++;
+      if (!event?.frame || event.frame.parentId) return;
+      loadGeneration++;
+      clearPause();
     });
 
     client.Debugger.on('scriptParsed', (event: any) => {
@@ -190,12 +205,7 @@ export function createInspectorSession(): InspectorSession {
       debuggerState.hitBreakpoints = event.hitBreakpoints ?? [];
     });
 
-    client.Debugger.on('resumed', () => {
-      debuggerState.paused = false;
-      debuggerState.callFrames = [];
-      debuggerState.pauseReason = '';
-      debuggerState.hitBreakpoints = [];
-    });
+    client.Debugger.on('resumed', clearPause);
 
     // Set up a one-time listener BEFORE enable so Chrome's initial 'paused' event
     // (if execution is already stopped) is caught and updates debuggerState.

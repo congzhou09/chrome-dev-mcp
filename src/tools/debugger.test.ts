@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import CDP from 'chrome-remote-interface';
-import { makeMockClient, setupMcpClient } from '../test-helpers.js';
+import { makeMockClient, setupMcpClient, fireCdp } from '../test-helpers.js';
 
 describe('get_debugger_state', () => {
   it('returns not-paused state when not paused', async () => {
@@ -40,6 +40,31 @@ describe('get_debugger_state', () => {
     expect(parsed.reason).toBe('breakpoint');
     expect(parsed.callStack[0].functionName).toBe('handleClick');
     expect(parsed.callStack[0].lineNumber).toBe(10); // converted from 0-indexed
+  });
+
+  // Chrome drops a pause on navigation without sending Debugger.resumed, so the state has to
+  // be cleared by the navigation itself — for the main frame only.
+  const pauseThenNavigate = async (parentId?: string) => {
+    const cdpClient = makeMockClient();
+    const mcpClient = await setupMcpClient(cdpClient);
+    await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    fireCdp(cdpClient, 'Debugger', 'paused', {
+      reason: 'other',
+      callFrames: [{ functionName: 'tick', url: 'http://localhost/a.js', location: { scriptId: '1', lineNumber: 0 } }],
+    });
+    fireCdp(cdpClient, 'Page', 'frameNavigated', {
+      frame: { url: 'http://localhost/', loaderId: 'l2', ...(parentId ? { parentId } : {}) },
+    });
+    const result = await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    return JSON.parse((result.content as any)[0].text);
+  };
+
+  it('reports not paused after a main-frame navigation discards the pause', async () => {
+    expect(await pauseThenNavigate()).toEqual({ paused: false });
+  });
+
+  it('stays paused when only a subframe navigates', async () => {
+    expect((await pauseThenNavigate('main-frame')).paused).toBe(true);
   });
 });
 

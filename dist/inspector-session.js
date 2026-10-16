@@ -30,7 +30,7 @@ export function createInspectorSession() {
     // When getClient() returns a different instance (reconnect), we re-register
     // and reset stale debugger state — this is the "reconnect cleanup" point.
     let registeredOnClient = null;
-    const clearPause = () => {
+    const clearPauseRecord = () => {
         debuggerState.paused = false;
         debuggerState.callFrames = [];
         debuggerState.pauseReason = '';
@@ -46,7 +46,7 @@ export function createInspectorSession() {
         // debugger/console tool call, which can be minutes after connect — clearing the
         // network buffer at that point would discard everything captured since connect.
         // Network capture has its own reset in NetworkCapture.reset().
-        clearPause();
+        clearPauseRecord();
         activeBreakpoints.clear();
         sourceMaps.reset();
         consoleLogs.length = 0;
@@ -127,7 +127,7 @@ export function createInspectorSession() {
             if (!event?.frame || event.frame.parentId)
                 return;
             loadGeneration++;
-            clearPause();
+            clearPauseRecord();
         });
         client.Debugger.on('scriptParsed', (event) => {
             if (event.url) {
@@ -140,7 +140,7 @@ export function createInspectorSession() {
             debuggerState.pauseReason = event.reason;
             debuggerState.hitBreakpoints = event.hitBreakpoints ?? [];
         });
-        client.Debugger.on('resumed', clearPause);
+        client.Debugger.on('resumed', clearPauseRecord);
         // Set up a one-time listener BEFORE enable so Chrome's initial 'paused' event
         // (if execution is already stopped) is caught and updates debuggerState.
         const initialPauseSettled = new Promise((resolve) => {

@@ -24,8 +24,9 @@ const outcomeSchema = z.object({
 //
 // Both work on a paused page with no special handling. Measured, Chrome 154: Page.reload and
 // Page.navigate issued while paused at a breakpoint both completed in ~10ms, and breakpoints
-// set by URL hit again in the new document. The old pause is discarded without a
-// Debugger.resumed — the session clears it on frameNavigated (see inspector-session.ts).
+// hit again in the new document. Chrome ends the old pause without sending
+// Debugger.resumed, so the session clears its record of it on frameNavigated
+// (see inspector-session.ts).
 export function registerNavigationTools(server, getClient, session) {
     // Issues `start` and waits for the first of: the new document's load event, a pause, or
     // the bound. Every listener goes on BEFORE the command, because on a fast page the load
@@ -57,22 +58,27 @@ export function registerNavigationTools(server, getClient, session) {
             };
         });
         try {
-            // Bounded by the same deadline as the wait: Page.navigate answers only once the new
-            // document commits, and a renderer held in a synchronous loop does not let it commit
-            // until the loop ends. Measured, Chrome 154: a 6s loop held Page.navigate's answer for
-            // 6020ms. Page.reload answers at once in that state, but the reload itself waits just
-            // the same — which is what `committedUrl` tells apart from a page merely slow to load.
-            const response = await withTimeout(start().catch((e) => ({ rejected: e.message })), NAVIGATION_TIMEOUT_MS);
+            // Bounded by the same `deadline` as the wait for load or pause below: Page.navigate
+            // answers only once the new document commits, and a renderer held in a synchronous loop
+            // does not let it commit until the loop ends. Measured, Chrome 154: a 6s loop held
+            // Page.navigate's answer for 6020ms. Page.reload answers at once in that state, but the
+            // reload itself waits just the same — which is what `committedUrl` tells apart from a
+            // page merely slow to load.
+            const response = await withTimeout(start().catch((e) => ({ rejected: e.message })), Math.max(0, deadline - Date.now()));
             if (response === TIMED_OUT)
                 return notCommitted(what);
             if ('rejected' in response)
                 return toolError(`Error: ${what} failed: ${response.rejected}`);
-            // Chrome then shows its own error page, which does fire a load event — waiting for it
-            // would report a failed navigation as "loaded".
-            if (response.errorText)
-                return toolError(`Error: ${what} failed: ${response.errorText}`);
+            // Before errorText, because a download carries one too. Measured, Chrome 155: navigating
+            // to an attachment or a non-renderable type answered `errorText: "net::ERR_ABORTED"`,
+            // `isDownload: true` and a loaderId, with downloads allowed and denied alike; the old
+            // page stayed and no load event followed.
             if (response.isDownload)
                 return result({ outcome: 'download' });
+            // A navigation that fails outright still commits Chrome's own error page, which fires a
+            // load event — waiting for it would report the failure as a successful "loaded".
+            if (response.errorText)
+                return toolError(`Error: ${what} failed: ${response.errorText}`);
             if (response.sameDocument)
                 return result({ outcome: 'same-document', ...(await readPage(client)) });
             const waited = await withTimeout(settled, Math.max(0, deadline - Date.now()));
@@ -95,7 +101,7 @@ export function registerNavigationTools(server, getClient, session) {
         }
     };
     // Best-effort: the navigation has already succeeded, so a page that does not answer here
-    // costs the caller a title, not the result.
+    // costs the caller the url and title, not the result.
     const readPage = async (client) => {
         const read = await withTimeout(client.Runtime.evaluate({ expression: '({ url: location.href, title: document.title })', returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS).catch(() => TIMED_OUT);
         if (read === TIMED_OUT)
@@ -109,9 +115,13 @@ export function registerNavigationTools(server, getClient, session) {
     const notCommitted = (what) => toolError(`Error: ${what} did not commit within ${NAVIGATION_TIMEOUT_MS}ms. The old page is still in place — its ` +
         'renderer may be blocked in a synchronous loop, which holds a navigation back until the loop ends.');
     server.registerTool('navigate', {
-        description: "Navigate the connected tab to a URL and wait for the new page's load event — or for execution to pause " +
-            'first, e.g. on a breakpoint the new page hits during startup, in which case the call stack is returned. ' +
-            'Breakpoints set by URL carry over to the new page. Works while paused: the pause ends with the old page.',
+        description: `Navigate the connected tab to a URL and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load ` +
+            'event — or for execution to pause first, e.g. on a breakpoint the new page hits during startup, in which ' +
+            'case the call stack is returned. `outcome` is "loaded", "paused", "still-loading" (the new page is in place ' +
+            'but its load event had not fired by the deadline), "same-document" (only the #hash changed; there is no ' +
+            'load to wait for) or "download" (the URL was downloaded and the page did not change). ' +
+            'Breakpoints carry over to the new page. ' +
+            'Also works while paused, no need to resume first: the pause ends with the old page.',
         inputSchema: z.object({
             url: z.string().describe('Absolute URL, including the scheme.'),
         }),
@@ -126,17 +136,19 @@ export function registerNavigationTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         return navigateAndSettle(client, 'navigate', async () => {
-            // `isDownload` is in the protocol but not yet in chrome-remote-interface's typings.
+            // `isDownload` is in the protocol but not yet in @types/chrome-remote-interface.
             const { loaderId, errorText, isDownload } = (await client.Page.navigate({ url }));
             // No loaderId means no new document: a #hash change, which fires no load event at all.
-            // Measured, Chrome 154: only Page.navigatedWithinDocument followed.
+            // Measured, Chrome 154: the only event that followed was Page.navigatedWithinDocument.
             return { sameDocument: !loaderId, errorText, isDownload };
         });
     });
     server.registerTool('reload', {
-        description: "Reload the connected tab and wait for the new page's load event — or for execution to pause first, e.g. on " +
-            'a breakpoint hit during startup, in which case the call stack is returned. Breakpoints set by URL carry over ' +
-            'to the reloaded page. Works while paused: the pause ends with the old page.',
+        description: `Reload the connected tab and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load event — ` +
+            'or for execution to pause first, e.g. on a breakpoint hit during startup, in which case the call stack is ' +
+            'returned. `outcome` is "loaded", "paused" or "still-loading" (the new page is in place but its load event ' +
+            'had not fired by the deadline). Breakpoints carry over to the reloaded page. ' +
+            'Also works while paused, no need to resume first: the pause ends with the old page.',
         inputSchema: z.object({
             ignoreCache: z.boolean().default(false).describe('Bypass the HTTP cache, as Shift+F5 does.'),
         }),
@@ -144,6 +156,7 @@ export function registerNavigationTools(server, getClient, session) {
         annotations: {
             title: 'Reload',
             destructiveHint: true,
+            openWorldHint: true,
         },
     }, async ({ ignoreCache }) => {
         const client = await getClient();

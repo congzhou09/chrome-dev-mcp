@@ -11,7 +11,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest"
+    "test": "vitest",
+    "measure:tools": "tsx scripts/measure-tools.ts"
   },
   "engines": {
     "node": ">=22"

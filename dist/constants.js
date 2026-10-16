@@ -157,6 +157,12 @@ export const BRING_TO_FRONT_TIMEOUT_MS = 3000;
 // ahead anyway, because the timeout-and-raise path behind it is still there to catch a tab
 // that never paints.
 export const FRAME_WAIT_TIMEOUT_MS = 1000;
+// Bound on a navigate or reload, from issuing the command to the new page's load event.
+// Unlike every bound above, this one waits on the network rather than on the renderer, so it
+// is sized like EVAL_SETTLE_TIMEOUT_MS and for the same reasons: 30s is Puppeteer's default
+// navigation timeout, and it leaves room under the MCP client's 60s for the PAGE_COMMAND_TIMEOUT_MS
+// read of the new page's title that follows it.
+export const NAVIGATION_TIMEOUT_MS = 30_000;
 // The answer to a CDP round-trip that outlived its bound. Deliberately a normal tool error
 // rather than a thrown one: "this renderer never answered" is a state the caller can act on
 // (resume the debugger, dismiss the dialog, reload the tab), not a fault in this server.

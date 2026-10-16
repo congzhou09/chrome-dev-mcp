@@ -29,7 +29,9 @@ export function registerNetworkTools(
         'Capture starts when this server connects to the tab: requests issued before that are NOT visible (unlike get_console_logs, which replays pre-connect history). ' +
         'Requests belonging to a previous page are pruned on navigation, mirroring the DevTools Network panel default; the new document request itself is kept. ' +
         'A redirect chain appears as one record per hop, sharing a requestId and distinguished by `hop`. ' +
-        'WebSocket frames are not captured.',
+        'WebSocket frames are not captured. ' +
+        'In a bulk listing, a URL ending in `…` is truncated and not usable — query its `requestId` for it in full. ' +
+        '`size` is compressed on-the-wire bytes; `canceled` marks an abort (e.g. navigating away), usually not a real failure.',
       inputSchema: z.object({
         limit: z
           .number()

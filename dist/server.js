@@ -5,6 +5,7 @@ import { createNetworkCapture } from './network-capture.js';
 import { registerCaptureTools } from './tools/capture.js';
 import { registerConsoleTools } from './tools/console.js';
 import { registerDebuggerTools } from './tools/debugger.js';
+import { registerNavigationTools } from './tools/navigation.js';
 import { registerNetworkTools } from './tools/network.js';
 import { registerPageTools } from './tools/page.js';
 import { registerTabTools } from './tools/tabs.js';
@@ -24,6 +25,7 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     });
     registerTabTools(server, { switchToTarget, getCurrentTargetId, session });
     registerPageTools(server, getClient);
+    registerNavigationTools(server, getClient, session);
     registerDebuggerTools(server, getClient, session);
     registerConsoleTools(server, getClient, session);
     registerNetworkTools(server, getClient, networkCapture);

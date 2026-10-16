@@ -31,6 +31,14 @@
 ■These are the standard debugger primitives, not overlapping conveniences: `next` / `step` / `finish` / `continue` in gdb, `next` / `stepIn` / `stepOut` / `continue` in DAP, four distinct `Debugger.*` methods in CDP. ■They are mutually exclusive and none can be expressed through another. ■`resume_execution` is not a stepping mode at all.
 ■Collapsing them into `step({ direction })` would remove three names and no decisions.
 
+## navigate / reload
+
+**Not merged.**
+
+◆A merged `navigate({ url? })` that reloads when `url` is left out would hide one of the two behind an absent parameter. A caller who wants to reload looks for a tool named `reload`; failing to find one, it reaches for `location.reload()` in `evaluate_js`, which returns before the new document exists and cannot report a breakpoint hit during startup — the very thing reloading is for while debugging.
+◆Their parameters do not overlap either: `navigate` needs a `url`, `reload` takes only `ignoreCache`. One schema would have to say, for each parameter, which mode it applies in.
+◆What they do share — waiting for the load event or a pause, and telling the two apart from a renderer that never let the navigation commit — is one function in `src/tools/navigation.ts`, so the split costs no duplicated logic.
+
 ## get_title / get_url vs list_tabs
 
 **Deliberate overlap.**

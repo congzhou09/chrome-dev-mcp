@@ -147,18 +147,21 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ## MCP Tools
 
-24 tools in six groups — five domains plus one cross-cutting tool:
+☆26 tools in seven groups — six domains plus one cross-cutting tool:
 
 | Group | Tools | Covers |
 | --- | --- | --- |
 | Tab management | 2 | Discovering tabs, and choosing which one this server is attached to |
 | Page inspection | 7 | The live page: title, URL, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
+| Navigation | 2 | Loading a URL or reloading, and waiting until the new page has loaded or paused |
 | Console | 1 | Console messages and uncaught exceptions, including output from before this server connected |
 | Debugger | 11 | Breakpoints, stepping, call stack, scopes, frame-scoped evaluation |
 | Network | 2 | Requests captured from connect time onward, plus response bodies fetched on demand |
 | Capture buffers | 1 | `clear_captures` — cross-cutting: resets the console and network buffers above |
 
-All 24 serve the same workflow: get the page into the state where it misbehaves, then read whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Several pairs below look mergeable and are deliberately not — [docs/tool-boundaries.md](docs/tool-boundaries.md) records which, and why.
+☆All 26 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate`, `reload` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload`, then read again.
+
+☆Several pairs below look mergeable and are deliberately not — [docs/tool-boundaries.md](docs/tool-boundaries.md) records which, and why.
 
 ### Tab management
 
@@ -178,6 +181,17 @@ All 24 serve the same workflow: get the page into the state where it misbehaves,
 | `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
 | `screenshot`            | PNG screenshot of the current viewport, or of one `region` of it (CSS px from the top-left of the visible area, as `getBoundingClientRect()` reports them). Native pixel size unless capped with `maxEdge` (longest side in px); a capture that was scaled or cut reports that |
 | `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
+
+### Navigation
+
+| Tool       | Description |
+| ---------- | ----------- |
+| `navigate` | Load a URL in the connected tab and wait for the new page's load event — or for execution to pause first, in which case the call stack is returned |
+| `reload`   | Reload the connected tab and wait the same way as `navigate`. `ignoreCache` bypasses the HTTP cache, as Shift+F5 does |
+
+▲Both work while paused at a breakpoint: the pause ends with the old page, and breakpoints hit again in the new one — so "set a breakpoint, then `reload`" stops in the page's startup code and returns the call stack where it paused. 
+
+▲A failed navigation is reported as an error, not as `loaded` — Chrome still loads its own error page in that case and fires its load event — and a page whose load event does not fire within 30s comes back as `still-loading`.
 
 ### Console
 

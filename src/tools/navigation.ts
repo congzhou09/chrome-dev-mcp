@@ -139,7 +139,7 @@ export function registerNavigationTools(
     );
 
   server.registerTool(
-    'navigate',
+    'navigate_tab',
     {
       description:
         `Navigate the connected tab to a URL and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load ` +
@@ -175,7 +175,7 @@ export function registerNavigationTools(
   );
 
   server.registerTool(
-    'reload',
+    'reload_tab',
     {
       description:
         `Reload the connected tab and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load event — ` +

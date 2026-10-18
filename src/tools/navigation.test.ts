@@ -15,7 +15,7 @@ const call = async (client: any, name: string, args: Record<string, unknown> = {
   return result;
 };
 
-describe('navigate', () => {
+describe('navigate_tab', () => {
   it('waits for the load event and reports the page it landed on', async () => {
     let cdp: any;
     const navigate = vi.fn(async () => {
@@ -28,7 +28,7 @@ describe('navigate', () => {
     cdp = makeMockClient(pageRead('http://localhost/next', 'Next'), undefined, {}, {}, {}, { navigate });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'navigate', { url: 'http://localhost/next' });
+    const result = await call(client, 'navigate_tab', { url: 'http://localhost/next' });
 
     expect(navigate).toHaveBeenCalledWith({ url: 'http://localhost/next' });
     expect(result.structuredContent).toEqual({ outcome: 'loaded', url: 'http://localhost/next', title: 'Next' });
@@ -44,7 +44,7 @@ describe('navigate', () => {
     cdp = makeMockClient(undefined, undefined, {}, {}, {}, { navigate });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'navigate', { url: 'http://localhost:1/' });
+    const result = await call(client, 'navigate_tab', { url: 'http://localhost:1/' });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('net::ERR_CONNECTION_REFUSED');
@@ -55,7 +55,7 @@ describe('navigate', () => {
     const cdp = makeMockClient(pageRead('http://localhost/#h', 'Same'), undefined, {}, {}, {}, { navigate });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'navigate', { url: 'http://localhost/#h' });
+    const result = await call(client, 'navigate_tab', { url: 'http://localhost/#h' });
 
     expect(result.structuredContent).toEqual({ outcome: 'same-document', url: 'http://localhost/#h', title: 'Same' });
   });
@@ -68,7 +68,7 @@ describe('navigate', () => {
     const cdp = makeMockClient(undefined, undefined, {}, {}, {}, { navigate });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'navigate', { url: 'http://localhost/file.zip' });
+    const result = await call(client, 'navigate_tab', { url: 'http://localhost/file.zip' });
 
     expect(result.structuredContent).toEqual({ outcome: 'download' });
   });
@@ -78,14 +78,14 @@ describe('navigate', () => {
     const cdp = makeMockClient(undefined, undefined, {}, {}, {}, { navigate });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'navigate', { url: 'example.invalid' });
+    const result = await call(client, 'navigate_tab', { url: 'example.invalid' });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Cannot navigate to invalid URL');
   });
 });
 
-describe('reload', () => {
+describe('reload_tab', () => {
   it('returns the call stack when the new page pauses before it loads', async () => {
     let cdp: any;
     const paused = {
@@ -107,7 +107,7 @@ describe('reload', () => {
     cdp = makeMockClient(undefined, undefined, {}, {}, {}, { reload });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'reload', { ignoreCache: true });
+    const result = await call(client, 'reload_tab', { ignoreCache: true });
 
     expect(reload).toHaveBeenCalledWith({ ignoreCache: true });
     expect(result.structuredContent.outcome).toBe('paused');
@@ -127,7 +127,7 @@ describe('reload', () => {
     cdp = makeMockClient(pageRead('http://localhost/', 'Home'), undefined, {}, {}, {}, { reload });
     const client = await setupMcpClient(cdp);
 
-    const result = await call(client, 'reload');
+    const result = await call(client, 'reload_tab');
 
     expect(reload).toHaveBeenCalledWith({ ignoreCache: false });
     expect(result.structuredContent).toEqual({ outcome: 'loaded', url: 'http://localhost/', title: 'Home' });

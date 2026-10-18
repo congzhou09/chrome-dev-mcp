@@ -159,7 +159,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | Network | 2 | Requests captured from connect time onward, plus response bodies fetched on demand |
 | Capture buffers | 1 | `clear_captures` — cross-cutting: resets the console and network buffers above |
 
-☆All 26 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate`, `reload` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload`, then read again.
+☆All 26 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate_tab`, `reload_tab` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload_tab`, then read again.
 
 ☆Several pairs below look mergeable and are deliberately not — [docs/tool-boundaries.md](docs/tool-boundaries.md) records which, and why.
 
@@ -184,12 +184,12 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ### Navigation
 
-| Tool       | Description |
-| ---------- | ----------- |
-| `navigate` | Load a URL in the connected tab and wait for the new page's load event — or for execution to pause first, in which case the call stack is returned |
-| `reload`   | Reload the connected tab and wait the same way as `navigate`. `ignoreCache` bypasses the HTTP cache, as Shift+F5 does |
+| Tool           | Description |
+| -------------- | ----------- |
+| `navigate_tab` | Load a URL in the connected tab and wait for the new page's load event — or for execution to pause first, in which case the call stack is returned |
+| `reload_tab`   | Reload the connected tab and wait the same way as `navigate_tab`. `ignoreCache` bypasses the HTTP cache, as Shift+F5 does |
 
-▲Both work while paused at a breakpoint: the pause ends with the old page, and breakpoints hit again in the new one — so "set a breakpoint, then `reload`" stops in the page's startup code and returns the call stack where it paused. 
+▲Both work while paused at a breakpoint: the pause ends with the old page, and breakpoints hit again in the new one — so "set a breakpoint, then `reload_tab`" stops in the page's startup code and returns the call stack where it paused. 
 
 ▲A failed navigation is reported as an error, not as `loaded` — Chrome still loads its own error page in that case and fires its load event — and a page whose load event does not fire within 30s comes back as `still-loading`.
 

@@ -114,7 +114,7 @@ export function registerNavigationTools(server, getClient, session) {
     });
     const notCommitted = (what) => toolError(`Error: ${what} did not commit within ${NAVIGATION_TIMEOUT_MS}ms. The old page is still in place — its ` +
         'renderer may be blocked in a synchronous loop, which holds a navigation back until the loop ends.');
-    server.registerTool('navigate', {
+    server.registerTool('navigate_tab', {
         description: `Navigate the connected tab to a URL and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load ` +
             'event — or for execution to pause first, e.g. on a breakpoint the new page hits during startup, in which ' +
             'case the call stack is returned. `outcome` is "loaded", "paused", "still-loading" (the new page is in place ' +
@@ -143,7 +143,7 @@ export function registerNavigationTools(server, getClient, session) {
             return { sameDocument: !loaderId, errorText, isDownload };
         });
     });
-    server.registerTool('reload', {
+    server.registerTool('reload_tab', {
         description: `Reload the connected tab and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load event — ` +
             'or for execution to pause first, e.g. on a breakpoint hit during startup, in which case the call stack is ' +
             'returned. `outcome` is "loaded", "paused" or "still-loading" (the new page is in place but its load event ' +

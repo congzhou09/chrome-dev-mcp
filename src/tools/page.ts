@@ -796,7 +796,8 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
     'get_inspected_element',
     {
       description:
-        'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console.',
+        'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console. ' +
+        'Returns an error if no element is marked.',
       inputSchema: z.object({}),
       outputSchema: z.object({
         tagName: z.string(),

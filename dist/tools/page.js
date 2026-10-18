@@ -667,7 +667,8 @@ export function registerPageTools(server, getClient) {
     // already know which node the user means, and CDP offers no way to read which node DevTools
     // has selected. Hence the manual `window.$0 = $0` step, which runs where the binding lives.
     server.registerTool('get_inspected_element', {
-        description: 'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console.',
+        description: 'Get the element marked for MCP inspection. To mark an element: select it in the Elements panel, then run `window.$0 = $0` in the DevTools console. ' +
+            'Returns an error if no element is marked.',
         inputSchema: z.object({}),
         outputSchema: z.object({
             tagName: z.string(),

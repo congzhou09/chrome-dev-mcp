@@ -177,56 +177,49 @@ const captureScaleFactor = (metrics: LayoutMetrics | undefined, reported: unknow
 
 // ── Page inspection tools ─────────────────────────────────────────────────────
 //
-// Every tool here is a bare Runtime.evaluate / Page.captureScreenshot, so this group
-// needs nothing but getClient — no session state at all.
+// Every tool here is a bare CDP command — Runtime.evaluate, Page.captureScreenshot,
+// Page.getNavigationHistory — so this group needs nothing but getClient — no session state
+// at all.
 //
 // Every one of them is also bounded. A CDP command sent to a renderer that is paused,
-// looping, or sitting on a modal neither returns nor rejects (see timeout.ts), so "read the
-// title" is just as capable of hanging forever as evaluating an arbitrary expression is —
+// looping, or sitting on a modal neither returns nor rejects (see timeout.ts), so a small
+// read is just as capable of hanging forever as evaluating an arbitrary expression is —
 // the difference is only in how surprising it looks when it happens.
 
 export function registerPageTools(server: McpServer, getClient: () => Promise<CDP.Client | null>): void {
+  // Read from the browser's navigation history rather than evaluated in the page, so it
+  // answers when the renderer cannot. Measured, Chrome 155: with the page in a synchronous
+  // loop or showing an alert(), Runtime.evaluate timed out while Page.getNavigationHistory
+  // answered in ~1ms; at a breakpoint both answered. All of it held the same with the window
+// in the foreground and minimised (`visibilityState: "hidden"`) — unlike screenshot, nothing
+// here waits on a frame being painted. The current entry tracks the page
+  // without lag — a document.title assignment, history.replaceState and a hash change were
+  // all reflected by the very next call. Target.getTargetInfo answers just as well, but
+  // reports an empty title as the host ("localhost:5173") where the history entry keeps the
+  // "" that document.title holds.
   server.registerTool(
-    'get_title',
+    'get_page_info',
     {
-      description: 'Get the title of the currently connected tab (`document.title`).',
+      description:
+        'Get the URL and title of the currently connected tab, as `{ url, title }`. Still answers while the page is not responding.',
       inputSchema: z.object({}),
+      outputSchema: z.object({ url: z.string(), title: z.string() }),
       annotations: {
-        title: 'Get page title',
+        title: 'Get page info',
         readOnlyHint: true,
       },
     },
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      const result = await withTimeout(
-        client.Runtime.evaluate({ expression: 'document.title', returnByValue: true }),
-        PAGE_COMMAND_TIMEOUT_MS,
-      );
-      if (result === TIMED_OUT) return rendererTimedOut('get_title');
-      return { content: [{ type: 'text', text: String(result.result.value) }] };
-    },
-  );
-
-  server.registerTool(
-    'get_url',
-    {
-      description: 'Get the URL of the currently connected tab (`location.href`).',
-      inputSchema: z.object({}),
-      annotations: {
-        title: 'Get page URL',
-        readOnlyHint: true,
-      },
-    },
-    async () => {
-      const client = await getClient();
-      if (!client) return NOT_CONNECTED;
-      const result = await withTimeout(
-        client.Runtime.evaluate({ expression: 'location.href', returnByValue: true }),
-        PAGE_COMMAND_TIMEOUT_MS,
-      );
-      if (result === TIMED_OUT) return rendererTimedOut('get_url');
-      return { content: [{ type: 'text', text: String(result.result.value) }] };
+      const history = await withTimeout(client.Page.getNavigationHistory(), PAGE_COMMAND_TIMEOUT_MS);
+      // The renderer's state cannot cause this, so rendererTimedOut's causes would mislead.
+      if (history === TIMED_OUT) {
+        return toolError(`Error: get_page_info did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms.`);
+      }
+      const entry = history.entries[history.currentIndex];
+      const info = { url: entry?.url ?? '', title: entry?.title ?? '' };
+      return { content: [{ type: 'text', text: JSON.stringify(info, null, 2) }], structuredContent: info };
     },
   );
 

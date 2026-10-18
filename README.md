@@ -147,19 +147,19 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ## MCP Tools
 
-☆26 tools in seven groups — six domains plus one cross-cutting tool:
+☆25 tools in seven groups — six domains plus one cross-cutting tool:
 
 | Group | Tools | Covers |
 | --- | --- | --- |
 | Tab management | 2 | Discovering tabs, and choosing which one this server is attached to |
-| Page inspection | 7 | The live page: title, URL, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
+| Page inspection | 6 | The live page: URL and title, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
 | Navigation | 2 | Loading a URL or reloading, and waiting until the new page has loaded or paused |
 | Console | 1 | Console messages and uncaught exceptions, including output from before this server connected |
 | Debugger | 11 | Breakpoints, stepping, call stack, scopes, frame-scoped evaluation |
 | Network | 2 | Requests captured from connect time onward, plus response bodies fetched on demand |
 | Capture buffers | 1 | `clear_captures` — cross-cutting: resets the console and network buffers above |
 
-☆All 26 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate_tab`, `reload_tab` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload_tab`, then read again.
+☆All 25 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate_tab`, `reload_tab` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload_tab`, then read again.
 
 ☆Several pairs below look mergeable and are deliberately not — [docs/tool-boundaries.md](docs/tool-boundaries.md) records which, and why.
 
@@ -174,8 +174,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 | Tool                    | Description                                                                                                    |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `get_title`             | Current page title                                                                                             |
-| `get_url`               | Current page URL                                                                                               |
+| `get_page_info`         | Current page URL and title as `{ url, title }` — answers even while the page is not responding                 |
 | `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
 | `evaluate_js`           | Run arbitrary JavaScript in global scope, with DevTools console semantics: top-level `await` works, and an expression that merely returns a promise stays pending rather than being awaited for you. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value |
 | `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |

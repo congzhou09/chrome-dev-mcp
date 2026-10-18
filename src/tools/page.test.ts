@@ -61,32 +61,51 @@ const expectLongEdge = (clip: any, dpr: number, requested: number) => {
 
 const clipOf = (captureScreenshot: any, call = 0) => captureScreenshot.mock.calls[call][0].clip;
 
-describe('get_title', () => {
-  it('returns the page title as text content', async () => {
-    const evaluate = vi.fn().mockResolvedValue({ result: { value: 'My Page Title' } });
-    const client = await setupMcpClient(makeMockClient(evaluate));
+describe('get_page_info', () => {
+  const history = (currentIndex: number, entries: Array<{ url: string; title: string }>) =>
+    vi.fn().mockResolvedValue({ currentIndex, entries });
 
-    const result = await client.callTool({ name: 'get_title', arguments: {} });
+  it('returns the current history entry, not the latest one', async () => {
+    const getNavigationHistory = history(0, [
+      { url: 'http://localhost:3000/', title: 'My Page Title' },
+      { url: 'http://localhost:3000/forward', title: 'Forward' },
+    ]);
+    const client = await setupMcpClient(makeMockClient(undefined, undefined, {}, {}, {}, { getNavigationHistory }));
 
-    expect(result.content).toEqual([{ type: 'text', text: 'My Page Title' }]);
-    expect(evaluate).toHaveBeenCalledWith({ expression: 'document.title', returnByValue: true });
+    const result = await client.callTool({ name: 'get_page_info', arguments: {} });
+
+    expect(result.structuredContent).toEqual({ url: 'http://localhost:3000/', title: 'My Page Title' });
+    expect(JSON.parse((result.content as any)[0].text)).toEqual(result.structuredContent);
+  });
+
+  // The whole reason for reading history: a renderer stuck in a loop or on a dialog never
+  // answers Runtime.evaluate, and this tool must not depend on it.
+  it('answers without evaluating anything in the page', async () => {
+    const evaluate = vi.fn(neverAnswers);
+    const getNavigationHistory = history(0, [{ url: 'http://localhost:3000/', title: '' }]);
+    const client = await setupMcpClient(makeMockClient(evaluate, undefined, {}, {}, {}, { getNavigationHistory }));
+
+    const result = await client.callTool({ name: 'get_page_info', arguments: {} });
+
+    expect(result.structuredContent).toEqual({ url: 'http://localhost:3000/', title: '' });
+    expect(evaluate).not.toHaveBeenCalled();
   });
 
   it('returns not-connected message with isError when Chrome is unavailable', async () => {
     const client = await setupMcpClient(null);
-    const result = await client.callTool({ name: 'get_title', arguments: {} });
+    const result = await client.callTool({ name: 'get_page_info', arguments: {} });
     expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
     expect(result.isError).toBe(true);
   });
 
-  // Reading the title is the cheapest command in the server, and it hangs just as
-  // permanently as anything else when the renderer stops answering.
-  it('reports a renderer that never answers instead of hanging', async () => {
-    const client = await setupMcpClient(makeMockClient(vi.fn(neverAnswers)));
+  it('reports a command that never answers instead of hanging', async () => {
+    const client = await setupMcpClient(
+      makeMockClient(undefined, undefined, {}, {}, {}, { getNavigationHistory: vi.fn(neverAnswers) }),
+    );
 
     vi.useFakeTimers();
     try {
-      const pending = client.callTool({ name: 'get_title', arguments: {} });
+      const pending = client.callTool({ name: 'get_page_info', arguments: {} });
       await vi.advanceTimersByTimeAsync(PAGE_COMMAND_TIMEOUT_MS + 1);
       const result = await pending;
 
@@ -95,17 +114,6 @@ describe('get_title', () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe('get_url', () => {
-  it('returns the page url as text content', async () => {
-    const evaluate = vi.fn().mockResolvedValue({ result: { value: 'http://localhost:3000/' } });
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    const result = await client.callTool({ name: 'get_url', arguments: {} });
-
-    expect(result.content).toEqual([{ type: 'text', text: 'http://localhost:3000/' }]);
   });
 });
 

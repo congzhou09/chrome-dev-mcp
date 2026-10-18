@@ -5,7 +5,7 @@
 ## The count is not the metric
 
 ◆What a caller actually pays is the tool definitions carried in its context: name, description and inputSchema.
-◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**17,571 characters (~4.9k tokens) across 26 tools**, of which `get_network_requests` alone is 13% and the four stepping tools together 5%.<!-- /tool-cost -->
+◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**17,436 characters (~4.8k tokens) across 25 tools**, of which `get_network_requests` alone is 13% and the four stepping tools together 5%.<!-- /tool-cost -->
 ◆So merging tools to lower the count trades a real cost (a caller choosing the wrong tool) for a negligible one. It also does not remove the decision — it relocates it from a tool name into an enum value, and drops the per-tool description that helps a caller get it right.
 ◆Where the schemas are large, they are large on purpose: `get_network_requests` spends its budget documenting navigation pruning, URL truncation markers and redirect-hop semantics — things a caller silently misreads without them.
 
@@ -39,12 +39,14 @@
 ◆Their parameters do not overlap either: `navigate_tab` needs a `url`, `reload_tab` takes only `ignoreCache`. One schema would have to say, for each parameter, which mode it applies in.
 ◆What they do share — waiting for the load event or a pause, and telling the two apart from a renderer that never let the navigation commit — is one function in `src/tools/navigation.ts`, so the split costs no duplicated logic.
 
-## get_title / get_url vs list_tabs
+## get_page_info vs list_tabs
 
 **Deliberate overlap.**
 
-❤`list_tabs` already reports every tab's title and URL, so these two are redundant in the strict sense.
-❤They are kept because reading the current page's title or URL is frequent and their whole schemas are among the smallest in the set (~260 characters each), while `list_tabs` returns every tab and exists to choose between them.
+❤`list_tabs` already reports every tab's title and URL, so `get_page_info` is redundant in the strict sense.
+❤It is kept because reading the current page's URL and title is frequent and its whole schema is among the smallest in the set, while `list_tabs` returns every tab and exists to choose between them.
+❤Neither description points at the other: picking either one by mistake yields an answer that is visibly partial or merely longer, never a wrong one.
+❤URL and title were once two tools, `get_url` and `get_title`. They are one because nothing separates them — no parameter, no mode, and returning both costs nothing over returning one — so unlike the pairs above, merging hides no decision.
 
 ## evaluate_js vs get_inspected_element
 

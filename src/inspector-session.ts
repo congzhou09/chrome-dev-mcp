@@ -1,6 +1,6 @@
 import CDP from 'chrome-remote-interface';
 import { MAX_CONSOLE_LOGS } from './constants.js';
-import { createSourceMapResolver } from './sourcemap.js';
+import { createSourceMapResolver, withoutQuery, type ParsedScript, type SourceLookup } from './sourcemap.js';
 import type { ConsoleEntry, DebuggerState } from './types.js';
 
 export interface CallStackFrame {
@@ -11,7 +11,36 @@ export interface CallStackFrame {
   columnNumber: number;
   compiledUrl?: string;
   compiledLine?: number;
+  compiledColumn?: number;
   scopeTypes: string[];
+}
+
+/** A location in a loaded script, 1-based, with the source-mapped position beside it when there is one. */
+export interface DescribedLocation {
+  url: string;
+  lineNumber: number;
+  columnNumber: number;
+  source?: string;
+  sourceLine?: number;
+  sourceColumn?: number;
+}
+
+/** A breakpoint dropped because the file it was set in changed. */
+export interface DroppedBreakpoint {
+  breakpointId: string;
+  location: string;
+  reason: string;
+}
+
+/** One script a `source` breakpoint was placed in, and where — 0-based, as Chrome takes it. */
+export interface SourcePlacement {
+  chromeId: string;
+  scriptId: string;
+  url: string;
+  lineNumber: number;
+  columnNumber?: number;
+  /** 1-based line of the file the placement came from. */
+  sourceLine: number;
 }
 
 // One lazily-attached session covering BOTH the Debugger and Console domains.
@@ -29,11 +58,39 @@ export interface InspectorSession {
 
   /** breakpointId -> "url:line" */
   readonly breakpoints: ReadonlyMap<string, string>;
-  addBreakpoint(id: string, label: string): void;
+  /**
+   * `chromeIds` are the Chrome breakpoints behind `id` when one file is loaded in several scripts
+   * and needed one each; `id` is the first of them. Omitted, the id is its own only member.
+   */
+  addBreakpoint(id: string, label: string, chromeIds?: string[]): void;
+  /** What has to be removed from Chrome for `id`. */
+  chromeBreakpointIds(id: string): string[];
   removeBreakpoint(id: string): boolean;
+  /** The id set_breakpoint returned for a Chrome breakpoint id — another one only inside a group. */
+  breakpointIdFor(chromeId: string): string;
+
+  /**
+   * Watches a breakpoint set by `source`. Each later copy of a script it was placed in is checked:
+   * an unchanged file carries the breakpoint into the new copy; a changed one drops it.
+   */
+  watchSourceBreakpoint(
+    id: string,
+    spec: { key: string; display: string; column?: number; condition?: string; placements: SourcePlacement[] },
+  ): Promise<void>;
+  /** Resolves when every pending check of a newly loaded copy is done. Await it before reporting a pause. */
+  settleSourceChecks(): Promise<void>;
+  /** Breakpoints dropped since the last call — each one is reported once. */
+  takeDroppedBreakpoints(): DroppedBreakpoint[];
+  /** Says so when the current pause is on a breakpoint that has since been dropped. */
+  droppedHitNote(): string | undefined;
 
   /** Call stack with source-mapped positions where available. */
   formatCallStack(): Promise<CallStackFrame[]>;
+
+  /** A file the caller names → where that code sits in the scripts Chrome loaded. */
+  locateSource(path: string, line: number, column?: number): Promise<SourceLookup>;
+  /** A 0-based Chrome location, described in 1-based terms and source-mapped where possible. */
+  describeLocation(scriptId: string, line0: number, col0: number): Promise<DescribedLocation>;
 
   /** MUST be called BEFORE issuing the step command, or the event is missed. */
   waitForNextPause(client: CDP.Client, timeoutMs?: number): Promise<boolean>;
@@ -59,6 +116,38 @@ export function createInspectorSession(): InspectorSession {
 
   // breakpointId -> human-readable label ("url:line")
   const activeBreakpoints = new Map<string, string>();
+  // breakpointId -> every Chrome breakpoint behind it, and back, for the ids that set more than one.
+  const breakpointGroups = new Map<string, string[]>();
+  const groupOf = new Map<string, string>();
+
+  // Breakpoints set by `source`, followed from copy to copy of the scripts they sit in.
+  //
+  // Following is only ever safe while the file is unchanged. Once it changes, where the
+  // breakpoint "should" be has no answer this server can give: a line inserted above makes the
+  // same line number a different statement, and following the code instead is a guess Chrome's
+  // own breakpoint hints already make, and get wrong in a React module (measured, Vite 7, Chrome
+  // 155: the hint left it one statement early, then inside another function). Only the caller
+  // made the edit, so only the caller knows — the breakpoint is dropped, and told.
+  //
+  // `fingerprint` is the file's own text, from the map's sourcesContent. Not the script's hash:
+  // in Vite, editing util.ts rewrites App.tsx's import to "util.ts?t=…", so App.tsx's script
+  // changes while App.tsx does not. The hash is only the fallback for a map without
+  // sourcesContent, and for a script without a map, which is the file itself.
+  type Watched = {
+    id: string;
+    key: string;
+    display: string;
+    column?: number;
+    condition?: string;
+    placements: Array<SourcePlacement & { base: string; fingerprint: string }>;
+  };
+  const watched = new Map<string, Watched>();
+  // A dropped breakpoint's label, kept so a pause already on it can still be named.
+  const droppedLabels = new Map<string, string>();
+  let pendingDrops: DroppedBreakpoint[] = [];
+  // One check at a time, in arrival order: a hot update followed by a reload is two copies, and
+  // the second has to be judged against what the first left behind.
+  let sourceChecks: Promise<void> = Promise.resolve();
 
   const sourceMaps = createSourceMapResolver();
 
@@ -85,6 +174,106 @@ export function createInspectorSession(): InspectorSession {
   // and reset stale debugger state — this is the "reconnect cleanup" point.
   let registeredOnClient: CDP.Client | null = null;
 
+  const labelOf = (bp: Watched) => {
+    const first = bp.placements[0];
+    return `${bp.display}:${first.sourceLine} → ${first.url}:${first.lineNumber + 1}`;
+  };
+
+  const fingerprintOf = (scriptId: string, file: { content: string | null }) =>
+    file.content ?? `hash:${sourceMaps.scriptHash(scriptId) ?? ''}`;
+
+  const drop = async (client: CDP.Client, bp: Watched, reason: string) => {
+    const location = activeBreakpoints.get(bp.id) ?? labelOf(bp);
+    watched.delete(bp.id);
+    activeBreakpoints.delete(bp.id);
+    // groupOf keeps its entries: a pause that already landed on one of these still has to be named.
+    breakpointGroups.delete(bp.id);
+    droppedLabels.set(bp.id, location);
+    pendingDrops.push({ breakpointId: bp.id, location, reason });
+    for (const { chromeId } of bp.placements) {
+      await client.Debugger.removeBreakpoint({ breakpointId: chromeId }).catch(() => {});
+    }
+  };
+
+  // A new copy of a script that watched breakpoints were placed in: Vite's "App.tsx?t=…" after a
+  // hot update, or the same URL after a reload.
+  //
+  // This runs right as Chrome parses the copy, but the copy runs at the same time, so code it
+  // executes on the spot can reach a stale breakpoint before it is removed. That pause is not
+  // prevented — it is named: scriptParsed always arrives ahead of it, so by the time a tool
+  // reports the pause, the drop is known (see droppedHitNote).
+  const recheck = async (client: CDP.Client, script: ParsedScript, base: string, ids: string[]) => {
+    for (const id of ids) {
+      const bp = watched.get(id);
+      const placement = bp?.placements.find((p) => p.base === base);
+      if (!bp || !placement || registeredOnClient !== client) continue;
+
+      const file = await sourceMaps.fileIn(script.scriptId, bp.key);
+      if (!file) {
+        await drop(client, bp, `${bp.display} is no longer part of ${script.url}`);
+        continue;
+      }
+      if (fingerprintOf(script.scriptId, file) !== placement.fingerprint) {
+        await drop(client, bp, `${bp.display} changed since this breakpoint was set`);
+        continue;
+      }
+      const at = await sourceMaps.positionIn(script.scriptId, file.source, placement.sourceLine, bp.column);
+      if (!at) {
+        await drop(client, bp, `${bp.display} has no code at line ${placement.sourceLine} in ${script.url}`);
+        continue;
+      }
+      if (
+        script.url === placement.url &&
+        at.lineNumber === placement.lineNumber &&
+        at.columnNumber === placement.columnNumber
+      ) {
+        // Chrome's own URL breakpoint already bound to this copy, at the same spot.
+        placement.scriptId = script.scriptId;
+        continue;
+      }
+      // The same file, unchanged, at a new URL or laid out differently: follow it there.
+      try {
+        const placed = await client.Debugger.setBreakpointByUrl({
+          url: script.url,
+          lineNumber: at.lineNumber,
+          ...(at.columnNumber !== undefined && { columnNumber: at.columnNumber }),
+          ...(bp.condition && { condition: bp.condition }),
+        });
+        await client.Debugger.removeBreakpoint({ breakpointId: placement.chromeId }).catch(() => {});
+        Object.assign(placement, {
+          chromeId: placed.breakpointId,
+          scriptId: script.scriptId,
+          url: script.url,
+          lineNumber: at.lineNumber,
+          columnNumber: at.columnNumber,
+        });
+        groupOf.set(placed.breakpointId, id);
+        breakpointGroups.set(
+          id,
+          bp.placements.map((p) => p.chromeId),
+        );
+        activeBreakpoints.set(id, labelOf(bp));
+      } catch (e) {
+        await drop(
+          client,
+          bp,
+          `${bp.display} could not be placed in its new copy at ${script.url}: ${(e as Error).message}`,
+        );
+      }
+    }
+  };
+
+  const followSourceBreakpoints = (client: CDP.Client, script: ParsedScript) => {
+    const base = withoutQuery(script.url);
+    const ids = [...watched.values()]
+      .filter((bp) => bp.placements.some((p) => p.base === base && p.scriptId !== script.scriptId))
+      .map((bp) => bp.id);
+    if (!ids.length) return;
+    sourceChecks = sourceChecks
+      .then(() => recheck(client, script, base, ids))
+      .catch((e) => console.error('[chrome-dev-mcp] Following a source breakpoint failed:', (e as Error).message));
+  };
+
   const clearPauseRecord = () => {
     debuggerState.paused = false;
     debuggerState.callFrames = [];
@@ -104,6 +293,12 @@ export function createInspectorSession(): InspectorSession {
     // Network capture has its own reset in NetworkCapture.reset().
     clearPauseRecord();
     activeBreakpoints.clear();
+    breakpointGroups.clear();
+    groupOf.clear();
+    watched.clear();
+    droppedLabels.clear();
+    pendingDrops = [];
+    sourceChecks = Promise.resolve();
     sourceMaps.reset();
     consoleLogs.length = 0;
     loadGeneration = 0;
@@ -122,7 +317,7 @@ export function createInspectorSession(): InspectorSession {
             functionName: frame.functionName || '(anonymous)',
             url: orig?.source ?? frame.url ?? '',
             lineNumber: orig?.line ?? line0 + 1,
-            columnNumber: orig?.column ?? col,
+            columnNumber: (orig?.column ?? col) + 1,
           };
         }),
       );
@@ -193,9 +388,19 @@ export function createInspectorSession(): InspectorSession {
     });
 
     client.Debugger.on('scriptParsed', (event: any) => {
-      if (event.url) {
-        sourceMaps.registerScript(event.scriptId, event.url, event.sourceMapURL);
-      }
+      if (!event.url) return;
+      sourceMaps.registerScript(event);
+      followSourceBreakpoints(client, event);
+    });
+
+    // A destroyed context's scripts are gone, and keeping them would let set_breakpoint place a
+    // source position in a page that is no longer there. A navigation clears every context
+    // before the new document parses anything — measured, Chrome 155: executionContextsCleared,
+    // frameNavigated, executionContextCreated, then the first scriptParsed — so dropping
+    // everything here never takes a script of the new page with it.
+    client.Runtime.on('executionContextsCleared', () => sourceMaps.dropContext());
+    client.Runtime.on('executionContextDestroyed', (event: any) => {
+      if (event?.executionContextId != null) sourceMaps.dropContext(event.executionContextId);
     });
 
     client.Debugger.on('paused', (event: any) => {
@@ -233,12 +438,66 @@ export function createInspectorSession(): InspectorSession {
       return activeBreakpoints;
     },
 
-    addBreakpoint(id, label) {
+    addBreakpoint(id, label, chromeIds) {
       activeBreakpoints.set(id, label);
+      if (chromeIds && chromeIds.length > 1) {
+        breakpointGroups.set(id, chromeIds);
+        for (const chromeId of chromeIds) groupOf.set(chromeId, id);
+      }
     },
 
+    // A dropped breakpoint has nothing left in Chrome.
+    chromeBreakpointIds: (id) => (droppedLabels.has(id) ? [] : (breakpointGroups.get(id) ?? [id])),
+
     removeBreakpoint(id) {
+      for (const chromeId of breakpointGroups.get(id) ?? []) groupOf.delete(chromeId);
+      breakpointGroups.delete(id);
+      watched.delete(id);
+      droppedLabels.delete(id);
       return activeBreakpoints.delete(id);
+    },
+
+    breakpointIdFor: (chromeId) => groupOf.get(chromeId) ?? chromeId,
+
+    async watchSourceBreakpoint(id, { key, display, column, condition, placements }) {
+      const followed = await Promise.all(
+        placements.map(async (placement) => {
+          const file = await sourceMaps.fileIn(placement.scriptId, key);
+          return {
+            ...placement,
+            base: withoutQuery(placement.url),
+            fingerprint: file
+              ? fingerprintOf(placement.scriptId, file)
+              : `hash:${sourceMaps.scriptHash(placement.scriptId) ?? ''}`,
+          };
+        }),
+      );
+      watched.set(id, { id, key, display, column, condition, placements: followed });
+      breakpointGroups.set(
+        id,
+        followed.map((p) => p.chromeId),
+      );
+      for (const { chromeId } of followed) groupOf.set(chromeId, id);
+    },
+
+    settleSourceChecks: () => sourceChecks,
+
+    takeDroppedBreakpoints() {
+      const dropped = pendingDrops;
+      pendingDrops = [];
+      return dropped;
+    },
+
+    droppedHitNote() {
+      const hits = [
+        ...new Set(debuggerState.hitBreakpoints.map((chromeId) => groupOf.get(chromeId) ?? chromeId)),
+      ].filter((id) => droppedLabels.has(id));
+      if (!hits.length) return undefined;
+      const named = hits.map((id) => `${id} (${droppedLabels.get(id)})`).join(', ');
+      return (
+        `Stopped on ${named}, dropped because its file changed after it was set: this may not be the ` +
+        'statement it was set on. Set it again on the line you mean.'
+      );
     },
 
     formatCallStack: () =>
@@ -247,17 +506,33 @@ export function createInspectorSession(): InspectorSession {
           const line0 = frame.location.lineNumber;
           const col = frame.location.columnNumber ?? 0;
           const orig = await sourceMaps.resolve(frame.location.scriptId, line0, col);
+          // Looked up by scriptId, not read off the frame: CallFrame.url is deprecated, and
+          // Chrome 155 sends it empty (measured), which left every frame of a script without a
+          // source map with no url at all.
+          const scriptUrl = sourceMaps.scriptUrl(frame.location.scriptId) ?? frame.url;
           return {
             index,
             functionName: frame.functionName || '(anonymous)',
-            url: orig?.source ?? frame.url,
+            url: orig?.source ?? scriptUrl,
             lineNumber: orig?.line ?? line0 + 1,
-            columnNumber: orig?.column ?? col,
-            ...(orig && { compiledUrl: frame.url, compiledLine: line0 + 1 }),
+            columnNumber: (orig?.column ?? col) + 1,
+            ...(orig && { compiledUrl: scriptUrl, compiledLine: line0 + 1, compiledColumn: col + 1 }),
             scopeTypes: (frame.scopeChain ?? []).map((s: any) => s.type),
           };
         }),
       ),
+
+    locateSource: (path, line, column) => sourceMaps.locate(path, line, column),
+
+    async describeLocation(scriptId, line0, col0) {
+      const orig = await sourceMaps.resolve(scriptId, line0, col0);
+      return {
+        url: sourceMaps.scriptUrl(scriptId) ?? '',
+        lineNumber: line0 + 1,
+        columnNumber: col0 + 1,
+        ...(orig && { source: orig.source, sourceLine: orig.line, sourceColumn: orig.column + 1 }),
+      };
+    },
 
     // Resolves true when the next paused event arrives, false on timeout.
     // Call BEFORE issuing the step command to avoid missing the event.

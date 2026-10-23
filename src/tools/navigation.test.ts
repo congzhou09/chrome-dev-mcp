@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { makeMockClient, setupMcpClient, fireCdp } from '../test-helpers.js';
+import { makeMockClient, setupMcpClient, fireCdp, inlineSourceMap } from '../test-helpers.js';
 
 // The mock client is an EventEmitter, so the tool's own listeners hear `cdp.emit`. The
 // session's handlers are mock registrations instead, reached through fireCdp.
@@ -131,5 +131,52 @@ describe('reload_tab', () => {
 
     expect(reload).toHaveBeenCalledWith({ ignoreCache: false });
     expect(result.structuredContent).toEqual({ outcome: 'loaded', url: 'http://localhost/', title: 'Home' });
+  });
+  // The edit-then-reload loop: the edited file's old breakpoint can fire during startup before it
+  // is removed. The result has to say the stop may not be where it was set, and that it is gone.
+  it('reports a breakpoint the reload dropped because its file changed, and a stop on it', async () => {
+    let cdp: any;
+    const appUrl = 'http://localhost/src/app.ts';
+    const text = (tail = '') => Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join('\n') + tail;
+    const map = (content: string) => inlineSourceMap(['app.ts'], [[], [[0, 0, 5, 0]]], [content]);
+    const paused = {
+      reason: 'other',
+      hitBreakpoints: ['bp-1'],
+      callFrames: [{ functionName: 'init', location: { scriptId: 's2', lineNumber: 1, columnNumber: 0 } }],
+    };
+    const reload = vi.fn(async () => {
+      later(() => {
+        commit(cdp, 'http://localhost/');
+        fireCdp(cdp, 'Debugger', 'scriptParsed', {
+          scriptId: 's2',
+          url: appUrl,
+          sourceMapURL: map(text('\nline 11')),
+          hash: 'h2',
+        });
+        fireCdp(cdp, 'Debugger', 'paused', paused);
+        cdp.emit('Debugger.paused', paused);
+      });
+      return {};
+    });
+    const setBreakpointByUrl = vi
+      .fn()
+      .mockResolvedValue({ breakpointId: 'bp-1', locations: [{ scriptId: 's1', lineNumber: 1, columnNumber: 0 }] });
+    cdp = makeMockClient(undefined, undefined, { setBreakpointByUrl }, {}, {}, { reload });
+    const client = await setupMcpClient(cdp);
+    await call(client, 'get_debugger_state');
+    fireCdp(cdp, 'Debugger', 'scriptParsed', { scriptId: 's1', url: appUrl, sourceMapURL: map(text()), hash: 'h1' });
+    await call(client, 'set_breakpoint', { source: 'src/app.ts', lineNumber: 5 });
+
+    const result = await call(client, 'reload_tab');
+
+    expect(result.structuredContent.outcome).toBe('paused');
+    expect(result.structuredContent.note).toMatch(/^Stopped on bp-1 .*dropped because its file changed/);
+    expect(result.structuredContent.droppedBreakpoints).toEqual([
+      {
+        breakpointId: 'bp-1',
+        location: `${appUrl}:5 → ${appUrl}:2`,
+        reason: `${appUrl} changed since this breakpoint was set`,
+      },
+    ]);
   });
 });

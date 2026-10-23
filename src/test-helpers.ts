@@ -37,6 +37,7 @@ export function makeMockClient(
 
   return Object.assign(new EventEmitter(), {
     Runtime: {
+      on: vi.fn(),
       enable: vi.fn(),
       evaluate,
       getProperties: vi.fn(),
@@ -92,7 +93,7 @@ export async function setupMcpClient(
 // simulates a paused event. Handlers are synchronous, so this is not awaited.
 export function fireCdp(
   cdpClient: CDP.Client,
-  domain: 'Debugger' | 'Network' | 'Page',
+  domain: 'Debugger' | 'Network' | 'Page' | 'Runtime',
   event: string,
   payload: any,
 ): void {
@@ -143,4 +144,41 @@ export async function captureOne(
     timestamp: 100.25,
     encodedDataLength: 1234,
   });
+}
+
+// An inline source map, written out by hand so a test can say exactly which generated position
+// maps to which source line. `lines[i]` lists the segments of generated line i+1 as
+// [generatedColumn, sourceIndex, sourceLine (1-based), sourceColumn].
+export function inlineSourceMap(
+  sources: string[],
+  lines: Array<Array<[number, number, number, number]>>,
+  sourcesContent?: string[],
+): string {
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const vlq = (n: number) => {
+    let v = n < 0 ? (-n << 1) | 1 : n << 1;
+    let out = '';
+    do {
+      let digit = v & 31;
+      v >>>= 5;
+      if (v > 0) digit |= 32;
+      out += B64[digit];
+    } while (v > 0);
+    return out;
+  };
+  let [src, line, col] = [0, 0, 0];
+  const mappings = lines
+    .map((segments) => {
+      let gen = 0;
+      return segments
+        .map(([g, s, l, c]) => {
+          const out = vlq(g - gen) + vlq(s - src) + vlq(l - 1 - line) + vlq(c - col);
+          [gen, src, line, col] = [g, s, l - 1, c];
+          return out;
+        })
+        .join(',');
+    })
+    .join(';');
+  const map = { version: 3, sources, names: [], mappings, ...(sourcesContent && { sourcesContent }) };
+  return `data:application/json;base64,${Buffer.from(JSON.stringify(map)).toString('base64')}`;
 }

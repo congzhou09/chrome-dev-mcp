@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
+import { droppedBreakpointsSchema } from './debugger.js';
 
 // How a navigation command was answered, in the terms the load-or-pause wait needs. Page.reload
 // answers with nothing and always starts a new document, so it reports `{}`.
@@ -24,6 +25,8 @@ const outcomeSchema = z.object({
   title: z.string().optional(),
   reason: z.string().optional().describe('Pause reason. Present only when paused.'),
   callStack: z.array(z.unknown()).optional().describe('Same shape as get_debugger_state. Present only when paused.'),
+  note: z.string().optional(),
+  droppedBreakpoints: droppedBreakpointsSchema,
 });
 
 // ── Navigation tools ──────────────────────────────────────────────────────────
@@ -92,15 +95,15 @@ export function registerNavigationTools(
       // to an attachment or a non-renderable type answered `errorText: "net::ERR_ABORTED"`,
       // `isDownload: true` and a loaderId, with downloads allowed and denied alike; the old
       // page stayed and no load event followed.
-      if (response.isDownload) return result({ outcome: 'download' });
+      if (response.isDownload) return finish({ outcome: 'download' });
       // A navigation that fails outright still commits Chrome's own error page, which fires a
       // load event — waiting for it would report the failure as a successful "loaded".
       if (response.errorText) return toolError(`Error: ${what} failed: ${response.errorText}`);
-      if (response.sameDocument) return result({ outcome: 'same-document', ...(await readPage(client)) });
+      if (response.sameDocument) return finish({ outcome: 'same-document', ...(await readPage(client)) });
 
       const waited = await withTimeout(settled, Math.max(0, deadline - Date.now()));
       if (waited === 'paused') {
-        return result({
+        return finish({
           outcome: 'paused',
           reason: session.state.pauseReason,
           callStack: await session.formatCallStack(),
@@ -108,12 +111,22 @@ export function registerNavigationTools(
       }
       if (waited === TIMED_OUT) {
         if (committedUrl === undefined) return notCommitted(what);
-        return result({ outcome: 'still-loading', url: committedUrl });
+        return finish({ outcome: 'still-loading', url: committedUrl });
       }
-      return result({ outcome: 'loaded', ...(await readPage(client)) });
+      return finish({ outcome: 'loaded', ...(await readPage(client)) });
     } finally {
       dispose();
     }
+  };
+
+  // A reload is where an edited file's new copy arrives, so it is where the breakpoints that
+  // edit dropped are reported — and where a pause on one, reached during startup before it could
+  // be removed, is named for what it is.
+  const finish = async (data: z.infer<typeof outcomeSchema>) => {
+    await session.settleSourceChecks();
+    const note = data.outcome === 'paused' ? session.droppedHitNote() : undefined;
+    const dropped = session.takeDroppedBreakpoints();
+    return result({ ...data, ...(note && { note }), ...(dropped.length && { droppedBreakpoints: dropped }) });
   };
 
   // Best-effort: the navigation has already succeeded, so a page that does not answer here

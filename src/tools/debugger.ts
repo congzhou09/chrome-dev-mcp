@@ -219,12 +219,16 @@ export function registerDebuggerTools(
     {
       description:
         'Set a breakpoint at a 1-based line (and column) of a file. Name the file with `source` — a path like ' +
-        '"src/App.tsx", or a url get_debugger_state or get_console_logs reported — and the position is mapped through ' +
-        'source maps into the code Chrome runs; that code must already be loaded. ' +
-        '`url`/`urlRegex` instead take a position in the script exactly as Chrome loaded it, and may name one not ' +
-        'loaded yet: a source-mapped url given there lands on the wrong line, or never binds. ' +
+        '"src/App.tsx", or the `url` of a frame get_debugger_state or get_console_logs reported. Either way the ' +
+        'position is mapped through source maps into the code Chrome runs, so that code must already be loaded. ' +
+        '`url`/`urlRegex` instead take a position in the script exactly as Chrome loads it, so a source-mapped ' +
+        "position given to them lands on the wrong line or never binds; use a frame's " +
+        '`compiledUrl`/`compiledLine`/`compiledColumn`. The script need not be loaded yet: an empty ' +
+        '`resolvedLocations` means no loaded script matches yet, and the breakpoint binds when one loads — ' +
+        'or never, if the URL is wrong. ' +
         'A `source` breakpoint is removed once its file changes, so set it again after an edit; the next state or ' +
-        'navigation result lists it under `droppedBreakpoints`.',
+        'navigation result lists it under `droppedBreakpoints`. A `url`/`urlRegex` breakpoint is kept through edits, ' +
+        'so it may then stop on other code, or not at all.',
       inputSchema: z.object({
         source: z
           .string()
@@ -348,9 +352,9 @@ export function registerDebuggerTools(
 
       const label =
         lookup && first ? `${lookup.source}:${landed} → ${first.url}:${first.lineNumber}` : `${where}:${lineNumber}`;
-      session.addBreakpoint(chromeIds[0], label, chromeIds);
+      const breakpointId = session.addBreakpoint(label, chromeIds);
       if (lookup) {
-        await session.watchSourceBreakpoint(chromeIds[0], {
+        await session.watchSourceBreakpoint(breakpointId, {
           key: lookup.key,
           display: lookup.source,
           column: columnNumber,
@@ -365,7 +369,7 @@ export function registerDebuggerTools(
           })),
         });
       }
-      const data = { breakpointId: chromeIds[0], resolvedLocations, ...(note && { note }) };
+      const data = { breakpointId, resolvedLocations, ...(note && { note }) };
       return {
         content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
         structuredContent: data,

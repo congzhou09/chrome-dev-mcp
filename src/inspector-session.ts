@@ -32,12 +32,14 @@ export interface DroppedBreakpoint {
   reason: string;
 }
 
-/** One script a `source` breakpoint was placed in, and where — 0-based, as Chrome takes it. */
+/** One script a `source` breakpoint was placed in, and where. */
 export interface SourcePlacement {
   chromeId: string;
   scriptId: string;
   url: string;
+  /** 0-based line in the loaded script, as Chrome takes it. */
   lineNumber: number;
+  /** 0-based, as Chrome takes it. */
   columnNumber?: number;
   /** 1-based line of the file the placement came from. */
   sourceLine: number;
@@ -59,14 +61,19 @@ export interface InspectorSession {
   /** breakpointId -> "url:line" */
   readonly breakpoints: ReadonlyMap<string, string>;
   /**
-   * `chromeIds` are the Chrome breakpoints behind `id` when one file is loaded in several scripts
-   * and needed one each; `id` is the first of them. Omitted, the id is its own only member.
+   * Records a breakpoint and returns the id to give the caller: the first of `chromeIds`.
+   * `chromeIds` holds more than one when one file is loaded in several scripts and the breakpoint
+   * needed a Chrome breakpoint in each; a hit on any of them is reported as the returned id
+   * (see breakpointIdFor).
    */
-  addBreakpoint(id: string, label: string, chromeIds?: string[]): void;
-  /** What has to be removed from Chrome for `id`. */
+  addBreakpoint(label: string, chromeIds: string[]): string;
+  /**
+   * The ids of the Chrome breakpoints `id` stands for right now: those addBreakpoint recorded,
+   * replaced by new ones once followed into a new copy of their script, and none once dropped.
+   */
   chromeBreakpointIds(id: string): string[];
   removeBreakpoint(id: string): boolean;
-  /** The id set_breakpoint returned for a Chrome breakpoint id — another one only inside a group. */
+  /** The id set_breakpoint returned for a Chrome breakpoint id. */
   breakpointIdFor(chromeId: string): string;
 
   /**
@@ -89,7 +96,7 @@ export interface InspectorSession {
 
   /** A file the caller names → where that code sits in the scripts Chrome loaded. */
   locateSource(path: string, line: number, column?: number): Promise<SourceLookup>;
-  /** A 0-based Chrome location, described in 1-based terms and source-mapped where possible. */
+  /** A 0-based Chrome location → the same in 1-based terms, source-mapped where possible. */
   describeLocation(scriptId: string, line0: number, col0: number): Promise<DescribedLocation>;
 
   /** MUST be called BEFORE issuing the step command, or the event is missed. */
@@ -387,7 +394,7 @@ export function createInspectorSession(): InspectorSession {
       clearPauseRecord();
     });
 
-    client.Debugger.on('scriptParsed', (event: any) => {
+    client.Debugger.on('scriptParsed', (event: ParsedScript) => {
       if (!event.url) return;
       sourceMaps.registerScript(event);
       followSourceBreakpoints(client, event);
@@ -438,19 +445,23 @@ export function createInspectorSession(): InspectorSession {
       return activeBreakpoints;
     },
 
-    addBreakpoint(id, label, chromeIds) {
+    addBreakpoint(label, chromeIds) {
+      const id = chromeIds[0];
       activeBreakpoints.set(id, label);
-      if (chromeIds && chromeIds.length > 1) {
+      if (chromeIds.length > 1) {
         breakpointGroups.set(id, chromeIds);
         for (const chromeId of chromeIds) groupOf.set(chromeId, id);
       }
+      return id;
     },
 
     // A dropped breakpoint has nothing left in Chrome.
     chromeBreakpointIds: (id) => (droppedLabels.has(id) ? [] : (breakpointGroups.get(id) ?? [id])),
 
     removeBreakpoint(id) {
-      for (const chromeId of breakpointGroups.get(id) ?? []) groupOf.delete(chromeId);
+      // Every entry pointing at `id`, not just its current group: those of the copies it was
+      // followed out of, and all of them once it was dropped, are still here.
+      for (const [chromeId, owner] of groupOf) if (owner === id) groupOf.delete(chromeId);
       breakpointGroups.delete(id);
       watched.delete(id);
       droppedLabels.delete(id);

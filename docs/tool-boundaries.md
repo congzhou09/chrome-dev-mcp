@@ -5,7 +5,7 @@
 ## The count is not the metric
 
 ◆What a caller actually pays is the tool definitions carried in its context: name, description and inputSchema.
-◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**18,396 characters (~5.1k tokens) across 25 tools**, of which `get_network_requests` alone is 12% and the four stepping tools together 5%.<!-- /tool-cost -->
+◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**18,732 characters (~5.2k tokens) across 25 tools**, of which `get_network_requests` alone is 12% and the four stepping tools together 5%.<!-- /tool-cost -->
 ◆So merging tools to lower the count trades a real cost (a caller choosing the wrong tool) for a negligible one. It also does not remove the decision — it relocates it from a tool name into an enum value, and drops the per-tool description that helps a caller get it right.
 ◆Where the schemas are large, they are large on purpose: `get_network_requests` spends its budget documenting navigation pruning, URL truncation markers and redirect-hop semantics — things a caller silently misreads without them.
 
@@ -70,5 +70,5 @@
 □That makes the right direction depend on the relationship:
 
 - **Confusable alternatives** — `evaluate_js` / `evaluate_at_frame`. Either one can be the wrong landing point, and landing wrong yields a silently wrong answer, so the reference is **bidirectional**. A one-way reference here is worse than none: whoever arrives at the unmarked side believes they have seen the whole picture.
-- **Prerequisites** — `evaluate_at_frame` → `get_debugger_state` (frame indices), `switch_tab` → `list_tabs` (targetId), `get_network_response_body` → `get_network_requests` (requestId), `remove_breakpoint` → `set_breakpoint` (breakpointId). **One-way, pointing at the input source.** The dependent tool cannot be called without the id; the producer loses nothing, because a caller who stops after it has merely stopped — there is no wrong answer to prevent. Reciprocating these would turn hub tools into directories: `get_debugger_state` is named by three tools, `set_breakpoint` and `get_network_requests` by two each.
+- **Prerequisites** — `evaluate_at_frame` → `get_debugger_state` (frame indices), `switch_tab` → `list_tabs` (targetId), `get_network_response_body` → `get_network_requests` (requestId), `remove_breakpoint` → `set_breakpoint` (breakpointId). **One-way, pointing at the input source.** The dependent tool cannot be called without the id; the producer loses nothing, because a caller who stops after it has merely stopped — there is no wrong answer to prevent. Reciprocating these would turn hub tools into directories: `get_debugger_state` is named by four tools, `set_breakpoint` and `get_network_requests` by two each.
 - **Contrast warnings** — `get_network_requests` → `get_console_logs`, noting that network capture does not replay pre-connect history while console capture does. **One-way, placed where the surprise is.** A caller reading `get_console_logs` is not about to be surprised, so the note does not belong there.

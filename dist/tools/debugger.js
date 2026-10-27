@@ -2,6 +2,28 @@ import { z } from 'zod';
 import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut } from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
+const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
+// Shared with the navigation tools, which report the same drops after a reload.
+export const droppedBreakpointsSchema = z
+    .array(z.object({ breakpointId: z.string(), location: z.string(), reason: z.string() }))
+    .optional()
+    .describe('Breakpoints set by `source` whose file has changed since: removed, and reported here once.');
+// Why a named file could not be placed, worded for what the caller can do next.
+const sourceNotPlaced = (source, line, lookup) => {
+    const list = (names) => names.slice(0, 10).join(', ') + (names.length > 10 ? `, … (${names.length} in all)` : '');
+    if (lookup.reason === 'ambiguous') {
+        return `Error: "${source}" matches ${lookup.candidates.length} loaded files: ${list(lookup.candidates)}. Pass more of the path.`;
+    }
+    if (lookup.reason === 'no-code') {
+        return `Error: ${lookup.candidates[0]} has no code at or after line ${line}.`;
+    }
+    if (lookup.candidates.length) {
+        return (`Error: no loaded file matches "${source}" by directory and name. Loaded files with that name: ` +
+            `${list(lookup.candidates)} — pass the path of the one you mean.`);
+    }
+    return (`Error: no loaded script has "${source}" — its code has not loaded yet (a route or chunk loaded on ` +
+        'demand), or it is not part of this page. Load it, then set the breakpoint.');
+};
 // ── Debugger tools ────────────────────────────────────────────────────────────
 export function registerDebuggerTools(server, getClient, session) {
     server.registerTool('get_debugger_state', {
@@ -23,10 +45,13 @@ export function registerDebuggerTools(server, getClient, session) {
                 columnNumber: z.number(),
                 compiledUrl: z.string().optional(),
                 compiledLine: z.number().optional(),
+                compiledColumn: z.number().optional(),
                 scopeTypes: z.array(z.string()),
             }))
                 .optional()
                 .describe('Source-mapped positions when available. Present only when paused.'),
+            note: z.string().optional(),
+            droppedBreakpoints: droppedBreakpointsSchema,
         }),
         annotations: {
             title: 'Get debugger state',
@@ -37,18 +62,29 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         await session.attach(client);
+        // A hot update applies without any navigation, so this is where a breakpoint it dropped
+        // is most likely to be noticed — typically while checking why a pause never came.
+        await session.settleSourceChecks();
+        const dropped = session.takeDroppedBreakpoints();
+        const droppedPart = dropped.length ? { droppedBreakpoints: dropped } : {};
         if (!session.state.paused) {
+            const state = { paused: false, ...droppedPart };
             return {
-                content: [{ type: 'text', text: JSON.stringify({ paused: false }, null, 2) }],
-                structuredContent: { paused: false },
+                content: [{ type: 'text', text: JSON.stringify(state, null, 2) }],
+                structuredContent: state,
             };
         }
         const callStack = await session.formatCallStack();
+        const note = session.droppedHitNote();
         const state = {
             paused: true,
             reason: session.state.pauseReason,
-            hitBreakpoints: session.state.hitBreakpoints,
+            // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
+            // returned, a single id even for a file it placed in several scripts.
+            hitBreakpoints: [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))],
             callStack,
+            ...(note && { note }),
+            ...droppedPart,
         };
         return {
             content: [{ type: 'text', text: JSON.stringify(state, null, 2) }],
@@ -138,55 +174,140 @@ export function registerDebuggerTools(server, getClient, session) {
         };
     });
     server.registerTool('set_breakpoint', {
-        description: 'Set a breakpoint by URL (exact or regex) + line number.',
+        description: 'Set a breakpoint at a 1-based line (and column) of a file. Name the file with `source` — a path like ' +
+            '"src/App.tsx", or the `url` of a frame get_debugger_state or get_console_logs reported. Either way the ' +
+            'position is mapped through source maps into the code Chrome runs, so that code must already be loaded. ' +
+            '`url`/`urlRegex` instead take a position in the script exactly as Chrome loads it, so a source-mapped ' +
+            "position given to them lands on the wrong line or never binds; use a frame's " +
+            '`compiledUrl`/`compiledLine`/`compiledColumn`. The script need not be loaded yet: an empty ' +
+            '`resolvedLocations` means no loaded script matches yet, and the breakpoint binds when one loads — ' +
+            'or never, if the URL is wrong. ' +
+            'A `source` breakpoint is removed once its file changes, so set it again after an edit; the next state or ' +
+            'navigation result lists it under `droppedBreakpoints`. A `url`/`urlRegex` breakpoint is kept through edits, ' +
+            'so it may then stop on other code, or not at all.',
         inputSchema: z.object({
+            source: z
+                .string()
+                .optional()
+                .describe('File to break in, as in your project: a path like "src/App.tsx" — more of it when the name alone ' +
+                'matches several loaded files — an absolute path, or a source-mapped url. lineNumber and columnNumber ' +
+                'are positions in this file.'),
             url: z
                 .string()
                 .optional()
-                .describe('Exact script URL. Provide this or urlRegex; if both, urlRegex takes precedence.'),
-            lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
-            columnNumber: z.number().int().min(1).optional().describe('Column number, 1-indexed (optional)'),
-            condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
+                .describe('Exact URL of the script as Chrome loaded it. Provide this, urlRegex or source; if both url and urlRegex, urlRegex takes precedence.'),
             urlRegex: z
                 .string()
                 .optional()
-                .describe('URL regex pattern. Provide this or url; if both, urlRegex takes precedence.'),
+                .describe('Regex on the URL of the script as Chrome loaded it. Provide this, url or source; if both url and urlRegex, urlRegex takes precedence.'),
+            lineNumber: z.number().int().min(1).describe('Line number (1-indexed)'),
+            columnNumber: z.number().int().min(1).optional().describe('Column number, 1-indexed (optional)'),
+            condition: z.string().optional().describe('JS expression; breakpoint triggers only when truthy'),
         }),
         outputSchema: z.object({
             breakpointId: z.string(),
             resolvedLocations: z
                 .array(z.object({
-                scriptId: z.string(),
+                url: z.string(),
                 lineNumber: z.number(),
-                columnNumber: z.number().optional(),
+                columnNumber: z.number(),
+                source: z.string().optional(),
+                sourceLine: z.number().optional(),
+                sourceColumn: z.number().optional(),
             }))
-                .describe('May be empty if the script is not loaded yet; the breakpoint will bind automatically when Chrome parses the script'),
+                .describe('Where Chrome bound it in each loaded script, 1-based; source* give the source-mapped position. ' +
+                'May be empty for url/urlRegex if the script is not loaded yet; the breakpoint will bind automatically when Chrome parses the script'),
+            note: z.string().optional(),
         }),
         annotations: {
             title: 'Set breakpoint',
             idempotentHint: true,
         },
-    }, async ({ url, lineNumber, columnNumber, condition, urlRegex }) => {
+    }, async ({ url, lineNumber, columnNumber, condition, urlRegex, source }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        if (!url && !urlRegex) {
-            return {
-                content: [{ type: 'text', text: 'Must provide either url or urlRegex.' }],
-                isError: true,
-            };
+        if (source && (url || urlRegex)) {
+            return toolError('Give source, or url/urlRegex — not both: they number lines in different files.');
+        }
+        if (!source && !url && !urlRegex) {
+            return toolError('Must provide source, url or urlRegex.');
         }
         await session.attach(client);
-        const params = {
-            lineNumber: lineNumber - 1,
-            ...(columnNumber !== undefined && { columnNumber: columnNumber - 1 }),
-            ...(condition && { condition }),
-            ...(urlRegex ? { urlRegex } : { url }),
-        };
-        const result = await client.Debugger.setBreakpointByUrl(params);
-        const label = `${urlRegex ?? url}:${lineNumber}`;
-        session.addBreakpoint(result.breakpointId, label);
-        const data = { breakpointId: result.breakpointId, resolvedLocations: result.locations };
+        let placements;
+        let lookup;
+        if (source) {
+            const located = await session.locateSource(source, lineNumber, columnNumber);
+            if (!located.found)
+                return toolError(sourceNotPlaced(source, lineNumber, located));
+            lookup = located;
+            // The exact URL of the copy that was mapped, not a pattern that also takes later copies.
+            // A later copy is later code: Vite re-imports a hot-updated module as "App.tsx?t=…", and
+            // a pattern binding there lands on these line and column numbers in code they no longer
+            // describe. Chrome's breakpoint hints are meant to carry a breakpoint to where its code
+            // moved, but in a React module they did not — measured, Vite 7, Chrome 155: one line
+            // inserted above, and the pattern stopped one statement early; a second edit, inside
+            // another function. Not binding at all is the lesser failure.
+            placements = located.locations.map(({ url, lineNumber, columnNumber }) => ({ url, lineNumber, columnNumber }));
+        }
+        else {
+            placements = [
+                {
+                    ...(urlRegex ? { urlRegex } : { url }),
+                    lineNumber: lineNumber - 1,
+                    ...(columnNumber !== undefined && { columnNumber: columnNumber - 1 }),
+                },
+            ];
+        }
+        // One file can be loaded in several scripts — a module bundled into two chunks — and each
+        // needs a breakpoint of its own. They are set as one, and undone as one if any is refused.
+        const chromeIds = [];
+        const bound = [];
+        try {
+            for (const { columnNumber, ...placement } of placements) {
+                const result = await client.Debugger.setBreakpointByUrl({
+                    ...placement,
+                    ...(columnNumber !== undefined && { columnNumber }),
+                    ...(condition && { condition }),
+                });
+                chromeIds.push(result.breakpointId);
+                bound.push(...result.locations);
+            }
+        }
+        catch (e) {
+            for (const breakpointId of chromeIds)
+                await client.Debugger.removeBreakpoint({ breakpointId }).catch(() => { });
+            throw e;
+        }
+        const resolvedLocations = await Promise.all(bound.map((l) => session.describeLocation(l.scriptId, l.lineNumber, l.columnNumber ?? 0)));
+        // Chrome moves a breakpoint to the next spot that can take one, and the named line may have
+        // had no code at all. Either way the line asked for is not the line it will stop on, which
+        // is worth saying outright rather than leaving to a comparison of numbers.
+        const first = resolvedLocations[0];
+        const landed = first && (lookup ? (first.sourceLine ?? first.lineNumber) : first.lineNumber);
+        const where = lookup ? lookup.source : (urlRegex ?? url);
+        const note = landed !== undefined && landed !== lineNumber
+            ? `Line ${lineNumber} has no code that can take a breakpoint; it is on line ${landed} of ${where}, the next one that does.`
+            : undefined;
+        const label = lookup && first ? `${lookup.source}:${landed} → ${first.url}:${first.lineNumber}` : `${where}:${lineNumber}`;
+        const breakpointId = session.addBreakpoint(label, chromeIds);
+        if (lookup) {
+            await session.watchSourceBreakpoint(breakpointId, {
+                key: lookup.key,
+                display: lookup.source,
+                column: columnNumber,
+                condition,
+                placements: lookup.locations.map(({ scriptId, url, lineNumber, columnNumber, sourceLine }, i) => ({
+                    chromeId: chromeIds[i],
+                    scriptId,
+                    url,
+                    lineNumber,
+                    columnNumber,
+                    sourceLine,
+                })),
+            });
+        }
+        const data = { breakpointId, resolvedLocations, ...(note && { note }) };
         return {
             content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
             structuredContent: data,
@@ -205,11 +326,18 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         await session.attach(client);
+        let known = false;
         try {
-            await client.Debugger.removeBreakpoint({ breakpointId });
+            for (const chromeId of session.chromeBreakpointIds(breakpointId)) {
+                await client.Debugger.removeBreakpoint({ breakpointId: chromeId });
+            }
         }
         finally {
-            session.removeBreakpoint(breakpointId);
+            known = session.removeBreakpoint(breakpointId);
+        }
+        if (!known) {
+            return toolError(`No breakpoint ${breakpointId}: it was removed already, or set before a tab switch or reconnect, ` +
+                'which clears every breakpoint.');
         }
         return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     });

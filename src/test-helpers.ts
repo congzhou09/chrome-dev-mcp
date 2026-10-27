@@ -18,7 +18,7 @@ export function makeMockClient(
   const debugger_ = {
     on: vi.fn(),
     enable: vi.fn().mockResolvedValue({}),
-    setBreakpointByUrl: vi.fn().mockResolvedValue({ breakpointId: 'bp-1', locations: [] }),
+    setBreakpointByUrl: vi.fn().mockResolvedValue({ breakpointId: 'br:1:0:0:http://localhost/app.js', locations: [] }),
     removeBreakpoint: vi.fn().mockResolvedValue({}),
     pause: vi.fn().mockResolvedValue({}),
     resume: vi.fn().mockResolvedValue({}),

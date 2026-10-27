@@ -104,8 +104,8 @@ export function registerDebuggerTools(
       const state = {
         paused: true,
         reason: session.state.pauseReason,
-        // Chrome names the breakpoint it hit; a set_breakpoint that placed one file in several
-        // scripts returned one id for all of them, so that is the id reported.
+        // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
+        // returned, a single id even for a file it placed in several scripts.
         hitBreakpoints: [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))],
         callStack,
         ...(note && { note }),
@@ -393,12 +393,19 @@ export function registerDebuggerTools(
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       await session.attach(client);
+      let known = false;
       try {
         for (const chromeId of session.chromeBreakpointIds(breakpointId)) {
           await client.Debugger.removeBreakpoint({ breakpointId: chromeId });
         }
       } finally {
-        session.removeBreakpoint(breakpointId);
+        known = session.removeBreakpoint(breakpointId);
+      }
+      if (!known) {
+        return toolError(
+          `No breakpoint ${breakpointId}: it was removed already, or set before a tab switch or reconnect, ` +
+            'which clears every breakpoint.',
+        );
       }
       return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     },

@@ -1,3 +1,4 @@
+import { randomBytes } from 'crypto';
 import CDP from 'chrome-remote-interface';
 import { MAX_CONSOLE_LOGS } from './constants.js';
 import { createSourceMapResolver, withoutQuery, type ParsedScript, type SourceLookup } from './sourcemap.js';
@@ -61,7 +62,7 @@ export interface InspectorSession {
   /** breakpointId -> "url:line" */
   readonly breakpoints: ReadonlyMap<string, string>;
   /**
-   * Records a breakpoint and returns the id to give the caller: the first of `chromeIds`.
+   * Records a breakpoint and returns a new id for it, never one of `chromeIds`.
    * `chromeIds` holds more than one when one file is loaded in several scripts and the breakpoint
    * needed a Chrome breakpoint in each; a hit on any of them is reported as the returned id
    * (see breakpointIdFor).
@@ -72,6 +73,7 @@ export interface InspectorSession {
    * replaced by new ones once followed into a new copy of their script, and none once dropped.
    */
   chromeBreakpointIds(id: string): string[];
+  /** Forgets a breakpoint, a dropped one included. False if `id` is not one this session has. */
   removeBreakpoint(id: string): boolean;
   /** The id set_breakpoint returned for a Chrome breakpoint id. */
   breakpointIdFor(chromeId: string): string;
@@ -123,9 +125,20 @@ export function createInspectorSession(): InspectorSession {
 
   // breakpointId -> human-readable label ("url:line")
   const activeBreakpoints = new Map<string, string>();
-  // breakpointId -> every Chrome breakpoint behind it, and back, for the ids that set more than one.
+  // breakpointId -> every Chrome breakpoint behind it, and back.
   const breakpointGroups = new Map<string, string[]>();
   const groupOf = new Map<string, string>();
+
+  // The ids callers get are this session's own, never Chrome's. Chrome names a breakpoint by its
+  // place — url, lineNumber 2 and columnNumber 0 are "br:1:2:0:<url>" every time (measured, Chrome
+  // 156) — so one set where an earlier one was gets that one's id back, while the earlier one may
+  // still answer to it: a dropped one is still reported and named under its id, and a followed one
+  // keeps its id while its Chrome breakpoint moves to a new copy.
+  //
+  // Never reset, attach() included: an id a caller still holds from before a tab switch must not
+  // name a breakpoint set after it. The tag does the same across restarts of this server.
+  const idTag = randomBytes(2).toString('hex');
+  let idCount = 0;
 
   // Breakpoints set by `source`, followed from copy to copy of the scripts they sit in.
   //
@@ -446,17 +459,15 @@ export function createInspectorSession(): InspectorSession {
     },
 
     addBreakpoint(label, chromeIds) {
-      const id = chromeIds[0];
+      const id = `${idTag}-${++idCount}`;
       activeBreakpoints.set(id, label);
-      if (chromeIds.length > 1) {
-        breakpointGroups.set(id, chromeIds);
-        for (const chromeId of chromeIds) groupOf.set(chromeId, id);
-      }
+      breakpointGroups.set(id, chromeIds);
+      // Replaces whatever an earlier breakpoint at the same place left here.
+      for (const chromeId of chromeIds) groupOf.set(chromeId, id);
       return id;
     },
 
-    // A dropped breakpoint has nothing left in Chrome.
-    chromeBreakpointIds: (id) => (droppedLabels.has(id) ? [] : (breakpointGroups.get(id) ?? [id])),
+    chromeBreakpointIds: (id) => breakpointGroups.get(id) ?? [],
 
     removeBreakpoint(id) {
       // Every entry pointing at `id`, not just its current group: those of the copies it was
@@ -464,8 +475,8 @@ export function createInspectorSession(): InspectorSession {
       for (const [chromeId, owner] of groupOf) if (owner === id) groupOf.delete(chromeId);
       breakpointGroups.delete(id);
       watched.delete(id);
-      droppedLabels.delete(id);
-      return activeBreakpoints.delete(id);
+      const wasDropped = droppedLabels.delete(id);
+      return activeBreakpoints.delete(id) || wasDropped;
     },
 
     breakpointIdFor: (chromeId) => groupOf.get(chromeId) ?? chromeId,
@@ -484,11 +495,6 @@ export function createInspectorSession(): InspectorSession {
         }),
       );
       watched.set(id, { id, key, display, column, condition, placements: followed });
-      breakpointGroups.set(
-        id,
-        followed.map((p) => p.chromeId),
-      );
-      for (const { chromeId } of followed) groupOf.set(chromeId, id);
     },
 
     settleSourceChecks: () => sourceChecks,

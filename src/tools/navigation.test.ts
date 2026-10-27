@@ -139,9 +139,10 @@ describe('reload_tab', () => {
     const appUrl = 'http://localhost/src/app.ts';
     const text = (tail = '') => Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join('\n') + tail;
     const map = (content: string) => inlineSourceMap(['app.ts'], [[], [[0, 0, 5, 0]]], [content]);
+    const chromeId = `br:1:1:0:${appUrl}`;
     const paused = {
       reason: 'other',
-      hitBreakpoints: ['bp-1'],
+      hitBreakpoints: [chromeId],
       callFrames: [{ functionName: 'init', location: { scriptId: 's2', lineNumber: 1, columnNumber: 0 } }],
     };
     const reload = vi.fn(async () => {
@@ -160,20 +161,21 @@ describe('reload_tab', () => {
     });
     const setBreakpointByUrl = vi
       .fn()
-      .mockResolvedValue({ breakpointId: 'bp-1', locations: [{ scriptId: 's1', lineNumber: 1, columnNumber: 0 }] });
+      .mockResolvedValue({ breakpointId: chromeId, locations: [{ scriptId: 's1', lineNumber: 1, columnNumber: 0 }] });
     cdp = makeMockClient(undefined, undefined, { setBreakpointByUrl }, {}, {}, { reload });
     const client = await setupMcpClient(cdp);
     await call(client, 'get_debugger_state');
     fireCdp(cdp, 'Debugger', 'scriptParsed', { scriptId: 's1', url: appUrl, sourceMapURL: map(text()), hash: 'h1' });
-    await call(client, 'set_breakpoint', { source: 'src/app.ts', lineNumber: 5 });
+    const set = await call(client, 'set_breakpoint', { source: 'src/app.ts', lineNumber: 5 });
+    const id = set.structuredContent.breakpointId;
 
     const result = await call(client, 'reload_tab');
 
     expect(result.structuredContent.outcome).toBe('paused');
-    expect(result.structuredContent.note).toMatch(/^Stopped on bp-1 .*dropped because its file changed/);
+    expect(result.structuredContent.note).toMatch(new RegExp(`^Stopped on ${id} .*dropped because its file changed`));
     expect(result.structuredContent.droppedBreakpoints).toEqual([
       {
-        breakpointId: 'bp-1',
+        breakpointId: id,
         location: `${appUrl}:5 → ${appUrl}:2`,
         reason: `${appUrl} changed since this breakpoint was set`,
       },

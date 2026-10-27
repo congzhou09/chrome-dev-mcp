@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import CDP from 'chrome-remote-interface';
-import { makeMockClient, setupMcpClient, fireCdp, inlineSourceMap } from '../test-helpers.js';
+import { makeMockClient, setupMcpClient, setupServer, fireCdp, inlineSourceMap } from '../test-helpers.js';
 
 describe('get_debugger_state', () => {
   it('returns not-paused state when not paused', async () => {
@@ -138,8 +138,10 @@ describe('evaluate_at_frame', () => {
 });
 
 describe('set_breakpoint', () => {
-  it('calls setBreakpointByUrl and returns the breakpointId', async () => {
-    const setBreakpointByUrl = vi.fn().mockResolvedValue({ breakpointId: 'bp-42', locations: [] });
+  const chromeId = 'br:1:9:0:http://localhost:3000/app.js';
+
+  it("calls setBreakpointByUrl and returns an id of its own, not Chrome's", async () => {
+    const setBreakpointByUrl = vi.fn().mockResolvedValue({ breakpointId: chromeId, locations: [] });
     const cdpClient = makeMockClient(undefined, undefined, { setBreakpointByUrl });
     const mcpClient = await setupMcpClient(cdpClient);
 
@@ -153,14 +155,15 @@ describe('set_breakpoint', () => {
       lineNumber: 9,
     });
     const parsed = JSON.parse((result.content as any)[0].text);
-    expect(parsed.breakpointId).toBe('bp-42');
+    expect(parsed.breakpointId).toEqual(expect.any(String));
+    expect(parsed.breakpointId).not.toBe(chromeId);
   });
 
   // Chrome answers in 0-based positions and scriptIds; the caller asked in 1-based ones and has
   // no tool that takes a scriptId.
   it('reports where it bound in the 1-based terms it was asked in, with the script URL', async () => {
     const setBreakpointByUrl = vi.fn().mockResolvedValue({
-      breakpointId: 'bp-42',
+      breakpointId: chromeId,
       locations: [{ scriptId: 's1', lineNumber: 11, columnNumber: 4 }],
     });
     const cdpClient = makeMockClient(undefined, undefined, { setBreakpointByUrl });
@@ -174,7 +177,7 @@ describe('set_breakpoint', () => {
     });
 
     expect(result.structuredContent).toEqual({
-      breakpointId: 'bp-42',
+      breakpointId: expect.any(String),
       resolvedLocations: [{ url: 'http://localhost:3000/app.js', lineNumber: 12, columnNumber: 5 }],
       note: 'Line 10 has no code that can take a breakpoint; it is on line 12 of http://localhost:3000/app.js, the next one that does.',
     });
@@ -202,7 +205,7 @@ describe('set_breakpoint by source', () => {
 
   it('places the source line where it was compiled to, and reports both positions', async () => {
     const setBreakpointByUrl = vi.fn().mockResolvedValue({
-      breakpointId: 'bp-7',
+      breakpointId: `br:1:9:4:${appUrl}`,
       locations: [{ scriptId: 's1', lineNumber: 9, columnNumber: 4 }],
     });
     const { cdpClient, mcpClient } = await setUp(setBreakpointByUrl);
@@ -224,21 +227,22 @@ describe('set_breakpoint by source', () => {
       columnNumber: 4,
       condition: 'n > 2',
     });
+    const { breakpointId } = result.structuredContent as any;
     expect(result.structuredContent).toEqual({
-      breakpointId: 'bp-7',
+      breakpointId,
       resolvedLocations: [
         { url: appUrl, lineNumber: 10, columnNumber: 5, source: appUrl, sourceLine: 14, sourceColumn: 5 },
       ],
     });
     const listed = await mcpClient.callTool({ name: 'list_breakpoints', arguments: {} });
     expect((listed.structuredContent as any).breakpoints).toEqual([
-      { breakpointId: 'bp-7', location: `${appUrl}:14 → ${appUrl}:10` },
+      { breakpointId, location: `${appUrl}:14 → ${appUrl}:10` },
     ]);
   });
 
   it('says so when the line has no code and the breakpoint went to the next line that does', async () => {
     const setBreakpointByUrl = vi.fn().mockResolvedValue({
-      breakpointId: 'bp-7',
+      breakpointId: `br:1:4:0:${appUrl}`,
       locations: [{ scriptId: 's1', lineNumber: 4, columnNumber: 0 }],
     });
     const { cdpClient, mcpClient } = await setUp(setBreakpointByUrl);
@@ -290,10 +294,11 @@ describe('set_breakpoint by source', () => {
   // One module bundled into two chunks needs a Chrome breakpoint in each, but the caller set one.
   it('sets a file loaded in two scripts as one breakpoint, reported, listed and removed as one', async () => {
     const shared = (gen: number) => inlineSourceMap(['webpack://app/src/shared.ts'], [[], [], [[0, 0, gen, 0]]]);
+    const [inA, inB] = ['br:1:2:0:http://x/a.js', 'br:1:2:0:http://x/b.js'];
     const setBreakpointByUrl = vi
       .fn()
-      .mockResolvedValueOnce({ breakpointId: 'bp-a', locations: [{ scriptId: 'a', lineNumber: 2, columnNumber: 0 }] })
-      .mockResolvedValueOnce({ breakpointId: 'bp-b', locations: [{ scriptId: 'b', lineNumber: 2, columnNumber: 0 }] });
+      .mockResolvedValueOnce({ breakpointId: inA, locations: [{ scriptId: 'a', lineNumber: 2, columnNumber: 0 }] })
+      .mockResolvedValueOnce({ breakpointId: inB, locations: [{ scriptId: 'b', lineNumber: 2, columnNumber: 0 }] });
     const removeBreakpoint = vi.fn().mockResolvedValue({});
     const { cdpClient, mcpClient } = await setUp(setBreakpointByUrl, removeBreakpoint);
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', { scriptId: 'a', url: 'http://x/a.js', sourceMapURL: shared(5) });
@@ -305,30 +310,32 @@ describe('set_breakpoint by source', () => {
     });
 
     expect(setBreakpointByUrl).toHaveBeenCalledTimes(2);
-    expect((result.structuredContent as any).breakpointId).toBe('bp-a');
+    const { breakpointId } = result.structuredContent as any;
     expect((result.structuredContent as any).resolvedLocations.map((l: any) => l.url)).toEqual([
       'http://x/a.js',
       'http://x/b.js',
     ]);
     const listed = await mcpClient.callTool({ name: 'list_breakpoints', arguments: {} });
-    expect((listed.structuredContent as any).breakpoints.map((b: any) => b.breakpointId)).toEqual(['bp-a']);
+    expect((listed.structuredContent as any).breakpoints.map((b: any) => b.breakpointId)).toEqual([breakpointId]);
 
     // A hit in the second script reports the id the caller was given.
     fireCdp(cdpClient, 'Debugger', 'paused', {
       reason: 'other',
-      hitBreakpoints: ['bp-b'],
+      hitBreakpoints: [inB],
       callFrames: [{ functionName: 'f', url: 'http://x/b.js', location: { scriptId: 'b', lineNumber: 2 } }],
     });
     const state = await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
-    expect((state.structuredContent as any).hitBreakpoints).toEqual(['bp-a']);
+    expect((state.structuredContent as any).hitBreakpoints).toEqual([breakpointId]);
 
-    await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId: 'bp-a' } });
-    expect(removeBreakpoint.mock.calls.map(([arg]) => arg.breakpointId)).toEqual(['bp-a', 'bp-b']);
+    await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId } });
+    expect(removeBreakpoint.mock.calls.map(([arg]) => arg.breakpointId)).toEqual([inA, inB]);
   });
 });
 
 describe('set_breakpoint by source, when its file loads again', () => {
   const appUrl = 'http://localhost:5173/src/App.tsx';
+  // Chrome's ids for the breakpoint in the first copy, and in the "?t=1" copy it is followed into.
+  const [inFirst, inCopy] = [`br:1:9:4:${appUrl}`, `br:1:10:4:${appUrl}?t=1`];
   const text = (edit = '') => Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join('\n') + edit;
   // Source line 14 at generated line `gen` (1-based), column 4.
   const mapAt = (gen: number, content = text()) =>
@@ -341,8 +348,8 @@ describe('set_breakpoint by source, when its file loads again', () => {
   const setUp = async () => {
     const setBreakpointByUrl = vi
       .fn()
-      .mockResolvedValueOnce({ breakpointId: 'bp-7', locations: [{ scriptId: 's1', lineNumber: 9, columnNumber: 4 }] })
-      .mockResolvedValue({ breakpointId: 'bp-8', locations: [] });
+      .mockResolvedValueOnce({ breakpointId: inFirst, locations: [{ scriptId: 's1', lineNumber: 9, columnNumber: 4 }] })
+      .mockResolvedValue({ breakpointId: inCopy, locations: [] });
     const removeBreakpoint = vi.fn().mockResolvedValue({});
     const cdpClient = makeMockClient(undefined, undefined, { setBreakpointByUrl, removeBreakpoint });
     const mcpClient = await setupMcpClient(cdpClient);
@@ -353,18 +360,22 @@ describe('set_breakpoint by source, when its file loads again', () => {
       sourceMapURL: mapAt(10),
       hash: 'h1',
     });
-    await mcpClient.callTool({ name: 'set_breakpoint', arguments: { source: 'src/App.tsx', lineNumber: 14 } });
+    const set = await mcpClient.callTool({
+      name: 'set_breakpoint',
+      arguments: { source: 'src/App.tsx', lineNumber: 14 },
+    });
+    const id = (set.structuredContent as any).breakpointId;
     setBreakpointByUrl.mockClear();
     // The state read settles the checks a new copy starts, so it is what the assertions wait on.
     const state = async () =>
       (await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} })).structuredContent as any;
     const listed = async () =>
       ((await mcpClient.callTool({ name: 'list_breakpoints', arguments: {} })).structuredContent as any).breakpoints;
-    return { cdpClient, mcpClient, setBreakpointByUrl, removeBreakpoint, state, listed };
+    return { cdpClient, mcpClient, setBreakpointByUrl, removeBreakpoint, state, listed, id };
   };
 
   it('leaves it alone when a reload brings the file back unchanged', async () => {
-    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed } = await setUp();
+    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed, id } = await setUp();
 
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
       scriptId: 's2',
@@ -376,12 +387,12 @@ describe('set_breakpoint by source, when its file loads again', () => {
     expect(await state()).toEqual({ paused: false });
     expect(setBreakpointByUrl).not.toHaveBeenCalled();
     expect(removeBreakpoint).not.toHaveBeenCalled();
-    expect((await listed()).map((b: any) => b.breakpointId)).toEqual(['bp-7']);
+    expect((await listed()).map((b: any) => b.breakpointId)).toEqual([id]);
   });
 
   // Vite re-imports a module as "App.tsx?t=…" when a file it imports changes, even if it did not.
   it('follows an unchanged file into a copy at a new URL, under the same id', async () => {
-    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed } = await setUp();
+    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed, id } = await setUp();
 
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
       scriptId: 's2',
@@ -392,20 +403,20 @@ describe('set_breakpoint by source, when its file loads again', () => {
 
     expect(await state()).toEqual({ paused: false });
     expect(setBreakpointByUrl).toHaveBeenCalledWith({ url: `${appUrl}?t=1`, lineNumber: 10, columnNumber: 4 });
-    expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: 'bp-7' });
-    expect(await listed()).toEqual([{ breakpointId: 'bp-7', location: `${appUrl}:14 → ${appUrl}?t=1:11` }]);
+    expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: inFirst });
+    expect(await listed()).toEqual([{ breakpointId: id, location: `${appUrl}:14 → ${appUrl}?t=1:11` }]);
 
     // A hit on the copy is reported under the id the caller was given.
     fireCdp(cdpClient, 'Debugger', 'paused', {
       reason: 'other',
-      hitBreakpoints: ['bp-8'],
+      hitBreakpoints: [inCopy],
       callFrames: [{ functionName: 'f', location: { scriptId: 's2', lineNumber: 10, columnNumber: 4 } }],
     });
-    expect((await state()).hitBreakpoints).toEqual(['bp-7']);
+    expect((await state()).hitBreakpoints).toEqual([id]);
   });
 
   it('drops it when the file changed, and says so once', async () => {
-    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed } = await setUp();
+    const { cdpClient, setBreakpointByUrl, removeBreakpoint, state, listed, id } = await setUp();
 
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
       scriptId: 's2',
@@ -418,13 +429,13 @@ describe('set_breakpoint by source, when its file loads again', () => {
       paused: false,
       droppedBreakpoints: [
         {
-          breakpointId: 'bp-7',
+          breakpointId: id,
           location: `${appUrl}:14 → ${appUrl}:10`,
           reason: `${appUrl} changed since this breakpoint was set`,
         },
       ],
     });
-    expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: 'bp-7' });
+    expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: inFirst });
     expect(setBreakpointByUrl).not.toHaveBeenCalled();
     expect(await listed()).toEqual([]);
     expect(await state()).toEqual({ paused: false });
@@ -433,7 +444,7 @@ describe('set_breakpoint by source, when its file loads again', () => {
   // A reload of a changed file: its old URL breakpoint can bind and fire during startup before
   // it is removed. The stop is real, but not necessarily where the breakpoint was set.
   it('names a pause on a breakpoint that was dropped under it', async () => {
-    const { cdpClient, state } = await setUp();
+    const { cdpClient, state, id } = await setUp();
 
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
       scriptId: 's2',
@@ -443,18 +454,18 @@ describe('set_breakpoint by source, when its file loads again', () => {
     });
     fireCdp(cdpClient, 'Debugger', 'paused', {
       reason: 'other',
-      hitBreakpoints: ['bp-7'],
+      hitBreakpoints: [inFirst],
       callFrames: [{ functionName: 'f', location: { scriptId: 's2', lineNumber: 9, columnNumber: 4 } }],
     });
 
     const paused = await state();
-    expect(paused.hitBreakpoints).toEqual(['bp-7']);
-    expect(paused.note).toMatch(/^Stopped on bp-7 \(.*\), dropped because its file changed/);
-    expect(paused.droppedBreakpoints.map((b: any) => b.breakpointId)).toEqual(['bp-7']);
+    expect(paused.hitBreakpoints).toEqual([id]);
+    expect(paused.note).toMatch(new RegExp(`^Stopped on ${id} \\(.*\\), dropped because its file changed`));
+    expect(paused.droppedBreakpoints.map((b: any) => b.breakpointId)).toEqual([id]);
   });
 
   it('has nothing left to remove from Chrome for a dropped breakpoint', async () => {
-    const { cdpClient, mcpClient, removeBreakpoint, state } = await setUp();
+    const { cdpClient, mcpClient, removeBreakpoint, state, id } = await setUp();
     fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
       scriptId: 's2',
       url: appUrl,
@@ -464,10 +475,82 @@ describe('set_breakpoint by source, when its file loads again', () => {
     await state();
     removeBreakpoint.mockClear();
 
-    const result = await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId: 'bp-7' } });
+    const result = await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId: id } });
 
     expect(result.isError).toBeFalsy();
     expect(removeBreakpoint).not.toHaveBeenCalled();
+  });
+
+  // Chrome names a breakpoint by its place, so setting one again on the same line, after an edit
+  // that did not move that line, gets the dropped one's Chrome id back.
+  it('gives a breakpoint set where a dropped one was a new id, though Chrome reuses its own', async () => {
+    const { cdpClient, mcpClient, setBreakpointByUrl, removeBreakpoint, state, id } = await setUp();
+    fireCdp(cdpClient, 'Debugger', 'scriptParsed', {
+      scriptId: 's2',
+      url: appUrl,
+      sourceMapURL: mapAt(10, text('\nline 21')),
+      hash: 'h2',
+    });
+    // Dropped, but not yet reported.
+    await vi.waitFor(() => expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: inFirst }));
+    setBreakpointByUrl.mockResolvedValueOnce({
+      breakpointId: inFirst,
+      locations: [{ scriptId: 's2', lineNumber: 9, columnNumber: 4 }],
+    });
+
+    const again = await mcpClient.callTool({
+      name: 'set_breakpoint',
+      arguments: { source: 'src/App.tsx', lineNumber: 14 },
+    });
+    const newId = (again.structuredContent as any).breakpointId;
+    expect(newId).not.toBe(id);
+
+    fireCdp(cdpClient, 'Debugger', 'paused', {
+      reason: 'other',
+      hitBreakpoints: [inFirst],
+      callFrames: [{ functionName: 'f', location: { scriptId: 's2', lineNumber: 9, columnNumber: 4 } }],
+    });
+    const paused = await state();
+    expect(paused.hitBreakpoints).toEqual([newId]);
+    expect(paused.note).toBeUndefined();
+    // The earlier one's drop is still reported, under the id it had.
+    expect(paused.droppedBreakpoints.map((b: any) => b.breakpointId)).toEqual([id]);
+
+    removeBreakpoint.mockClear();
+    await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId: newId } });
+    expect(removeBreakpoint).toHaveBeenCalledWith({ breakpointId: inFirst });
+  });
+});
+
+describe('remove_breakpoint', () => {
+  // A reconnect is a new session: every breakpoint went with the old one, and Chrome hands out
+  // the same ids again. One from before must not name a breakpoint set since.
+  it('rejects an id from before a reconnect, though a breakpoint was set at the same place since', async () => {
+    const setBreakpointByUrl = vi
+      .fn()
+      .mockResolvedValue({ breakpointId: 'br:1:9:0:http://localhost:3000/app.js', locations: [] });
+    const removeBreakpoint = vi.fn().mockResolvedValue({});
+    let cdpClient = makeMockClient(undefined, undefined, { setBreakpointByUrl, removeBreakpoint });
+    const { mcpClient } = await setupServer(() => cdpClient);
+    const set = async () => {
+      const result = await mcpClient.callTool({
+        name: 'set_breakpoint',
+        arguments: { url: 'http://localhost:3000/app.js', lineNumber: 10 },
+      });
+      return (result.structuredContent as any).breakpointId;
+    };
+
+    const before = await set();
+    cdpClient = makeMockClient(undefined, undefined, { setBreakpointByUrl, removeBreakpoint });
+    const after = await set();
+    expect(after).not.toBe(before);
+
+    const result = await mcpClient.callTool({ name: 'remove_breakpoint', arguments: { breakpointId: before } });
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toMatch(/^No breakpoint /);
+    expect(removeBreakpoint).not.toHaveBeenCalled();
+    const listed = await mcpClient.callTool({ name: 'list_breakpoints', arguments: {} });
+    expect((listed.structuredContent as any).breakpoints.map((b: any) => b.breakpointId)).toEqual([after]);
   });
 });
 

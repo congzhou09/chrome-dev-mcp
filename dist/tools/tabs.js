@@ -1,6 +1,6 @@
 import CDP from 'chrome-remote-interface';
 import { z } from 'zod';
-import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut } from '../constants.js';
+import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 // ── Tab management tools ──────────────────────────────────────────────────────
 export function registerTabTools(server, deps) {
@@ -64,9 +64,12 @@ export function registerTabTools(server, deps) {
                 isError: true,
             };
         }
-        await session.attach(client);
-        // connectToTarget already proved this target answers, so a hang here means it wedged in
-        // between — bounded anyway, because reporting the switch is not worth parking the call.
+        // The attach and the title read are both bounded: reporting the switch is not worth parking
+        // the call. A fresh connect has just proved the target answers, so a hang here usually means
+        // it wedged in between; staying on the current tab proves nothing, and it may already be stuck.
+        if (!(await session.attach(client))) {
+            return attachTimedOut(`switch_tab (connected to ${targetId}, but still attaching to it)`);
+        }
         const result = await withTimeout(client.Runtime.evaluate({
             expression: '({ title: document.title, url: location.href })',
             returnByValue: true,

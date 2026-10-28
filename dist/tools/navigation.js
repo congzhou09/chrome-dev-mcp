@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS } from '../constants.js';
+import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import { droppedBreakpointsSchema } from './debugger.js';
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
@@ -39,7 +39,8 @@ export function registerNavigationTools(server, getClient, session) {
         // and only an enabled Debugger domain hears it — including a pause on a breakpoint that
         // DevTools or another client set. Without it, a page stopped during startup would look
         // exactly like one that is slow to load.
-        await session.attach(client);
+        if (!(await session.attach(client)))
+            return attachTimedOut(what);
         const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
         let committedUrl;
         const emitter = client;

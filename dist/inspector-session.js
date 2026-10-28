@@ -1,6 +1,7 @@
 import { randomBytes } from 'crypto';
-import { MAX_CONSOLE_LOGS } from './constants.js';
+import { MAX_CONSOLE_LOGS, PAGE_COMMAND_TIMEOUT_MS } from './constants.js';
 import { createSourceMapResolver, withoutQuery } from './sourcemap.js';
+import { TIMED_OUT, withTimeout } from './timeout.js';
 export function createInspectorSession() {
     const debuggerState = {
         paused: false,
@@ -51,6 +52,11 @@ export function createInspectorSession() {
     // When getClient() returns a different instance (reconnect), we re-register
     // and reset stale debugger state — this is the "reconnect cleanup" point.
     let registeredOnClient = null;
+    // The attach under way on registeredOnClient, or finished. Every caller waits on this one.
+    let attaching = Promise.resolve();
+    // What that attach registered on registeredOnClient. Being this list is also what makes an
+    // attach the current one (see attach).
+    let listening = [];
     const labelOf = (bp) => {
         const first = bp.placements[0];
         return `${bp.display}:${first.sourceLine} → ${first.url}:${first.lineNumber + 1}`;
@@ -144,10 +150,14 @@ export function createInspectorSession() {
         debuggerState.pauseReason = '';
         debuggerState.hitBreakpoints = [];
     };
-    const attach = async (client) => {
-        if (registeredOnClient === client)
-            return;
-        registeredOnClient = client;
+    // The attach itself. Every listener it registers is recorded in `registered`, so that it can be
+    // taken off again: when Chrome refuses the attach, or when the session moves to another client
+    // (see attach below).
+    const attachTo = async (client, registered) => {
+        const listen = (domain, event, handler) => {
+            client[domain].on(event, handler);
+            registered.push([`${domain}.${event}`, handler]);
+        };
         // Reset stale state from the previous Chrome session.
         //
         // Do NOT add the network buffer here. This function runs lazily on the first
@@ -188,7 +198,7 @@ export function createInspectorSession() {
         // in DevTools before this server connected.
         //
         // source === 'javascript' + level === 'error' → uncaught exception (not a console.error call).
-        client.Console.on('messageAdded', async (event) => {
+        listen('Console', 'messageAdded', async (event) => {
             // Read synchronously, before the first await. Resolving a stack trace takes a turn or
             // two, and the replay burst that Console.enable() answers with arrives during exactly
             // that window — stamping after the await would hand those entries the live generation.
@@ -223,6 +233,12 @@ export function createInspectorSession() {
         // only mechanism that replays all messages already visible in DevTools before this server
         // connected — which is the core requirement here.  The @deprecated hint is intentional.
         await client.Console.enable();
+        // Taken over by another attach while it waited (see attach): what it registered so far has
+        // been taken off, and it registers nothing more, nor touches state that attach now owns. This
+        // await is the first point where that can have happened: attach sets `listening` and calls
+        // attachTo in one synchronous run, which lasts until here, so a check any earlier always passes.
+        if (listening !== registered)
+            return;
         // Everything replayed above belongs to generation 0; everything from here is live.
         loadGeneration = 1;
         // One generation per main-frame navigation — a reload included, which is the case this
@@ -237,13 +253,13 @@ export function createInspectorSession() {
         // location.reload() via evaluate, resumes first. Without this the state would keep
         // reporting call frames of a document that no longer exists. A breakpoint the new
         // document hits arrives as a fresh Debugger.paused after this event, so it is not lost.
-        client.Page.on('frameNavigated', (event) => {
+        listen('Page', 'frameNavigated', (event) => {
             if (!event?.frame || event.frame.parentId)
                 return;
             loadGeneration++;
             clearPauseRecord();
         });
-        client.Debugger.on('scriptParsed', (event) => {
+        listen('Debugger', 'scriptParsed', (event) => {
             if (!event.url)
                 return;
             sourceMaps.registerScript(event);
@@ -254,18 +270,18 @@ export function createInspectorSession() {
         // before the new document parses anything — measured, Chrome 155: executionContextsCleared,
         // frameNavigated, executionContextCreated, then the first scriptParsed — so dropping
         // everything here never takes a script of the new page with it.
-        client.Runtime.on('executionContextsCleared', () => sourceMaps.dropContext());
-        client.Runtime.on('executionContextDestroyed', (event) => {
+        listen('Runtime', 'executionContextsCleared', () => sourceMaps.dropContext());
+        listen('Runtime', 'executionContextDestroyed', (event) => {
             if (event?.executionContextId != null)
                 sourceMaps.dropContext(event.executionContextId);
         });
-        client.Debugger.on('paused', (event) => {
+        listen('Debugger', 'paused', (event) => {
             debuggerState.paused = true;
             debuggerState.callFrames = event.callFrames;
             debuggerState.pauseReason = event.reason;
             debuggerState.hitBreakpoints = event.hitBreakpoints ?? [];
         });
-        client.Debugger.on('resumed', clearPauseRecord);
+        listen('Debugger', 'resumed', clearPauseRecord);
         // Set up a one-time listener BEFORE enable so Chrome's initial 'paused' event
         // (if execution is already stopped) is caught and updates debuggerState.
         const initialPauseSettled = new Promise((resolve) => {
@@ -278,6 +294,64 @@ export function createInspectorSession() {
         // First-ever enable for this client — Chrome fires 'paused' here if already stopped.
         await client.Debugger.enable({});
         await initialPauseSettled;
+    };
+    // Takes off what an attach registered. By name, not through what `.on` returned: that is typed
+    // void, and is a function that unsubscribes only by the current implementation, which could
+    // change it without breaking anything it promises.
+    const unlisten = (client, registered) => {
+        const emitter = client;
+        for (const [event, handler] of registered)
+            emitter.removeListener(event, handler);
+    };
+    // Shared, and bounded.
+    //
+    // Shared because a call that arrives while another is attaching has to wait for it. Returning
+    // early, it would send Debugger commands ahead of Debugger.enable, which Chrome refuses ("Debugger
+    // agent is not enabled"), and read a pause record and a console buffer that cannot have filled
+    // yet — a pause already in place would read as `paused: false`. Two tool calls issued together
+    // are enough to hit it.
+    //
+    // Bounded because a renderer held in a synchronous loop or by a modal dialog answers neither
+    // enable until it is let go, and a shared attach without a bound would park every caller at
+    // once. A paused renderer is not among them: it answers straight away. Measured, Chrome 156, a
+    // fresh session each time:
+    //
+    //   page                                          Console.enable   Debugger.enable
+    //   Vite + React dev page                               13ms             64ms
+    //   1000 console entries, 2000 scripts                  37ms            194ms
+    //   the same, paused at a `debugger` statement          36ms            145ms   paused event with it
+    //   the same, in a 3000ms synchronous loop            2819ms            119ms
+    //   an alert() open                                 no answer in 3000ms; 12ms once dismissed
+    //
+    // So a caller that gives up cancels nothing: the attach finishes by itself once the renderer is
+    // let go, and the next call finds it done. PAGE_COMMAND_TIMEOUT_MS is ~20x the slowest healthy
+    // attach, the 200ms look for a pause already in place included.
+    const attach = async (client) => {
+        // Synchronous up to the await, so that a concurrent caller always finds this attach started.
+        if (registeredOnClient !== client) {
+            // The client left behind comes off first. Today that changes nothing — index.ts closes a
+            // client before it connects another, and a closed one emits nothing — but it keeps the
+            // session from depending on that: a client still alive would go on writing into state the
+            // new one owns, and one attached again later would have every listener twice.
+            if (registeredOnClient)
+                unlisten(registeredOnClient, listening);
+            registeredOnClient = client;
+            const registered = [];
+            listening = registered;
+            attaching = attachTo(client, registered);
+            // A refused attach is undone rather than kept, so the next call starts over instead of
+            // finding a session that looks attached with no debugger behind it. Chrome refuses
+            // Debugger.enable while script execution is disabled ("Script execution is prohibited",
+            // measured, Chrome 156), and the same session takes it once execution is back on.
+            attaching.catch(() => {
+                // Taken over before it failed, and taken off then.
+                if (listening !== registered)
+                    return;
+                registeredOnClient = null;
+                unlisten(client, registered);
+            });
+        }
+        return (await withTimeout(attaching, PAGE_COMMAND_TIMEOUT_MS)) !== TIMED_OUT;
     };
     return {
         attach,

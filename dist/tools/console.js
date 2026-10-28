@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { MAX_CONSOLE_LOGS, NOT_CONNECTED } from '../constants.js';
+import { MAX_CONSOLE_LOGS, NOT_CONNECTED, attachTimedOut } from '../constants.js';
 // ── Console log tool ──────────────────────────────────────────────────────────
 export function registerConsoleTools(server, getClient, session) {
     server.registerTool('get_console_logs', {
@@ -58,7 +58,8 @@ export function registerConsoleTools(server, getClient, session) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
-        await session.attach(client);
+        if (!(await session.attach(client)))
+            return attachTimedOut('get_console_logs');
         const logs = session.readConsoleLogs({ limit, level, since });
         // An empty result reads very differently depending on what was asked for: with
         // `current-page-load` it is the useful answer "this page has printed nothing", which

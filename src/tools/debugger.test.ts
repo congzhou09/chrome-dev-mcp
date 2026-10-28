@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import CDP from 'chrome-remote-interface';
+import { PAGE_COMMAND_TIMEOUT_MS } from '../constants.js';
 import { makeMockClient, setupMcpClient, setupServer, fireCdp, inlineSourceMap } from '../test-helpers.js';
 
 describe('get_debugger_state', () => {
@@ -66,6 +67,156 @@ describe('get_debugger_state', () => {
 
   it('stays paused when only a subframe navigates', async () => {
     expect((await pauseThenNavigate('main-frame')).paused).toBe(true);
+  });
+});
+
+// The first debugger or console tool call attaches the session: Console.enable, then
+// Debugger.enable. Chrome answers Console.enable only once it has replayed the console history,
+// and not at all while the renderer is held in a loop or by a dialog — holding the mock's open
+// reproduces both.
+describe('attaching the debugger', () => {
+  const holdConsoleEnable = (debuggerMethods: Record<string, ReturnType<typeof vi.fn>> = {}) => {
+    let answer = () => {};
+    const cdpClient: any = makeMockClient(undefined, undefined, debuggerMethods);
+    cdpClient.Console.enable = vi.fn(() => new Promise<void>((resolve) => (answer = () => resolve())));
+    return { cdpClient, answer: () => answer() };
+  };
+
+  // Keeps listeners the way chrome-remote-interface does — `<Domain>.on(event, handler)` puts the
+  // handler on the client itself, under '<Domain>.<event>' — and returns how many of those each
+  // event has on the client right now, for the events that have any.
+  const trackListeners = (cdpClient: any) => {
+    const viaOn = new Set<unknown>();
+    for (const domain of ['Console', 'Debugger', 'Page', 'Runtime']) {
+      cdpClient[domain].on = vi.fn((event: string, handler: (params: any) => void) => {
+        viaOn.add(handler);
+        cdpClient.on(`${domain}.${event}`, handler);
+      });
+    }
+    return (): number[] =>
+      cdpClient
+        .eventNames()
+        .map((name: string) => cdpClient.listeners(name).filter((handler: unknown) => viaOn.has(handler)).length)
+        .filter((count: number) => count > 0);
+  };
+
+  it('makes a call that arrives mid-attach wait for it, rather than run ahead of Debugger.enable', async () => {
+    const sent: string[] = [];
+    const { cdpClient, answer } = holdConsoleEnable({
+      enable: vi.fn(async () => {
+        sent.push('Debugger.enable');
+        return {};
+      }),
+      setBreakpointByUrl: vi.fn(async () => {
+        sent.push('Debugger.setBreakpointByUrl');
+        return { breakpointId: 'br:1:0:0:http://localhost/app.js', locations: [] };
+      }),
+    });
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const logs = mcpClient.callTool({ name: 'get_console_logs', arguments: {} });
+    const breakpoint = mcpClient.callTool({
+      name: 'set_breakpoint',
+      arguments: { url: 'http://localhost/app.js', lineNumber: 1 },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sent).toEqual([]);
+
+    answer();
+    await Promise.all([logs, breakpoint]);
+    expect(sent).toEqual(['Debugger.enable', 'Debugger.setBreakpointByUrl']);
+    expect(cdpClient.Console.enable).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers with an error when the tab does not finish attaching, and finds the attach done later', async () => {
+    const { cdpClient, answer } = holdConsoleEnable();
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    vi.useFakeTimers();
+    try {
+      const pending = mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+      await vi.advanceTimersByTimeAsync(PAGE_COMMAND_TIMEOUT_MS + 1);
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      const text = (result.content as any)[0].text;
+      expect(text).toContain(`did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms`);
+      // A paused renderer answers both enables, so a pause is not offered as the cause.
+      expect(text).not.toContain('breakpoint');
+
+      // The renderer is let go: the attach already under way finishes, and no second one starts.
+      answer();
+      const next = mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+      await vi.advanceTimersByTimeAsync(250);
+      expect((await next).isError).toBeFalsy();
+      expect(cdpClient.Console.enable).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts over after Chrome refuses Debugger.enable, without registering its listeners twice', async () => {
+    const cdpClient: any = makeMockClient(undefined, undefined, {
+      enable: vi.fn().mockRejectedValueOnce(new Error('Script execution is prohibited')).mockResolvedValue({}),
+    });
+    const live = trackListeners(cdpClient);
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const refused = await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    expect(refused.isError).toBe(true);
+    expect((refused.content as any)[0].text).toContain('Script execution is prohibited');
+
+    const retried = await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    expect(retried.isError).toBeFalsy();
+    expect(cdpClient.Debugger.enable).toHaveBeenCalledTimes(2);
+    // The refused attempt took back every listener it added, so each event has only the retry's.
+    const perEvent = live();
+    expect(perEvent.length).toBeGreaterThan(0);
+    expect(perEvent).toEqual(Array(perEvent.length).fill(1));
+  });
+
+  it('takes its listeners off a client it moves away from, so going back does not register them twice', async () => {
+    const a: any = makeMockClient();
+    const b: any = makeMockClient();
+    const onA = trackListeners(a);
+    const onB = trackListeners(b);
+    let current = a;
+    const { mcpClient } = await setupServer(() => current);
+    const callOn = async (client: any) => {
+      current = client;
+      await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    };
+
+    await callOn(a);
+    const oneSet = onA();
+    expect(oneSet.length).toBeGreaterThan(0);
+    expect(oneSet).toEqual(Array(oneSet.length).fill(1));
+
+    await callOn(b);
+    expect(onA()).toEqual([]);
+    expect(onB()).toEqual(oneSet);
+
+    await callOn(a);
+    expect(onA()).toEqual(oneSet);
+    expect(onB()).toEqual([]);
+  });
+
+  it('lets an attach that another client took over midway register nothing more', async () => {
+    const { cdpClient: a, answer } = holdConsoleEnable();
+    const b: any = makeMockClient();
+    const onA = trackListeners(a);
+    let current = a;
+    const { mcpClient } = await setupServer(() => current);
+
+    const first = mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    await vi.waitFor(() => expect(a.Console.enable).toHaveBeenCalled());
+    current = b;
+    await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+
+    // a's Console.enable answers only now, after b has taken over.
+    answer();
+    await first;
+    expect(onA()).toEqual([]);
+    expect(a.Debugger.enable).not.toHaveBeenCalled();
   });
 });
 

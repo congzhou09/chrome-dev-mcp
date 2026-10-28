@@ -1,7 +1,7 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut } from '../constants.js';
+import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
@@ -84,7 +84,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('get_debugger_state');
 
       // A hot update applies without any navigation, so this is where a breakpoint it dropped
       // is most likely to be noticed — typically while checking why a pause never came.
@@ -148,7 +148,7 @@ export function registerDebuggerTools(
     async ({ frameIndex, scopeType }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('get_scope_variables');
 
       if (!session.state.paused) {
         return { content: [{ type: 'text', text: 'Debugger is not paused.' }], isError: true };
@@ -287,7 +287,7 @@ export function registerDebuggerTools(
       if (!source && !url && !urlRegex) {
         return toolError('Must provide source, url or urlRegex.');
       }
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('set_breakpoint');
 
       // Every breakpoint below is set by the loaded script's URL, never by scriptId, because a
       // URL breakpoint survives a reload — and a reload is how a breakpoint in startup code gets hit.
@@ -392,7 +392,7 @@ export function registerDebuggerTools(
     async ({ breakpointId }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('remove_breakpoint');
       let known = false;
       try {
         for (const chromeId of session.chromeBreakpointIds(breakpointId)) {
@@ -455,7 +455,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('pause_execution');
       await client.Debugger.pause();
       return {
         content: [
@@ -477,7 +477,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('resume_execution');
       await client.Debugger.resume({});
       return { content: [{ type: 'text', text: 'Execution resumed.' }] };
     },
@@ -496,7 +496,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('step_over');
       if (!session.state.paused) {
         return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
       }
@@ -535,7 +535,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('step_into');
       if (!session.state.paused) {
         return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
       }
@@ -585,7 +585,7 @@ export function registerDebuggerTools(
     async ({ expression, frameIndex }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('evaluate_at_frame');
 
       if (!session.state.paused) {
         return {
@@ -630,7 +630,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      await session.attach(client);
+      if (!(await session.attach(client))) return attachTimedOut('step_out');
       if (!session.state.paused) {
         return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
       }

@@ -42,6 +42,10 @@
 
 ■ **Not designed to run alongside chrome-devtools-mcp**. Both register overlapping tool names and maintain independent debugger state against the same Chrome target, which causes confusion for the AI and potential state conflicts.
 
+■ **Breakpoints are not shared with DevTools.** Chrome keeps breakpoints per CDP connection: those set through `set_breakpoint` never appear in DevTools' Breakpoints pane and cannot be removed there (use `remove_breakpoint`; Chrome also drops them when this server disconnects or switches tabs), and those set in DevTools never appear in `list_breakpoints`. Pausing is shared, though — DevTools pauses on this server's breakpoints too, and resuming or stepping from either side applies to both.
+
+■ **DevTools' "Deactivate breakpoints" (Ctrl+F8) has no effect while this server is debugging the tab.** Chrome turns breakpoints off only once every debugger connected to the tab has turned them off, and this server never does — so the page still pauses on DevTools' breakpoints, on debugger; statements, and on this server's breakpoints. This server starts debugging a tab with its first call to `get_console_logs`, `navigate_tab`, `reload_tab`, `switch_tab` or a debugger tool such as `set_breakpoint`, and stops when it disconnects or switches to another tab.
+
 ## Prerequisites
 
 - Node.js 22+

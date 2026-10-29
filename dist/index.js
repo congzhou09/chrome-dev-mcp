@@ -88,7 +88,7 @@ async function connectToTarget(targetId) {
     if (ready === TIMED_OUT) {
         // Leaving it open would keep a half-enabled client feeding the shared capture buffer.
         await client.close().catch(() => { });
-        throw new Error(`target ${targetId} did not respond within ${CONNECT_TIMEOUT_MS}ms (renderer paused or busy?)`);
+        throw new Error(`target ${targetId} did not respond within ${CONNECT_TIMEOUT_MS}ms (renderer busy, or blocked on a dialog?)`);
     }
     cdpClient = client;
     currentTargetId = targetId;

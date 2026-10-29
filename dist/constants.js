@@ -12,12 +12,13 @@ export const MAX_CONSOLE_LOGS = 500;
 export const MAX_HTML_LENGTH = 20_000;
 // ── Connection timeouts ───────────────────────────────────────────────────────
 //
-// Chrome is never assumed to be in a clean debugging state. A renderer that is paused at a
-// breakpoint, stuck in a synchronous loop, or blocked on a modal answers NO CDP command —
-// not even Runtime.enable — and never rejects either. Every command issued while building
-// a connection is therefore bounded; without that, one wedged tab parks the shared
-// connection promise forever and every tool that needs a client times out at the MCP layer
-// while browser-level tools like list_tabs keep working.
+// Chrome is never assumed to be in a clean debugging state. A renderer stuck in a synchronous
+// loop or blocked on a modal answers NO CDP command — not even Runtime.enable — and never
+// rejects either. One paused at a breakpoint is not among them: measured, Chrome 156, it
+// answered Runtime.evaluate, Runtime.enable and Page.enable from a fresh connection within
+// 2ms. Every command issued while building a connection is therefore bounded; without that,
+// one wedged tab parks the shared connection promise forever and every tool that needs a
+// client times out at the MCP layer while browser-level tools like list_tabs keep working.
 // Per-target visibility probe. Only has to survive one round-trip to a healthy renderer.
 export const TARGET_PROBE_TIMEOUT_MS = 2000;
 // Runtime.enable + Page.enable + Network.enable against the chosen target, as a group.

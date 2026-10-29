@@ -146,10 +146,10 @@ const captureScaleFactor = (metrics, reported) => {
 // Page.getNavigationHistory — so this group needs nothing but getClient — no session state
 // at all.
 //
-// Every one of them is also bounded. A CDP command sent to a renderer that is paused,
-// looping, or sitting on a modal neither returns nor rejects (see timeout.ts), so a small
-// read is just as capable of hanging forever as evaluating an arbitrary expression is —
-// the difference is only in how surprising it looks when it happens.
+// Every one of them is also bounded. A CDP command sent to a renderer that is looping or
+// sitting on a modal neither returns nor rejects (see timeout.ts), so a small read is just as
+// capable of hanging forever as evaluating an arbitrary expression is — the difference is
+// only in how surprising it looks when it happens.
 export function registerPageTools(server, getClient) {
     // Read from the browser's navigation history rather than evaluated in the page, so it
     // answers when the renderer cannot. Measured, Chrome 155: with the page in a synchronous

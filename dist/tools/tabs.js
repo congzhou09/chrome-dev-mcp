@@ -1,19 +1,23 @@
-import CDP from 'chrome-remote-interface';
 import { z } from 'zod';
 import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
+import { listPageTargets, probeVisible } from '../targets.js';
 // ── Tab management tools ──────────────────────────────────────────────────────
 export function registerTabTools(server, deps) {
     const { switchToTarget, getCurrentTargetId, session } = deps;
     server.registerTool('list_tabs', {
-        description: 'List all open Chrome page tabs with their targetIds, titles, and URLs. When you are unsure which tab to inspect, call this proactively to discover available tabs, then present the list to the user and ask which one to switch to — do NOT tell the user to switch tabs manually in Chrome.',
+        description: 'List open Chrome page tabs with their targetIds, titles and URLs. ' +
+            '`active` marks a tab showing on screen — the selected tab of a window that is not minimised or fully covered, ' +
+            'so several windows mean several — and is absent if the tab did not answer. `connected` marks the tab this ' +
+            'server acts on; selecting another tab in Chrome does not change it, only switch_tab does.',
         inputSchema: z.object({}),
         outputSchema: z.object({
             tabs: z.array(z.object({
                 targetId: z.string(),
                 title: z.string(),
                 url: z.string(),
-                active: z.boolean().describe('True if this tab is the current MCP target'),
+                active: z.boolean().optional(),
+                connected: z.boolean(),
             })),
         }),
         annotations: {
@@ -21,25 +25,28 @@ export function registerTabTools(server, deps) {
             readOnlyHint: true,
         },
     }, async () => {
+        let pages;
         try {
-            const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 }));
-            const activeId = getCurrentTargetId();
-            const tabs = targets
-                .filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'))
-                .map((t) => ({
-                targetId: t.id,
-                title: t.title,
-                url: t.url,
-                active: t.id === activeId,
-            }));
-            return {
-                content: [{ type: 'text', text: JSON.stringify(tabs, null, 2) }],
-                structuredContent: { tabs },
-            };
+            pages = await listPageTargets();
         }
         catch {
             return NOT_CONNECTED;
         }
+        const connectedId = getCurrentTargetId();
+        // All at once, so that however many tabs fail to answer, the call waits one
+        // TARGET_PROBE_TIMEOUT_MS at most rather than one per tab.
+        const visible = await Promise.all(pages.map((t) => probeVisible(t.id)));
+        const tabs = pages.map((t, i) => ({
+            targetId: t.id,
+            title: t.title,
+            url: t.url,
+            ...(visible[i] !== undefined && { active: visible[i] }),
+            connected: t.id === connectedId,
+        }));
+        return {
+            content: [{ type: 'text', text: JSON.stringify(tabs, null, 2) }],
+            structuredContent: { tabs },
+        };
     });
     server.registerTool('switch_tab', {
         description: 'Switch the MCP connection to a specific Chrome tab. Use list_tabs first to get available targetIds.',

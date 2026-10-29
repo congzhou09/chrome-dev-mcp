@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import CDP from 'chrome-remote-interface';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CONNECT_TIMEOUT_MS, TARGET_PROBE_TIMEOUT_MS, TRANSITION_WAIT_TIMEOUT_MS } from './constants.js';
+import { CONNECT_TIMEOUT_MS, TRANSITION_WAIT_TIMEOUT_MS } from './constants.js';
 import { TIMED_OUT, withTimeout } from './timeout.js';
 import { createServer } from './server.js';
+import { listPageTargets, probeVisible } from './targets.js';
 let cdpClient = null;
 let currentTargetId = null;
 // Serialises every connection transition, and is also the shared promise that stops two
@@ -48,33 +49,22 @@ const { server, attachNetwork } = createServer(getClient, switchToTarget, () => 
 // Picks the visible tab, skipping any target whose renderer does not answer.
 //
 // The probe is bounded because an unresponsive target is a normal thing to find: Chrome is
-// never assumed to start in a clean debugging state, and a tab already paused at a
-// breakpoint answers no CDP command at all. Falling back to `pageTargets[0]`
+// never assumed to start in a clean debugging state, and a renderer stuck in a synchronous
+// loop or blocked on a modal answers no CDP command. Falling back to the first page target
 // unconditionally would hand back exactly such a tab and move the hang one layer down, so
 // the fallback is the first target that actually answered.
 async function findActivePageTargetId() {
-    const targets = (await CDP.List({ host: '127.0.0.1', port: 9222 }));
-    const pageTargets = targets.filter((t) => t.type === 'page' && !t.url.startsWith('devtools://'));
     let firstResponsive;
-    for (const target of pageTargets) {
-        const tempClient = await CDP({ host: '127.0.0.1', port: 9222, target: target.id }).catch(() => null);
-        if (!tempClient)
+    // One at a time, unlike list_tabs: the first visible tab ends the search.
+    for (const target of await listPageTargets()) {
+        const visible = await probeVisible(target.id);
+        if (visible === undefined) {
+            console.error(`[chrome-dev-mcp] Target not responding, skipped: ${target.url}`);
             continue;
-        try {
-            // The websocket connects even for a wedged renderer, so getting this far proves nothing.
-            const probe = await withTimeout(tempClient.Runtime.evaluate({ expression: 'document.visibilityState === "visible"' }), TARGET_PROBE_TIMEOUT_MS).catch(() => TIMED_OUT);
-            if (probe === TIMED_OUT) {
-                console.error(`[chrome-dev-mcp] Target not responding, skipped: ${target.url}`);
-                continue;
-            }
-            firstResponsive ??= target.id;
-            if (probe.result.value === true)
-                return target.id;
         }
-        finally {
-            // Closing is handled by the browser process, so it works even on a wedged target.
-            await tempClient.close().catch(() => { });
-        }
+        firstResponsive ??= target.id;
+        if (visible)
+            return target.id;
     }
     return firstResponsive;
 }

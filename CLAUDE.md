@@ -14,3 +14,13 @@
 - Disposable working notes and design docs are named `*.tmp.md` or `*.local.md`.
 - Never reference a `*.tmp.md` or `*.local.md` file from anything that outlives it: source comments, README, `docs/`, tool descriptions, or commit messages.
 - If the reasoning in one is worth keeping, inline it where it belongs instead of linking to it.
+
+# Writing Style
+
+Applies to source comments, tool descriptions and error messages alike. A reader should never have to decode a sentence.
+
+- When a `which`/`it`/`that` would reach back across a long clause, name its antecedent again instead. Next to its antecedent, a pronoun is fine.
+- Do not refer back to an event with a noun made from its verb ("it refuses … the refusal"). Name the thing again: "Debugger.resume fails … the failed resume".
+- No metaphors or idioms standing in for a plain statement: not "survives the refusal" but "is not cancelled by it"; not "finds itself on that tab" but "is already on that tab"; not "once the page is let go" but "once the loop ends or the dialog is closed".
+- Split a sentence that carries more than one claim. Several cases go in a list ("in two cases: A, or B"), not in a `both when … and when …, which …` chain.
+- Say what the reader can do, not just the internal state: "Retry once the page responds", not "the next call finds it done".

@@ -860,4 +860,15 @@ describe('resume_execution', () => {
 
     expect(resume).toHaveBeenCalled();
   });
+
+  it('says there is nothing to resume when Chrome refuses for lack of a pause', async () => {
+    const resume = vi.fn().mockRejectedValue(new Error('Can only perform operation while paused.'));
+    const cdpClient = makeMockClient(undefined, undefined, { resume });
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const result = await mcpClient.callTool({ name: 'resume_execution', arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toContain('not paused — nothing to resume');
+  });
 });

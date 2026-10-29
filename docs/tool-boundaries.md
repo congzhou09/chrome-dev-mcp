@@ -5,7 +5,7 @@
 ## The count is not the metric
 
 ◆What a caller actually pays is the tool definitions carried in its context: name, description and inputSchema.
-◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**18,976 characters (~5.3k tokens) across 25 tools**, of which `get_network_requests` alone is 12% and the four stepping tools together 5%.<!-- /tool-cost -->
+◆On the current set: <!-- tool-cost: pnpm measure:tools --write -->**19,039 characters (~5.3k tokens) across 25 tools**, of which `get_network_requests` alone is 12% and the four stepping tools together 5%.<!-- /tool-cost -->
 ◆So merging tools to lower the count trades a real cost (a caller choosing the wrong tool) for a negligible one. It also does not remove the decision — it relocates it from a tool name into an enum value, and drops the per-tool description that helps a caller get it right.
 ◆Where the schemas are large, they are large on purpose: `get_network_requests` spends its budget documenting navigation pruning, URL truncation markers and redirect-hop semantics — things a caller silently misreads without them.
 

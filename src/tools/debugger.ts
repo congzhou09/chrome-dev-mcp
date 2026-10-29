@@ -530,17 +530,32 @@ export function registerDebuggerTools(
   server.registerTool(
     'resume_execution',
     {
-      description: 'Resume JavaScript execution after a breakpoint or pause.',
+      description:
+        'Resume execution while paused; it runs until the next breakpoint or pause. Returns at once rather than ' +
+        'waiting for one.',
       inputSchema: z.object({}),
       annotations: {
         title: 'Resume execution',
+        destructiveHint: false,
       },
     },
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       if (!(await session.attach(client))) return attachTimedOut('resume_execution');
-      await client.Debugger.resume({});
+      // Chrome decides whether a pause is in place, not session.state. Measured, Chrome 156:
+      // Debugger.resume fails with "Can only perform operation while paused" in two cases: nothing
+      // is paused, or pause_execution asked for a pause that has not landed yet. In the second case
+      // the failed resume does not cancel that pause; it still lands at the next statement that runs.
+      try {
+        await client.Debugger.resume({});
+      } catch (err) {
+        if (!/only perform operation while paused/i.test((err as Error).message)) throw err;
+        return toolError(
+          'Error: not paused — nothing to resume. A pause requested by pause_execution that has not landed yet ' +
+            'is not withdrawn by this.',
+        );
+      }
       return { content: [{ type: 'text', text: 'Execution resumed.' }] };
     },
   );

@@ -108,7 +108,10 @@ export interface InspectorSession {
   /** A 0-based Chrome location → the same in 1-based terms, source-mapped where possible. */
   describeLocation(scriptId: string, line0: number, col0: number): Promise<DescribedLocation>;
 
-  /** MUST be called BEFORE issuing the step command, or the event is missed. */
+  /**
+   * True once the next pause arrives, false after `timeoutMs`. MUST be called BEFORE issuing the
+   * command expected to pause, or the event is missed.
+   */
   waitForNextPause(client: CDP.Client, timeoutMs?: number): Promise<boolean>;
 
   readConsoleLogs(opts: {
@@ -638,15 +641,20 @@ export function createInspectorSession(): InspectorSession {
       };
     },
 
-    // Resolves true when the next paused event arrives, false on timeout.
-    // Call BEFORE issuing the step command to avoid missing the event.
     waitForNextPause: (client, timeoutMs = 5000) =>
       new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(false), timeoutMs);
-        (client as any).once('Debugger.paused', () => {
+        const emitter = client as unknown as NodeJS.EventEmitter;
+        const onPaused = () => {
           clearTimeout(timer);
           resolve(true);
-        });
+        };
+        // Taken off when nothing came. pause_execution times out on every idle page, and a
+        // listener left behind each time would stay on the client for as long as it lives.
+        const timer = setTimeout(() => {
+          emitter.removeListener('Debugger.paused', onPaused);
+          resolve(false);
+        }, timeoutMs);
+        emitter.once('Debugger.paused', onPaused);
       }),
 
     readConsoleLogs({ limit, level, since = 'before-connect' }) {

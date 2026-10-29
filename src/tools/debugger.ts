@@ -1,7 +1,13 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
+import {
+  NOT_CONNECTED,
+  PAGE_COMMAND_TIMEOUT_MS,
+  PAUSE_WAIT_TIMEOUT_MS,
+  attachTimedOut,
+  rendererTimedOut,
+} from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
@@ -37,6 +43,25 @@ const sourceNotPlaced = (source: string, line: number, lookup: Extract<SourceLoo
   );
 };
 
+// attachTimedOut advises a retry once the page responds, which is no help to a pause: by then the
+// loop is over, and a loop that never ends leaves the page unresponsive until the tab is reloaded
+// or reopened. Only a debugger enabled before a loop began can stop it — Debugger.enable sent
+// during one is not answered until it ends (see InspectorSession.attach), and Debugger.pause is
+// refused without it ("Debugger agent is not enabled"). Hence the advice: a debugger tool call,
+// which attaches or finds the attach done, then the hang. Measured, Chrome 156: with the debugger
+// already enabled, a pause sent into a 3s loop was answered in 3ms and landed in 6ms.
+const pauseAttachTimedOut = () => {
+  const result = rendererTimedOut(
+    'pause_execution (attaching the debugger)',
+    'blocked in a synchronous loop, or blocked on a modal dialog',
+  );
+  result.content[0].text +=
+    ' A loop can be paused only by a debugger attached before it started. Once the page responds again — for a ' +
+    'loop that never ends, once the tab has been reloaded or reopened — call any debugger tool, such as ' +
+    'get_debugger_state, before reproducing the hang; pause_execution can then stop it.';
+  return result;
+};
+
 // ── Debugger tools ────────────────────────────────────────────────────────────
 
 export function registerDebuggerTools(
@@ -44,6 +69,13 @@ export function registerDebuggerTools(
   getClient: () => Promise<CDP.Client | null>,
   session: InspectorSession,
 ): void {
+  // Where execution stopped, for the tools that wait for a pause of their own: pause_execution
+  // and the step tools.
+  const reportPause = async () => {
+    const data = { paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() };
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  };
+
   server.registerTool(
     'get_debugger_state',
     {
@@ -446,20 +478,50 @@ export function registerDebuggerTools(
     'pause_execution',
     {
       description:
-        'Pause JavaScript execution immediately. After pausing, use get_debugger_state to inspect the call stack.',
+        'Pause JavaScript at the next statement that runs, and return the call stack if that happens within ' +
+        `${PAUSE_WAIT_TIMEOUT_MS / 1000}s. On an idle page nothing runs, so the pause stays pending until script ` +
+        'next does — a timer, an event, a click — and get_debugger_state reports it once it lands.',
       inputSchema: z.object({}),
       annotations: {
         title: 'Pause execution',
+        destructiveHint: false,
+        idempotentHint: true,
       },
     },
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('pause_execution');
-      await client.Debugger.pause();
+      if (!(await session.attach(client))) return pauseAttachTimedOut();
+      if (session.state.paused) return reportPause();
+
+      // Listening first: in a loop the pause lands within milliseconds of the command.
+      const landed = session.waitForNextPause(client, PAUSE_WAIT_TIMEOUT_MS);
+      // Bounded, because a page showing a modal dialog does not answer even this. Measured, Chrome
+      // 156, the debugger already enabled: no answer while an alert() was open; once it was closed,
+      // the pause was pending, and landed at the next statement that ran.
+      const sent = await withTimeout(client.Debugger.pause(), PAUSE_WAIT_TIMEOUT_MS);
+      if (sent === TIMED_OUT) {
+        return toolError(
+          `Error: the page did not take the pause within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s — it may be showing a ` +
+            'modal dialog (alert, confirm or prompt), which holds every command back until it is closed. The pause ' +
+            'is still queued: once the dialog closes, it lands at the next statement that runs.',
+        );
+      }
+      if (await landed) return reportPause();
+
+      // Not an error: the pause is in place, it has only not landed. Measured, Chrome 156:
+      // Debugger.resume refuses a pause that has not landed ("Can only perform operation while
+      // paused"), and a navigation drops it — a reload included, a #hash change not.
       return {
         content: [
-          { type: 'text', text: 'Pause command sent. Call get_debugger_state to inspect the current position.' },
+          {
+            type: 'text',
+            text:
+              `No script ran within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s, so nothing is paused yet. The pause stays ` +
+              'pending, and cannot be withdrawn short of reloading the page: it lands at the next statement that ' +
+              'runs — a timer, an event such as a click, or an evaluate_js expression. get_debugger_state shows it ' +
+              'once it has landed, and resume_execution continues from there.',
+          },
         ],
       };
     },
@@ -508,18 +570,7 @@ export function registerDebuggerTools(
           content: [{ type: 'text', text: 'Stepped over — execution did not pause again (no more breakpoints).' }],
         };
       }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return reportPause();
     },
   );
 
@@ -545,18 +596,7 @@ export function registerDebuggerTools(
       if (!paused) {
         return { content: [{ type: 'text', text: 'Stepped into — execution did not pause again.' }] };
       }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return reportPause();
     },
   );
 
@@ -640,18 +680,7 @@ export function registerDebuggerTools(
       if (!paused) {
         return { content: [{ type: 'text', text: 'Stepped out — execution did not pause again.' }] };
       }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return reportPause();
     },
   );
 }

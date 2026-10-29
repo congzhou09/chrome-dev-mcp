@@ -9,6 +9,7 @@ import {
   LAYOUT_METRICS_TIMEOUT_MS,
   MAX_HTML_LENGTH,
   NOT_CONNECTED,
+  OWN_EXPRESSION,
   PAGE_COMMAND_TIMEOUT_MS,
   SCREENSHOT_TIMEOUT_MS,
   rendererTimedOut,
@@ -258,6 +259,7 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
             })()
           `,
           returnByValue: true,
+          ...OWN_EXPRESSION,
         }),
         PAGE_COMMAND_TIMEOUT_MS,
       );
@@ -398,7 +400,7 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
         })()
       `;
       const result = await withTimeout(
-        client.Runtime.evaluate({ expression, returnByValue: true }),
+        client.Runtime.evaluate({ expression, returnByValue: true, ...OWN_EXPRESSION }),
         PAGE_COMMAND_TIMEOUT_MS,
       );
       if (result === TIMED_OUT) return rendererTimedOut('get_computed_style');
@@ -540,6 +542,7 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
         const ratio = client.Runtime.evaluate({
           expression: '({ dpr: devicePixelRatio, hidden: document.hidden })',
           returnByValue: true,
+          ...OWN_EXPRESSION,
         })
           .then((r) => r.result?.value as { dpr?: unknown; hidden?: unknown } | undefined)
           .catch(() => undefined);
@@ -630,10 +633,17 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
           front.catch(() => {});
           if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) !== TIMED_OUT) {
             broughtToFront = true;
+            // The second frame is asked for by a bound requestAnimationFrame, not by an arrow
+            // function: the frames call only browser functions, so this leaves no JS of its own
+            // to run once OWN_EXPRESSION has stopped covering it. Measured, Chrome 156, a pause
+            // pending on a foreground tab: it landed in `() => requestAnimationFrame(resolve)`
+            // after 5ms; with the bound form it did not land in three runs and stayed pending
+            // for the page's own code. Two frames either way: 31ms with no pause.
             const painted = client.Runtime.evaluate({
-              expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+              expression: 'new Promise(resolve => requestAnimationFrame(requestAnimationFrame.bind(window, resolve)))',
               returnByValue: true,
               awaitPromise: true,
+              ...OWN_EXPRESSION,
             });
             painted.catch(() => {});
             await withTimeout(painted, FRAME_WAIT_TIMEOUT_MS);
@@ -825,6 +835,7 @@ export function registerPageTools(server: McpServer, getClient: () => Promise<CD
           })()
         `,
           returnByValue: true,
+          ...OWN_EXPRESSION,
         }),
         PAGE_COMMAND_TIMEOUT_MS,
       );

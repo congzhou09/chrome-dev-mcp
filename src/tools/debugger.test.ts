@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import CDP from 'chrome-remote-interface';
-import { PAGE_COMMAND_TIMEOUT_MS } from '../constants.js';
+import { PAGE_COMMAND_TIMEOUT_MS, PAUSE_WAIT_TIMEOUT_MS } from '../constants.js';
 import { makeMockClient, setupMcpClient, setupServer, fireCdp, inlineSourceMap } from '../test-helpers.js';
 
 describe('get_debugger_state', () => {
@@ -713,15 +713,140 @@ describe('list_breakpoints', () => {
   });
 });
 
+// A pause as Chrome delivers it: the session's listener records it, and whoever is waiting for the
+// next one on the client hears it.
+const landPause = (cdpClient: CDP.Client, event: any) => {
+  fireCdp(cdpClient, 'Debugger', 'paused', event);
+  (cdpClient as any).emit('Debugger.paused', event);
+};
+const tick = { functionName: 'tick', url: 'http://localhost/app.js', location: { scriptId: '1', lineNumber: 4 } };
+
 describe('pause_execution', () => {
-  it('calls Debugger.pause', async () => {
-    const pause = vi.fn().mockResolvedValue({});
-    const cdpClient = makeMockClient(undefined, undefined, { pause });
+  const attached = async (debuggerMethods: Record<string, ReturnType<typeof vi.fn>> = {}) => {
+    const cdpClient: any = makeMockClient(undefined, undefined, debuggerMethods);
+    const mcpClient = await setupMcpClient(cdpClient);
+    await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    return { cdpClient, mcpClient };
+  };
+
+  it('returns the call stack once the pause lands', async () => {
+    // Chrome answers the command first, and the pause follows.
+    const pause = vi.fn(async () => {
+      setTimeout(() => landPause(cdpClient, { reason: 'other', callFrames: [tick] }));
+      return {};
+    });
+    const { cdpClient, mcpClient } = await attached({ pause });
+
+    const result = await mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(JSON.parse((result.content as any)[0].text)).toEqual({
+      paused: true,
+      reason: 'other',
+      callStack: [expect.objectContaining({ functionName: 'tick', lineNumber: 5 })],
+    });
+  });
+
+  it('returns where execution already is, without pausing again', async () => {
+    const { cdpClient, mcpClient } = await attached();
+    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'breakpoint', callFrames: [tick] });
+
+    const result = await mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+
+    expect(cdpClient.Debugger.pause).not.toHaveBeenCalled();
+    expect(JSON.parse((result.content as any)[0].text)).toMatchObject({
+      paused: true,
+      reason: 'breakpoint',
+      callStack: [{ functionName: 'tick' }],
+    });
+  });
+
+  // An idle page runs nothing, so the pause has nowhere to land yet.
+  it('says the pause is pending when nothing runs in time, and leaves no listener behind', async () => {
+    const { cdpClient, mcpClient } = await attached();
+    const listeners = cdpClient.listenerCount('Debugger.paused');
+
+    vi.useFakeTimers();
+    try {
+      const pending = mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+      await vi.advanceTimersByTimeAsync(PAUSE_WAIT_TIMEOUT_MS + 1);
+      const result = await pending;
+
+      expect(result.isError).toBeFalsy();
+      expect((result.content as any)[0].text).toMatch(/^No script ran within .*The pause stays pending/);
+      expect(cdpClient.Debugger.pause).toHaveBeenCalledTimes(1);
+      expect(cdpClient.listenerCount('Debugger.paused')).toBe(listeners);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A page showing alert() answers no command until the dialog is closed.
+  it('stops waiting on a page that does not take the pause', async () => {
+    const { cdpClient, mcpClient } = await attached({ pause: vi.fn(() => new Promise(() => {})) });
+    const listeners = cdpClient.listenerCount('Debugger.paused');
+
+    vi.useFakeTimers();
+    try {
+      const pending = mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+      await vi.advanceTimersByTimeAsync(PAUSE_WAIT_TIMEOUT_MS + 1);
+      const result = await pending;
+
+      expect(result.isError).toBe(true);
+      expect((result.content as any)[0].text).toContain('modal dialog');
+      expect(cdpClient.listenerCount('Debugger.paused')).toBe(listeners);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Debugger.enable is not answered during a synchronous loop, and Debugger.pause is refused without it.
+  it('says why a page that will not let the debugger attach cannot be paused', async () => {
+    const cdpClient: any = makeMockClient();
+    cdpClient.Console.enable = vi.fn(() => new Promise(() => {}));
     const mcpClient = await setupMcpClient(cdpClient);
 
-    await mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+    vi.useFakeTimers();
+    try {
+      const pending = mcpClient.callTool({ name: 'pause_execution', arguments: {} });
+      await vi.advanceTimersByTimeAsync(PAGE_COMMAND_TIMEOUT_MS + 1);
+      const result = await pending;
 
-    expect(pause).toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      const text = (result.content as any)[0].text;
+      expect(text).toContain('paused only by a debugger attached before it started');
+      expect(text).toContain('call any debugger tool, such as get_debugger_state, before reproducing the hang');
+      expect(cdpClient.Debugger.pause).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('step_over', () => {
+  it('returns the call stack where the step paused', async () => {
+    let cdpClient: any;
+    const stepOver = vi.fn(async () => {
+      setTimeout(() =>
+        landPause(cdpClient, {
+          reason: 'other',
+          callFrames: [{ ...tick, location: { scriptId: '1', lineNumber: 5 } }],
+        }),
+      );
+      return {};
+    });
+    cdpClient = makeMockClient(undefined, undefined, { stepOver });
+    const mcpClient = await setupMcpClient(cdpClient);
+    await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
+    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'breakpoint', callFrames: [tick] });
+
+    const result = await mcpClient.callTool({ name: 'step_over', arguments: {} });
+
+    expect(JSON.parse((result.content as any)[0].text)).toEqual({
+      paused: true,
+      reason: 'other',
+      callStack: [expect.objectContaining({ functionName: 'tick', lineNumber: 6 })],
+    });
   });
 });
 

@@ -1,5 +1,5 @@
 import CDP from 'chrome-remote-interface';
-import { TARGET_PROBE_TIMEOUT_MS } from './constants.js';
+import { OWN_EXPRESSION, TARGET_PROBE_TIMEOUT_MS } from './constants.js';
 import { TIMED_OUT, withTimeout } from './timeout.js';
 
 export type PageTarget = { id: string; title: string; url: string };
@@ -25,7 +25,7 @@ export async function probeVisible(targetId: string): Promise<boolean | undefine
   try {
     // The websocket connects even for a wedged renderer, so getting this far proves nothing.
     const probe = await withTimeout(
-      client.Runtime.evaluate({ expression: 'document.visibilityState === "visible"' }),
+      client.Runtime.evaluate({ expression: 'document.visibilityState === "visible"', ...OWN_EXPRESSION }),
       TARGET_PROBE_TIMEOUT_MS,
     ).catch((): typeof TIMED_OUT => TIMED_OUT);
     if (probe === TIMED_OUT) return undefined;

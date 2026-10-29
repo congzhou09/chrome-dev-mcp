@@ -186,6 +186,37 @@ export const FRAME_WAIT_TIMEOUT_MS = 1000;
 // read of the new page's title that follows it.
 export const NAVIGATION_TIMEOUT_MS = 30_000;
 
+// How long pause_execution waits for its pause to land. Debugger.pause stops at the next
+// statement that runs, so the wait is set by what the page is doing. Measured, Chrome 156, a
+// background tab — hidden, as is any tab in a window that is minimised or fully covered:
+//
+//   page                       pause landed after
+//   in a synchronous loop            6ms
+//   a 100ms setInterval        17–997ms, median 468ms (30 runs)
+//   a 1000ms setInterval     1000–1883ms (12 runs)
+//   idle                       never: nothing runs
+//
+// A hidden tab runs its timers once a second at most, which is what spreads the middle rows over
+// a whole second and more; a visible one runs them on time. 2s takes in any page with a timer due
+// once a second or more often, hidden or not. The last row sets the cost: an idle page holds the
+// call for all of it, only to hear that the pause is still pending — the answer it gets however
+// long the wait. That is why the bound is not stretched to catch every slow timer.
+export const PAUSE_WAIT_TIMEOUT_MS = 2000;
+
+// Spread into every Runtime.evaluate of an expression this server wrote itself — all but
+// evaluate_js's, which runs the caller's code and so stops wherever the caller's breakpoints say.
+//
+// A read of the page is script like any other, so without this it is where a pending pause lands:
+// one that pause_execution left on an idle page, or that DevTools' pause button did. Measured,
+// Chrome 156, a pause requested on an idle tab: the next Runtime.evaluate stopped on its own first
+// statement, whether it came over the session that asked for the pause or over a fresh connection
+// like probeVisible's — so the read never answered, and the page sat paused in code nobody wrote.
+// With `disableBreaks` the read answered in 21ms, and the pause stayed pending for the page's own
+// code. It covers the evaluation itself only: a callback the expression leaves behind, such as
+// the one an awaited setTimeout runs, still stops — so an expression that waits must not leave
+// one behind (see the screenshot's frame wait).
+export const OWN_EXPRESSION = { disableBreaks: true } as const;
+
 // The answer to a CDP round-trip that outlived its bound. Deliberately a normal tool error
 // rather than a thrown one: "this renderer never answered" is a state the caller can act on
 // (resume the debugger, dismiss the dialog, reload the tab), not a fault in this server.

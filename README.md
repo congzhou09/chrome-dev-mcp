@@ -212,7 +212,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `set_breakpoint`      | Set a breakpoint by source file + line (mapped through source maps), or by script URL / regex; supports conditions  |
 | `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                       |
 | `list_breakpoints`    | All breakpoints active in this session                                                                              |
-| `pause_execution`     | Pause JS execution immediately                                                                                      |
+| `pause_execution`     | Pause JS at the next statement that runs, returning the call stack if that happens within 2s. On an idle page the pause stays pending until script runs — a timer, a click, an `evaluate_js` expression |
 | `resume_execution`    | Resume after a pause or breakpoint                                                                                  |
 | `step_over`           | Execute current line, pause at next (skips into calls); returns updated call stack                                  |
 | `step_into`           | Step into the function call on the current line; returns updated call stack                                         |

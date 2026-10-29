@@ -1,7 +1,13 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut } from '../constants.js';
+import {
+  NAVIGATION_TIMEOUT_MS,
+  NOT_CONNECTED,
+  OWN_EXPRESSION,
+  PAGE_COMMAND_TIMEOUT_MS,
+  attachTimedOut,
+} from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
 import { droppedBreakpointsSchema } from './debugger.js';
@@ -133,7 +139,11 @@ export function registerNavigationTools(
   // costs the caller the url and title, not the result.
   const readPage = async (client: CDP.Client): Promise<{ url?: string; title?: string }> => {
     const read = await withTimeout(
-      client.Runtime.evaluate({ expression: '({ url: location.href, title: document.title })', returnByValue: true }),
+      client.Runtime.evaluate({
+        expression: '({ url: location.href, title: document.title })',
+        returnByValue: true,
+        ...OWN_EXPRESSION,
+      }),
       PAGE_COMMAND_TIMEOUT_MS,
     ).catch((): typeof TIMED_OUT => TIMED_OUT);
     if (read === TIMED_OUT) return {};

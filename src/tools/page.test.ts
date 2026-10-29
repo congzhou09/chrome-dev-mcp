@@ -193,6 +193,29 @@ describe('get_computed_style', () => {
   });
 });
 
+// A pause left pending on an idle page lands at the next statement that runs, and evaluating an
+// expression runs one. A read this server makes for itself must not be where it lands.
+describe('a pending pause', () => {
+  it('cannot land in a read of the page, only in an evaluate_js expression', async () => {
+    const evaluate = vi.fn();
+    const client = await setupMcpClient(makeMockClient(evaluate));
+    const reads: Array<[string, Record<string, unknown>, unknown]> = [
+      ['get_html', {}, { html: '<html></html>', totalLength: 13 }],
+      ['get_computed_style', { selector: '#app', properties: ['display'] }, { display: 'block' }],
+      ['get_inspected_element', {}, null],
+    ];
+    for (const [name, args, value] of reads) {
+      evaluate.mockClear().mockResolvedValue({ result: { value } });
+      await client.callTool({ name, arguments: args });
+      expect(evaluate, name).toHaveBeenCalledWith(expect.objectContaining({ disableBreaks: true }));
+    }
+
+    evaluate.mockClear().mockResolvedValue({ result: { type: 'number', value: 1 } });
+    await client.callTool({ name: 'evaluate_js', arguments: { expression: '1' } });
+    expect(evaluate.mock.calls[0][0]).not.toHaveProperty('disableBreaks');
+  });
+});
+
 describe('screenshot', () => {
   it('returns base64 image content', async () => {
     const pngBase64 =
@@ -287,7 +310,9 @@ describe('screenshot', () => {
     expect(bringToFront).toHaveBeenCalledTimes(1);
     const evaluate = (cdp as any).Runtime.evaluate;
     const frameWait = evaluate.mock.calls.find(([a]: [any]) => a.expression.includes('requestAnimationFrame'));
-    expect(frameWait?.[0]).toMatchObject({ awaitPromise: true });
+    expect(frameWait?.[0]).toMatchObject({ awaitPromise: true, disableBreaks: true });
+    // No function of its own for the frames to call, which a pending pause would land in.
+    expect(frameWait?.[0].expression).not.toMatch(/requestAnimationFrame\(\s*(\(|function)/);
     // The order is the whole point: raised, painted, then captured.
     expect(bringToFront.mock.invocationCallOrder[0]).toBeLessThan(captureScreenshot.mock.invocationCallOrder[0]);
     expect((result.content as any)[1].text).toContain('raised in its window');

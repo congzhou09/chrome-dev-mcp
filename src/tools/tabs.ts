@@ -1,7 +1,13 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
+import {
+  NOT_CONNECTED,
+  OWN_EXPRESSION,
+  PAGE_COMMAND_TIMEOUT_MS,
+  attachTimedOut,
+  rendererTimedOut,
+} from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import { type PageTarget, listPageTargets, probeVisible } from '../targets.js';
 import type { InspectorSession } from '../inspector-session.js';
@@ -106,6 +112,7 @@ export function registerTabTools(
         client.Runtime.evaluate({
           expression: '({ title: document.title, url: location.href })',
           returnByValue: true,
+          ...OWN_EXPRESSION,
         }),
         PAGE_COMMAND_TIMEOUT_MS,
       );

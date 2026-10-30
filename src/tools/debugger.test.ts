@@ -931,9 +931,21 @@ describe('resume_execution', () => {
     const cdpClient = makeMockClient(undefined, undefined, { resume });
     const mcpClient = await setupMcpClient(cdpClient);
 
-    await mcpClient.callTool({ name: 'resume_execution', arguments: {} });
+    const result = await mcpClient.callTool({ name: 'resume_execution', arguments: {} });
 
-    expect(resume).toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledWith({});
+    expect((result.content as any)[0].text).toBe('Execution resumed.');
+  });
+
+  it('ends the paused code instead when asked to terminate', async () => {
+    const resume = vi.fn().mockResolvedValue({});
+    const cdpClient = makeMockClient(undefined, undefined, { resume });
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const result = await mcpClient.callTool({ name: 'resume_execution', arguments: { terminate: true } });
+
+    expect(resume).toHaveBeenCalledWith({ terminateOnResume: true });
+    expect((result.content as any)[0].text).toBe('The paused code was terminated, and execution resumed.');
   });
 
   it('says there is nothing to resume when Chrome refuses for lack of a pause', async () => {
@@ -945,5 +957,18 @@ describe('resume_execution', () => {
 
     expect(result.isError).toBe(true);
     expect((result.content as any)[0].text).toContain('not paused — nothing to resume');
+  });
+
+  it('says to pause first when asked to terminate with nothing paused', async () => {
+    const resume = vi.fn().mockRejectedValue(new Error('Can only perform operation while paused.'));
+    const cdpClient = makeMockClient(undefined, undefined, { resume });
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const result = await mcpClient.callTool({ name: 'resume_execution', arguments: { terminate: true } });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content as any)[0].text;
+    expect(text).toContain('not paused — nothing to resume');
+    expect(text).toContain('pause it with pause_execution first');
   });
 });

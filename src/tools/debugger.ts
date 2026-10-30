@@ -73,7 +73,7 @@ const pauseAttachTimedOut = () => {
 // - Over an `await`, the step paused on the statement after it once the promise settled. A 100ms
 //   interval ran meanwhile, and its callback did not pause.
 // - In an endless loop, Debugger.pause was answered in 2ms and paused inside the loop in 5ms. A
-//   reload then loaded the page in 18ms.
+//   resume with terminateOnResume then ended the loop; see resume_execution.
 // - Over alert(), the step command was answered in 2ms. Once the dialog was closed, the step paused
 //   at the next statement.
 const STEP_NOT_PAUSED =
@@ -83,7 +83,7 @@ const STEP_NOT_PAUSED =
   'that runs, including an evaluate_js expression. Only a reload or a navigation cancels it.\n' +
   '- Waiting at an `await`: the step pauses once the awaited promise settles.\n' +
   '- In a long or endless loop: the page does not respond. pause_execution pauses inside the loop, and ' +
-  'reload_tab then ends the loop.\n' +
+  'resume_execution with terminate: true then ends the loop.\n' +
   '- Blocked by an alert, confirm or prompt dialog: the page does not respond until the dialog is closed in the ' +
   'browser.\n' +
   'get_debugger_state shows whether the step has paused.';
@@ -577,19 +577,37 @@ export function registerDebuggerTools(
     },
   );
 
+  // `terminate` is DevTools' "Terminate current JavaScript call", which sends Runtime.terminateExecution
+  // and then Debugger.resume; {terminateOnResume: true} does the same in one command. Measured, Chrome 156,
+  // paused in an endless loop in a message event listener, both ways alike:
+  // - The whole stack up to the listener stopped: no catch, no finally, no code after the loop.
+  // - In an async function, past an `await`: the function's promise never settled, and the other
+  //   microtasks already queued never ran.
+  // - Nothing was reported: no console error, no window.onerror, no unhandledrejection.
+  // - The event's next listener ran, and so did later timers, events and promise callbacks.
   server.registerTool(
     'resume_execution',
     {
       description:
         'Resume execution while paused; it runs until the next breakpoint or pause. Returns at once rather than ' +
         'waiting for one.',
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        terminate: z
+          .boolean()
+          .default(false)
+          .describe(
+            'Resume, but skip the rest of the paused function and of its callers, finally blocks included, e.g. to ' +
+              'stop an endless loop. The page may be left half-updated; reload_tab gives a clean state.',
+          ),
+      }),
       annotations: {
         title: 'Resume execution',
-        destructiveHint: false,
+        // Resuming ends the pause, and the paused state may be hard to reproduce. terminate also ends
+        // the page's code partway.
+        destructiveHint: true,
       },
     },
-    async () => {
+    async ({ terminate }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       if (!(await session.attach(client))) return attachTimedOut('resume_execution');
@@ -597,16 +615,26 @@ export function registerDebuggerTools(
       // Debugger.resume fails with "Can only perform operation while paused" in two cases: nothing
       // is paused, or pause_execution asked for a pause that has not landed yet. In the second case
       // the failed resume does not cancel that pause; it still lands at the next statement that runs.
+      // While a loop ran with nothing paused, Debugger.resume still failed within 5ms.
       try {
-        await client.Debugger.resume({});
+        await client.Debugger.resume(terminate ? { terminateOnResume: true } : {});
       } catch (err) {
         if (!/only perform operation while paused/i.test((err as Error).message)) throw err;
         return toolError(
-          'Error: not paused — nothing to resume. A pause requested by pause_execution that has not landed yet ' +
-            'is not withdrawn by this.',
+          'Error: not paused — nothing to resume. ' +
+            (terminate
+              ? 'To stop code that is still running, such as an endless loop, pause it with pause_execution first.'
+              : 'A pause requested by pause_execution that has not landed yet is not withdrawn by this.'),
         );
       }
-      return { content: [{ type: 'text', text: 'Execution resumed.' }] };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: terminate ? 'The paused code was terminated, and execution resumed.' : 'Execution resumed.',
+          },
+        ],
+      };
     },
   );
 

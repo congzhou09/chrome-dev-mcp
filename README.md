@@ -213,7 +213,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                       |
 | `list_breakpoints`    | All breakpoints active in this session                                                                              |
 | `pause_execution`     | Pause JS at the next statement that runs, returning the call stack if that happens within 2s. On an idle page the pause stays pending until script runs — a timer, a click, an `evaluate_js` expression |
-| `resume_execution`    | Resume after a pause or breakpoint                                                                                  |
+| `resume_execution`    | Resume after a pause or breakpoint. With `terminate: true`, skip the rest of the paused function and of its callers, `finally` blocks included, e.g. to stop an endless loop; the page may be left half-updated |
 | `step_over`           | Run the current statement without stepping into the functions it calls, and pause at the next one; returns the new call stack |
 | `step_into`           | Step into the function the current statement calls, or to the next statement if it calls none; returns the new call stack |
 | `step_out`            | Run the rest of the current function and pause in its caller; returns the new call stack                            |

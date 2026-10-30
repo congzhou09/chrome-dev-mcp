@@ -330,13 +330,15 @@ export function registerPageTools(
       where = ` in ${top.functionName || '(anonymous)'} at ${position}`;
     }
     // Measured, Chrome 156, an expression resumed into `for (;;) {}`: pause_execution landed inside
-    // the loop in 10ms, and reload_tab then loaded the page in 88ms.
+    // the loop in 10ms. A resume with terminateOnResume then ended the expression: its
+    // Runtime.evaluate failed with -32603, and the page answered the next command at once.
     const text =
       `Execution paused (reason: ${event?.reason ?? 'unknown'})${where}. The expression has not finished: ` +
       'it continues once execution resumes, but its result will not be returned. ' +
       'get_debugger_state shows the full call stack. ' +
       'After execution resumes, this call does not terminate an endless loop in the expression: the page stops ' +
-      'responding. pause_execution pauses inside such a loop, and reload_tab then abandons the expression.';
+      'responding. pause_execution pauses inside such a loop, and resume_execution with terminate: true then ' +
+      'ends the expression.';
     return { content: [{ type: 'text' as const, text }] };
   };
 

@@ -214,9 +214,11 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | `list_breakpoints`    | All breakpoints active in this session                                                                              |
 | `pause_execution`     | Pause JS at the next statement that runs, returning the call stack if that happens within 2s. On an idle page the pause stays pending until script runs — a timer, a click, an `evaluate_js` expression |
 | `resume_execution`    | Resume after a pause or breakpoint                                                                                  |
-| `step_over`           | Execute current line, pause at next (skips into calls); returns updated call stack                                  |
-| `step_into`           | Step into the function call on the current line; returns updated call stack                                         |
-| `step_out`            | Step out of the current function back to the caller; returns updated call stack                                     |
+| `step_over`           | Run the current statement without stepping into the functions it calls, and pause at the next one; returns the new call stack |
+| `step_into`           | Step into the function the current statement calls, or to the next statement if it calls none; returns the new call stack |
+| `step_out`            | Run the rest of the current function and pause in its caller; returns the new call stack                            |
+
+▲The three step tools work only while paused, and go by statement rather than by line, since a minified line holds many statements. A step past the end of an event handler or timer callback — from its last statement, or out of it — pauses at the first statement of whatever script runs next, which may be unrelated code. When a step has not paused within 5s, the result lists the possible reasons: the step went past the end of the code that was running, the code is waiting at an `await`, or the page is not responding.
 
 ### Network
 

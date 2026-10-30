@@ -233,6 +233,21 @@ export const NAVIGATION_TIMEOUT_MS = 30_000;
 // long the wait. That is why the bound is not stretched to catch every slow timer.
 export const PAUSE_WAIT_TIMEOUT_MS = 2000;
 
+// How long a step tool waits for the pause its step causes. Measured, Chrome 156, a background tab:
+//
+//   step                                                    paused after
+//   to the next statement, into a call, or out of one       0–6ms
+//   over an `await` of a 2500ms timer                       2926ms, on the statement after it
+//   past the end of a timer callback, a 100ms interval set  610ms, in the interval's callback
+//   past the end of a timer callback, no other timer set    never: nothing runs
+//   over a call into an endless loop                        never
+//
+// So a step pauses within milliseconds wherever code runs on. The wait matters only for a step that
+// waits for code to run: at an `await`, or past the end of the code that was running. 5s covers an
+// `await` on a slow request. As with PAUSE_WAIT_TIMEOUT_MS, an idle page holds the call for the whole
+// wait: a step past the end of an event handler waits 5s, only to report that it has not paused.
+export const STEP_WAIT_TIMEOUT_MS = 5000;
+
 // Spread into every Runtime.evaluate of an expression this server wrote itself — all but
 // evaluate_js's, which runs the caller's code and so stops wherever the caller's breakpoints say.
 //

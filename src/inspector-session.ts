@@ -112,7 +112,7 @@ export interface InspectorSession {
    * True once the next pause arrives, false after `timeoutMs`. MUST be called BEFORE issuing the
    * command expected to pause, or the event is missed.
    */
-  waitForNextPause(client: CDP.Client, timeoutMs?: number): Promise<boolean>;
+  waitForNextPause(client: CDP.Client, timeoutMs: number): Promise<boolean>;
 
   readConsoleLogs(opts: {
     limit: number;
@@ -641,7 +641,7 @@ export function createInspectorSession(): InspectorSession {
       };
     },
 
-    waitForNextPause: (client, timeoutMs = 5000) =>
+    waitForNextPause: (client, timeoutMs) =>
       new Promise((resolve) => {
         const emitter = client as unknown as NodeJS.EventEmitter;
         const onPaused = () => {

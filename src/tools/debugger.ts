@@ -5,6 +5,7 @@ import {
   NOT_CONNECTED,
   PAGE_COMMAND_TIMEOUT_MS,
   PAUSE_WAIT_TIMEOUT_MS,
+  STEP_WAIT_TIMEOUT_MS,
   attachTimedOut,
   rendererTimedOut,
 } from '../constants.js';
@@ -62,6 +63,31 @@ const pauseAttachTimedOut = () => {
   return result;
 };
 
+// A step tool's answer when its step has not paused within STEP_WAIT_TIMEOUT_MS. Not an error: the
+// step is still in effect. Measured, Chrome 156, one case at a time:
+//
+// - Past the end of the code that was running, the next Runtime.evaluate paused on its own first
+//   statement. One with `disableBreaks` did not, and the step stayed in effect after it.
+//   Debugger.resume fails ("Can only perform operation while paused"), and the step stays in effect
+//   after the failed resume too. A reload or a navigation drops the step.
+// - Over an `await`, the step paused on the statement after it once the promise settled. A 100ms
+//   interval ran meanwhile, and its callback did not pause.
+// - In an endless loop, Debugger.pause was answered in 2ms and paused inside the loop in 5ms. A
+//   reload then loaded the page in 18ms.
+// - Over alert(), the step command was answered in 2ms. Once the dialog was closed, the step paused
+//   at the next statement.
+const STEP_NOT_PAUSED =
+  `The step has not paused within ${STEP_WAIT_TIMEOUT_MS / 1000}s, but it is still in effect. Execution is in one ` +
+  'of four states:\n' +
+  '- Past the end of the code that was running, such as an event handler: the step pauses in the next script ' +
+  'that runs, including an evaluate_js expression. Only a reload or a navigation cancels it.\n' +
+  '- Waiting at an `await`: the step pauses once the awaited promise settles.\n' +
+  '- In a long or endless loop: the page does not respond. pause_execution pauses inside the loop, and ' +
+  'reload_tab then ends the loop.\n' +
+  '- Blocked by an alert, confirm or prompt dialog: the page does not respond until the dialog is closed in the ' +
+  'browser.\n' +
+  'get_debugger_state shows whether the step has paused.';
+
 // ── Debugger tools ────────────────────────────────────────────────────────────
 
 export function registerDebuggerTools(
@@ -69,11 +95,36 @@ export function registerDebuggerTools(
   getClient: () => Promise<CDP.Client | null>,
   session: InspectorSession,
 ): void {
+  // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
+  // returned, a single id even for a file it placed in several scripts.
+  const hitBreakpoints = () => [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))];
+
   // Where execution stopped, for the tools that wait for a pause of their own: pause_execution
-  // and the step tools.
+  // and the step tools. A step over a function call stops at any breakpoint inside that call,
+  // not at the next statement. Chrome then gives the reason as "ambiguous" (measured, Chrome 156),
+  // so the result names the breakpoint.
   const reportPause = async () => {
-    const data = { paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() };
+    const hit = hitBreakpoints();
+    const data = {
+      paused: true,
+      reason: session.state.pauseReason,
+      ...(hit.length > 0 && { hitBreakpoints: hit }),
+      callStack: await session.formatCallStack(),
+    };
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  };
+
+  // The step tools differ only in the command they send. Each waits for the pause its step causes.
+  // When no pause comes, the answer lists the possible reasons.
+  const step = async (tool: string, send: (client: CDP.Client) => Promise<unknown>) => {
+    const client = await getClient();
+    if (!client) return NOT_CONNECTED;
+    if (!(await session.attach(client))) return attachTimedOut(tool);
+    if (!session.state.paused) return toolError('Not paused. Cannot step.');
+    const landed = session.waitForNextPause(client, STEP_WAIT_TIMEOUT_MS);
+    await send(client);
+    if (await landed) return reportPause();
+    return { content: [{ type: 'text' as const, text: STEP_NOT_PAUSED }] };
   };
 
   server.registerTool(
@@ -84,10 +135,11 @@ export function registerDebuggerTools(
       inputSchema: z.object({}),
       outputSchema: z.object({
         paused: z.boolean(),
+        // Measured, Chrome 156: every breakpoint, this server's or DevTools', arrives as "other".
         reason: z
           .string()
           .optional()
-          .describe('Pause reason (e.g. "breakpoint", "exception"). Present only when paused.'),
+          .describe('Pause reason (e.g. "other" for a breakpoint, "step", "exception"). Present only when paused.'),
         hitBreakpoints: z.array(z.string()).optional().describe('IDs of breakpoints hit. Present only when paused.'),
         callStack: z
           .array(
@@ -136,9 +188,7 @@ export function registerDebuggerTools(
       const state = {
         paused: true,
         reason: session.state.pauseReason,
-        // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
-        // returned, a single id even for a file it placed in several scripts.
-        hitBreakpoints: [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))],
+        hitBreakpoints: hitBreakpoints(),
         callStack,
         ...(note && { note }),
         ...droppedPart,
@@ -560,59 +610,43 @@ export function registerDebuggerTools(
     },
   );
 
+  // CDP steps by statement, not by line, and a minified line holds many statements. Measured, Chrome
+  // 156: the one line `a(); b(); c(); const x = a(), y = b(); return x + y;` took seven steps — one per
+  // statement, one more for the second initializer, and one for the function's exit.
   server.registerTool(
     'step_over',
     {
       description:
-        'Execute the current line and pause at the next line (does not enter function calls). Returns the new call stack position.',
+        'While paused, run the current statement without stepping into the functions it calls, and pause at the ' +
+        'next statement. After an event handler or timer callback returns, the step stays in effect: it pauses at ' +
+        'the first statement of whatever script runs next, which may be unrelated code. Returns the new call ' +
+        'stack, or a note if execution has not paused again within ' +
+        `${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
       inputSchema: z.object({}),
       annotations: {
         title: 'Step over',
+        destructiveHint: false,
       },
     },
-    async () => {
-      const client = await getClient();
-      if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('step_over');
-      if (!session.state.paused) {
-        return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-      }
-      const pausePromise = session.waitForNextPause(client);
-      await client.Debugger.stepOver({});
-      const paused = await pausePromise;
-      if (!paused) {
-        return {
-          content: [{ type: 'text', text: 'Stepped over — execution did not pause again (no more breakpoints).' }],
-        };
-      }
-      return reportPause();
-    },
+    () => step('step_over', (client) => client.Debugger.stepOver({})),
   );
 
   server.registerTool(
     'step_into',
     {
-      description: 'Step into the function call on the current line. Returns the new call stack position.',
+      description:
+        'While paused, step into the function the current statement calls, or to the next statement if it calls ' +
+        'none. After an event handler or timer callback returns, the step stays in effect: it pauses at the first ' +
+        'statement of whatever script runs next, which may be unrelated code. Returns the new call stack, or a ' +
+        'note if execution has not paused again within ' +
+        `${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
       inputSchema: z.object({}),
       annotations: {
         title: 'Step into',
+        destructiveHint: false,
       },
     },
-    async () => {
-      const client = await getClient();
-      if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('step_into');
-      if (!session.state.paused) {
-        return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-      }
-      const pausePromise = session.waitForNextPause(client);
-      await client.Debugger.stepInto({});
-      const paused = await pausePromise;
-      if (!paused) {
-        return { content: [{ type: 'text', text: 'Stepped into — execution did not pause again.' }] };
-      }
-      return reportPause();
-    },
+    () => step('step_into', (client) => client.Debugger.stepInto({})),
   );
 
   server.registerTool(
@@ -676,26 +710,16 @@ export function registerDebuggerTools(
   server.registerTool(
     'step_out',
     {
-      description: 'Step out of the current function and pause at the caller. Returns the new call stack position.',
+      description:
+        'While paused, run the rest of the current function and pause in its caller. An event handler or timer ' +
+        'callback has no caller, so stepping out of one pauses in whatever script runs next. Returns the new ' +
+        `call stack, or a note if execution has not paused again within ${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
       inputSchema: z.object({}),
       annotations: {
         title: 'Step out',
+        destructiveHint: false,
       },
     },
-    async () => {
-      const client = await getClient();
-      if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('step_out');
-      if (!session.state.paused) {
-        return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-      }
-      const pausePromise = session.waitForNextPause(client);
-      await client.Debugger.stepOut();
-      const paused = await pausePromise;
-      if (!paused) {
-        return { content: [{ type: 'text', text: 'Stepped out — execution did not pause again.' }] };
-      }
-      return reportPause();
-    },
+    () => step('step_out', (client) => client.Debugger.stepOut()),
   );
 }

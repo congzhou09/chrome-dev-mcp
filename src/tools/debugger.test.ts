@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import CDP from 'chrome-remote-interface';
-import { PAGE_COMMAND_TIMEOUT_MS, PAUSE_WAIT_TIMEOUT_MS } from '../constants.js';
+import { PAGE_COMMAND_TIMEOUT_MS, PAUSE_WAIT_TIMEOUT_MS, STEP_WAIT_TIMEOUT_MS } from '../constants.js';
 import { makeMockClient, setupMcpClient, setupServer, fireCdp, inlineSourceMap } from '../test-helpers.js';
 
 describe('get_debugger_state', () => {
@@ -22,7 +22,7 @@ describe('get_debugger_state', () => {
       ([event]: [string]) => event === 'paused',
     )?.[1];
     pausedHandler?.({
-      reason: 'breakpoint',
+      reason: 'other',
       hitBreakpoints: ['b:1:0'],
       callFrames: [
         {
@@ -38,7 +38,7 @@ describe('get_debugger_state', () => {
     const parsed = JSON.parse((result.content as any)[0].text);
 
     expect(parsed.paused).toBe(true);
-    expect(parsed.reason).toBe('breakpoint');
+    expect(parsed.reason).toBe('other');
     expect(parsed.callStack[0].functionName).toBe('handleClick');
     expect(parsed.callStack[0].lineNumber).toBe(10); // converted from 0-indexed
     expect(parsed.callStack[0].columnNumber).toBe(3); // and so is the column, as set_breakpoint takes it
@@ -228,7 +228,7 @@ describe('evaluate_at_frame', () => {
       ([event]: [string]) => event === 'paused',
     )?.[1];
     pausedHandler?.({
-      reason: 'breakpoint',
+      reason: 'other',
       hitBreakpoints: ['b:1:0'],
       callFrames: [
         {
@@ -749,14 +749,14 @@ describe('pause_execution', () => {
 
   it('returns where execution already is, without pausing again', async () => {
     const { cdpClient, mcpClient } = await attached();
-    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'breakpoint', callFrames: [tick] });
+    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'other', callFrames: [tick] });
 
     const result = await mcpClient.callTool({ name: 'pause_execution', arguments: {} });
 
     expect(cdpClient.Debugger.pause).not.toHaveBeenCalled();
     expect(JSON.parse((result.content as any)[0].text)).toMatchObject({
       paused: true,
-      reason: 'breakpoint',
+      reason: 'other',
       callStack: [{ functionName: 'tick' }],
     });
   });
@@ -823,30 +823,105 @@ describe('pause_execution', () => {
   });
 });
 
-describe('step_over', () => {
-  it('returns the call stack where the step paused', async () => {
-    let cdpClient: any;
-    const stepOver = vi.fn(async () => {
-      setTimeout(() =>
-        landPause(cdpClient, {
-          reason: 'other',
-          callFrames: [{ ...tick, location: { scriptId: '1', lineNumber: 5 } }],
-        }),
-      );
-      return {};
-    });
-    cdpClient = makeMockClient(undefined, undefined, { stepOver });
+describe('stepping', () => {
+  // Attached, and paused in `tick`, where a step can start.
+  const pausedInTick = async () => {
+    const cdpClient: any = makeMockClient();
     const mcpClient = await setupMcpClient(cdpClient);
     await mcpClient.callTool({ name: 'get_debugger_state', arguments: {} });
-    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'breakpoint', callFrames: [tick] });
+    fireCdp(cdpClient, 'Debugger', 'paused', { reason: 'other', callFrames: [tick] });
+    return { cdpClient, mcpClient };
+  };
+  // Chrome answers the step command first, and the pause the step causes follows.
+  const stepPausesAt = (cdpClient: any, method: string, event: any) => {
+    cdpClient.Debugger[method] = vi.fn(async () => {
+      setTimeout(() => landPause(cdpClient, event));
+      return {};
+    });
+  };
+
+  it.each([
+    ['step_over', 'stepOver'],
+    ['step_into', 'stepInto'],
+    ['step_out', 'stepOut'],
+  ])('%s sends Debugger.%s and returns the call stack where the step paused', async (tool, method) => {
+    const { cdpClient, mcpClient } = await pausedInTick();
+    stepPausesAt(cdpClient, method, {
+      reason: 'step',
+      callFrames: [{ ...tick, location: { scriptId: '1', lineNumber: 5 } }],
+    });
+
+    const result = await mcpClient.callTool({ name: tool, arguments: {} });
+
+    expect(cdpClient.Debugger[method]).toHaveBeenCalledTimes(1);
+    expect(JSON.parse((result.content as any)[0].text)).toEqual({
+      paused: true,
+      reason: 'step',
+      callStack: [expect.objectContaining({ functionName: 'tick', lineNumber: 6 })],
+    });
+  });
+
+  // A step over a call stops at a breakpoint inside it, and Chrome gives the reason as "ambiguous".
+  it('names the breakpoint a step stopped at, by the id set_breakpoint returned', async () => {
+    const chromeId = 'br:1:1:0:http://localhost/app.js';
+    const { cdpClient, mcpClient } = await pausedInTick();
+    cdpClient.Debugger.setBreakpointByUrl = vi.fn().mockResolvedValue({ breakpointId: chromeId, locations: [] });
+    const set = await mcpClient.callTool({
+      name: 'set_breakpoint',
+      arguments: { url: 'http://localhost/app.js', lineNumber: 2 },
+    });
+    const { breakpointId } = set.structuredContent as any;
+    const callee = {
+      functionName: 'callee',
+      url: 'http://localhost/app.js',
+      location: { scriptId: '1', lineNumber: 1 },
+    };
+    stepPausesAt(cdpClient, 'stepOver', {
+      reason: 'ambiguous',
+      hitBreakpoints: [chromeId],
+      callFrames: [callee, tick],
+    });
 
     const result = await mcpClient.callTool({ name: 'step_over', arguments: {} });
 
-    expect(JSON.parse((result.content as any)[0].text)).toEqual({
-      paused: true,
-      reason: 'other',
-      callStack: [expect.objectContaining({ functionName: 'tick', lineNumber: 6 })],
+    expect(JSON.parse((result.content as any)[0].text)).toMatchObject({
+      reason: 'ambiguous',
+      hitBreakpoints: [breakpointId],
+      callStack: [{ functionName: 'callee' }, { functionName: 'tick' }],
     });
+  });
+
+  // Past the end of an event handler on an idle page, nothing runs for the step to pause at.
+  it('says why when the step has not paused again, and leaves no listener behind', async () => {
+    const { cdpClient, mcpClient } = await pausedInTick();
+    const listeners = cdpClient.listenerCount('Debugger.paused');
+
+    vi.useFakeTimers();
+    try {
+      const pending = mcpClient.callTool({ name: 'step_over', arguments: {} });
+      await vi.advanceTimersByTimeAsync(STEP_WAIT_TIMEOUT_MS + 1);
+      const result = await pending;
+
+      expect(result.isError).toBeFalsy();
+      const text = (result.content as any)[0].text;
+      expect(text).toMatch(/^The step has not paused within \d+s, but it is still in effect\./);
+      expect(text).toContain('Past the end of the code that was running');
+      expect(text).toContain('Waiting at an `await`');
+      expect(text).toContain('pause_execution pauses inside the loop');
+      expect(cdpClient.listenerCount('Debugger.paused')).toBe(listeners);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses to step when not paused, without sending the step', async () => {
+    const cdpClient: any = makeMockClient();
+    const mcpClient = await setupMcpClient(cdpClient);
+
+    const result = await mcpClient.callTool({ name: 'step_into', arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect(cdpClient.Debugger.stepInto).not.toHaveBeenCalled();
   });
 });
 

@@ -34,39 +34,69 @@ export const CONNECT_TIMEOUT_MS = 10_000;
 // having, but not at the price of a permanent deadlock.
 export const TRANSITION_WAIT_TIMEOUT_MS = 15_000;
 
-// ── evaluate_js timeouts ──────────────────────────────────────────────────────
+// ── evaluate_js bounds ────────────────────────────────────────────────────────
 //
 // An arbitrary expression can hang in two ways that need two different bounds. They cover
-// disjoint cases and neither substitutes for the other. Measured against Chrome 141:
+// disjoint cases and neither substitutes for the other:
 //
-//   expression                      renderer      Runtime.evaluate `timeout`   client-side race
-//   while (Date.now()-t < 5000) {}  WEDGED        fires, 1008ms for 1000       useless
-//   await new Promise(() => {})     idle          never fires (>6000ms)        the only bound
+//   expression                      renderer   answers a probe   what ends it
+//   while (Date.now()-t < 5000) {}  busy       no                Runtime.terminateExecution
+//   await new Promise(() => {})     idle       yes               the client-side race
 //
-// Row 2 is the case that matters, and it holds for a structural reason: `timeout` bounds
-// EXECUTION, and time suspended at an `await` is not execution. An `await sleep(800)` under
-// `timeout: 200` was not terminated — it returned its value ~1000ms later, five times over
-// its own bound. Suspended time is simply not counted, so an expression that never resumes
-// never accumulates any, and `timeout` has nothing to fire on however long we wait. The
-// client-side race is the only thing that ends that call.
+// A synchronous loop holds the renderer, which then answers no CDP command at all. The
+// client-side race in evaluate_js would hand control back to the caller without stopping the loop, 
+// and every later tool call would inherit a dead target; only terminating the loop stops it. An
+// expression suspended at an `await` holds nothing, and the client-side race in evaluate_js is
+// the only thing that ends that call.
 //
-// The reverse is just as one-sided. A synchronous loop wedges the renderer, which then
-// answers no CDP command at all — the client-side race hands control back to the caller but
-// leaves the tab spinning, and every later tool call inherits a dead target. Only `timeout`
-// actually stops it.
+// Runtime.evaluate's own `timeout` used to stop the loop. But that `timeout` is a wall clock, and it
+// keeps running while execution is paused in the debugger. Measured, Chrome 156, `timeout: 1000`
+// and a `debugger;` statement held for 2.5s: after Debugger.resume not one more statement of the
+// expression ran, and Debugger.stepOver ended the expression the same way. The first
+// evaluateOnCallFrame during that pause failed with "Execution was terminated". An agent's calls
+// are seconds apart, so every breakpoint an evaluate_js expression ran into — one in the click
+// handler that `btn.click()` calls, say — was held past the `timeout`.
+//
+// So instead of the previous approach, evaluate_js now watches the renderer itself, by sending it
+// a probe (Runtime.evaluate of `0`). Measured, Chrome 156:
+//
+//   renderer                            probe answered after
+//   paused at a breakpoint              4ms
+//   in a 2s loop, probe sent at 200ms   1791ms, once the loop ended
+//
+// An idle renderer answers at once, as a paused one does. Runtime.terminateExecution is not held
+// back by a loop: it was answered in 14–30ms, and the evaluation ended within ~40ms, with or
+// without the debugger enabled. Sent to a page with nothing running, Runtime.terminateExecution is
+// dropped: the next evaluation and an already-queued timer both ran.
 
-// Server-side: how long the expression may hold the renderer in ONE uninterrupted stretch.
+// How long the renderer may go without answering a probe before evaluate_js terminates the code
+// that holds it. Five seconds of a blocked main thread is more than any legitimate debugging
+// expression needs, and a page blocked that long is already broken. Neither a pause nor time
+// suspended at an `await` counts, since in both the renderer answers.
 //
-// Not a budget for the whole expression — the clock is per-slice, and every `await` resets
-// it. Measured: ten 700ms busy loops separated by awaits, 7177ms of real execution, ran to
-// completion under `timeout: 5000`. So what this actually catches is five continuous seconds
-// of a blocked main thread, which no legitimate debugging expression reaches and which is
-// already a broken page. Total runtime is bounded by EVAL_SETTLE_TIMEOUT_MS instead.
+// Runtime.terminateExecution stops whatever is running, and that need not be the expression. Other
+// code holds the renderer just the same in three cases: a loop in the page's own code that was
+// already running when the call began; one that started while the expression waited at an
+// `await`; or a loop in an expression that an earlier call left running, for example one that
+// paused and was then resumed. Measured, Chrome 156, each case: the call terminated the loop and
+// returned its own result, 6–7s after the call began.
 export const EVAL_EXECUTION_TIMEOUT_MS = 5000;
 
-// Client-side: the wall-clock bound on the whole call, covering an expression suspended on a
-// promise that never settles — and a context destroyed mid-evaluate by a navigation, which
-// drops the command without ever answering it.
+// Gap between probes while an expression runs. The first probe goes out only this long after the
+// expression, so an expression that finishes sooner — nearly all of them — costs no probe at all.
+export const EVAL_PROBE_INTERVAL_MS = 1000;
+
+// How long to wait for a terminated expression to end; measured above at ~40ms. A page showing a
+// modal dialog answers neither the probe nor Runtime.terminateExecution. Measured, Chrome 156: an
+// expression that called alert() went on to finish normally once the dialog was closed, with the
+// Runtime.terminateExecution sent during the dialog having no effect. So an expression that has
+// not ended by this bound is reported as held by a dialog, not as terminated.
+export const EVAL_TERMINATE_WAIT_MS = 2000;
+
+// Client-side: the wall-clock bound on the whole call. It covers three cases: an expression
+// suspended on a promise that never settles; a context destroyed mid-evaluate by a navigation,
+// which drops the command without ever answering it; and a pause the call cannot hear about,
+// because this server's Debugger is not enabled (a breakpoint set in DevTools, say).
 //
 // Sized for what top-level `await` invites people to write: awaiting a slow fetch, an
 // animation, a poll for an element. 30s matches the de-facto convention for browser
@@ -77,9 +107,9 @@ export const EVAL_EXECUTION_TIMEOUT_MS = 5000;
 // and ours names the cause while the client's only says the call took too long.
 export const EVAL_SETTLE_TIMEOUT_MS = 30_000;
 
-// Bound on the optional deep-value upgrade in remote-object.ts, which runs AFTER the two
-// above have already been satisfied — so it has to be small enough that the two cannot add
-// up past the MCP client's 60s. 30 + 5 leaves real headroom.
+// Bound on the optional deep-value upgrade in remote-object.ts, which runs AFTER the evaluation
+// has settled within EVAL_SETTLE_TIMEOUT_MS — so it has to be small enough that the two cannot
+// add up past the MCP client's 60s. 30 + 5 leaves real headroom.
 //
 // Generous against measured cost: an array of 500,000 small objects deep-serialises in
 // 1631ms (10,000 -> 35ms, 100,000 -> 355ms), so 5s covers anything a person would sit and

@@ -43,6 +43,7 @@ export function makeMockClient(
       getProperties: vi.fn(),
       callFunctionOn: vi.fn().mockResolvedValue({ result: { type: 'object', value: {} } }),
       releaseObject: vi.fn().mockResolvedValue({}),
+      terminateExecution: vi.fn().mockResolvedValue({}),
       ...runtimeMethods,
     },
     Page: {

@@ -32,7 +32,7 @@ export function createServer(
   });
 
   registerTabTools(server, { switchToTarget, getCurrentTargetId, session });
-  registerPageTools(server, getClient);
+  registerPageTools(server, getClient, session);
   registerNavigationTools(server, getClient, session);
   registerDebuggerTools(server, getClient, session);
   registerConsoleTools(server, getClient, session);

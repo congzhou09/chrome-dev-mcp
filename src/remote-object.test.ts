@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { makeMockClient, setupMcpClient } from './test-helpers.js';
-import { EVAL_DEEP_VALUE_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS } from './constants.js';
+import { fireCdp, makeMockClient, setupMcpClient } from './test-helpers.js';
+import {
+  EVAL_DEEP_VALUE_TIMEOUT_MS,
+  EVAL_EXECUTION_TIMEOUT_MS,
+  EVAL_PROBE_INTERVAL_MS,
+  EVAL_SETTLE_TIMEOUT_MS,
+  EVAL_TERMINATE_WAIT_MS,
+} from './constants.js';
 
 describe('evaluate_js', () => {
   // Mock shapes below are copied from real Chrome responses, not invented: preview mode is
@@ -10,27 +16,35 @@ describe('evaluate_js', () => {
     returnByValue: false,
     generatePreview: true,
     replMode: true,
-    timeout: EVAL_EXECUTION_TIMEOUT_MS,
   };
 
-  // An evaluate that hangs until the test rejects it, so a rejection can be placed on
-  // either side of Chrome's execution deadline. `called` fires when the handler actually
-  // reached Runtime.evaluate — the in-memory transport round trip is more than one microtask.
-  const pendingEvaluate = () => {
+  // The caller's expression never answers on its own; the test settles it when it chooses.
+  // `called` fires when the handler actually reached Runtime.evaluate — the in-memory transport
+  // round trip is more than one microtask. The renderer's answer to a probe is up to the test:
+  // `probesAnswered: false` is a renderer held by a synchronous loop.
+  const pendingEvaluate = ({ probesAnswered = true } = {}) => {
+    let resolve!: (value: unknown) => void;
     let reject!: (err: unknown) => void;
     let onCalled!: () => void;
     const called = new Promise<void>((res) => (onCalled = res));
-    const evaluate = vi.fn(
-      () =>
-        new Promise((_, rej) => {
-          reject = rej;
-          onCalled();
-        }),
-    );
+    const evaluate = vi.fn((args: any) => {
+      if (args.disableBreaks) return probesAnswered ? Promise.resolve({ result: { value: 0 } }) : new Promise(() => {});
+      return new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+        onCalled();
+      });
+    });
+    const resolveWith = (value: unknown) => resolve(value);
     const rejectWith = (response: { code: number; message: string }) =>
       reject(Object.assign(new Error(response.message), { response }));
-    return { evaluate, called, rejectWith };
+    const expressionCalls = () => evaluate.mock.calls.filter(([args]) => !args.disableBreaks);
+    return { evaluate, called, resolveWith, rejectWith, expressionCalls };
   };
+
+  // Time for the watch on the renderer to give up on it: the first probe goes out after one
+  // interval, and goes unanswered for EVAL_EXECUTION_TIMEOUT_MS.
+  const UNTIL_TERMINATED = EVAL_PROBE_INTERVAL_MS + EVAL_EXECUTION_TIMEOUT_MS;
 
   it('evaluates once, in preview mode', async () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { type: 'number', value: 42, description: '42' } });
@@ -60,57 +74,177 @@ describe('evaluate_js', () => {
     expect(args).not.toHaveProperty('awaitPromise');
   });
 
-  // Chrome's own `timeout` is the ONLY thing that stops runaway synchronous code: the renderer
-  // is wedged and answers nothing, so a client-side race would hand back control while leaving
-  // the tab spinning for every later call.
-  it("bounds renderer execution with Chrome's own timeout", async () => {
+  // Chrome's `timeout` keeps counting while execution is paused, and once it has run out the next
+  // resume or step ends the expression instead of running the rest of it.
+  it('passes no `timeout`, which would end an expression held at a breakpoint', async () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { type: 'number', value: 1 } });
     const client = await setupMcpClient(makeMockClient(evaluate));
 
     await client.callTool({ name: 'evaluate_js', arguments: { expression: '1' } });
 
-    expect(evaluate.mock.calls[0][0].timeout).toBe(EVAL_EXECUTION_TIMEOUT_MS);
+    expect(evaluate.mock.calls[0][0]).not.toHaveProperty('timeout');
   });
 
-  // A `timeout` kill arrives as a rejected command, not as exceptionDetails, so it would
-  // otherwise escape the handler entirely.
-  it('reports a terminated expression rather than throwing: -32000 Execution was terminated', async () => {
-    const response = { code: -32000, message: 'Execution was terminated' };
-    const evaluate = vi.fn().mockRejectedValue(Object.assign(new Error(response.message), { response }));
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: 'while(true){}' } });
-
-    expect(result.isError).toBe(true);
-    expect((result.content as any)[0].text).toContain(`terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms`);
-  });
-
-  // Under replMode the kill degrades to a bare -32603 "Internal error", which is the mode
-  // this tool ships. The rejection has to be delayed past the deadline to be a real kill:
-  // Chrome starts its `timeout` clock on receipt, so it cannot fire any earlier than this.
-  it('reports a terminated expression rather than throwing: -32603 Internal error at the deadline', async () => {
-    const { evaluate, called, rejectWith } = pendingEvaluate();
-    const client = await setupMcpClient(makeMockClient(evaluate as any));
+  // A renderer held by synchronous code answers nothing, so a client-side race alone would hand
+  // back control while leaving the tab spinning for every later call. The termination arrives as
+  // a rejected command, not as exceptionDetails, in either code depending on replMode.
+  it.each([
+    { code: -32603, message: 'Internal error' },
+    { code: -32000, message: 'Execution was terminated' },
+  ])('terminates an expression whose renderer stops answering ($code)', async (response) => {
+    const { evaluate, called, rejectWith } = pendingEvaluate({ probesAnswered: false });
+    const terminateExecution = vi.fn().mockResolvedValue({});
+    const client = await setupMcpClient(
+      makeMockClient(evaluate as any, undefined, undefined, undefined, { terminateExecution }),
+    );
 
     vi.useFakeTimers();
     try {
       const call = client.callTool({ name: 'evaluate_js', arguments: { expression: 'while(true){}' } });
       await called;
-      await vi.advanceTimersByTimeAsync(EVAL_EXECUTION_TIMEOUT_MS);
-      rejectWith({ code: -32603, message: 'Internal error' });
+      await vi.advanceTimersByTimeAsync(UNTIL_TERMINATED - 1);
+      expect(terminateExecution).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(terminateExecution).toHaveBeenCalled();
+      rejectWith(response);
       const result = await call;
 
       expect(result.isError).toBe(true);
-      expect((result.content as any)[0].text).toContain(`terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms`);
+      expect((result.content as any)[0].text).toContain(
+        `terminated after the page had not responded for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s`,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A terminated expression cannot finish. When the expression still finishes after the
+  // termination, other code most likely held the renderer: the page's own code, or an expression
+  // an earlier call left running. The result is the expression's own, with a note beside it.
+  it.each([
+    {
+      kind: 'a value',
+      answer: { result: { type: 'number', value: 2, description: '2' } },
+      first: '2',
+      isError: false,
+    },
+    {
+      kind: 'an exception',
+      answer: {
+        result: { type: 'object', subtype: 'error' },
+        exceptionDetails: { text: 'Uncaught', exception: { description: 'ReferenceError: x is not defined' } },
+      },
+      first: 'Error: ReferenceError: x is not defined',
+      isError: true,
+    },
+  ])('notes the termination when the expression still finishes with $kind', async ({ answer, first, isError }) => {
+    const { evaluate, called, resolveWith } = pendingEvaluate({ probesAnswered: false });
+    const terminateExecution = vi.fn().mockResolvedValue({});
+    const client = await setupMcpClient(
+      makeMockClient(evaluate as any, undefined, undefined, undefined, { terminateExecution }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const call = client.callTool({ name: 'evaluate_js', arguments: { expression: '1 + 1' } });
+      await called;
+      await vi.advanceTimersByTimeAsync(UNTIL_TERMINATED);
+      expect(terminateExecution).toHaveBeenCalled();
+      resolveWith(answer);
+      const result = await call;
+
+      expect(!!result.isError).toBe(isError);
+      const [value, note] = result.content as any[];
+      expect(value.text).toBe(first);
+      expect(note.text).toContain(`did not respond for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s`);
+      expect(note.text).toContain('most likely other code');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A page showing alert() answers neither the probe nor Runtime.terminateExecution, and the
+  // expression goes on once the dialog is closed — so it must not be reported as terminated.
+  it('reports a page that does not stop when terminated as possibly showing a dialog', async () => {
+    const { evaluate, called } = pendingEvaluate({ probesAnswered: false });
+    const terminateExecution = vi.fn(() => new Promise(() => {}));
+    const client = await setupMcpClient(
+      makeMockClient(evaluate as any, undefined, undefined, undefined, { terminateExecution }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const call = client.callTool({ name: 'evaluate_js', arguments: { expression: "alert('x')" } });
+      await called;
+      await vi.advanceTimersByTimeAsync(UNTIL_TERMINATED + EVAL_TERMINATE_WAIT_MS + 1);
+      const result = await call;
+
+      expect(result.isError).toBe(true);
+      const text = (result.content as any)[0].text;
+      expect(text).toContain('modal dialog');
+      expect(text).not.toContain('terminated after');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A breakpoint in code the expression runs holds the expression until execution resumes. The
+  // call answers at once with where it stopped, rather than waiting out EVAL_SETTLE_TIMEOUT_MS.
+  it('returns at once, with the position, when execution pauses before the expression finishes', async () => {
+    const { evaluate, called } = pendingEvaluate();
+    const cdpClient = makeMockClient(evaluate as any);
+    const client = await setupMcpClient(cdpClient);
+    // The pause is only heard with this server's Debugger enabled, so attach it as a debugger tool would.
+    await client.callTool({ name: 'get_debugger_state', arguments: {} });
+    fireCdp(cdpClient, 'Debugger', 'scriptParsed', { scriptId: '9', url: 'http://localhost/app.js' });
+    const listenersBefore = (cdpClient as any).listeners('Debugger.paused');
+
+    const call = client.callTool({ name: 'evaluate_js', arguments: { expression: 'btn.click()' } });
+    await called;
+    (cdpClient as any).emit('Debugger.paused', {
+      reason: 'other',
+      callFrames: [{ functionName: 'onClick', location: { scriptId: '9', lineNumber: 4, columnNumber: 2 } }],
+    });
+    const result = await call;
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content as any)[0].text;
+    expect(text).toContain('Execution paused (reason: other) in onClick at http://localhost/app.js:5:3.');
+    expect(text).toContain('its result will not be returned');
+    // Once this call has returned, it no longer terminates a loop in the expression.
+    expect(text).toContain('pause_execution pauses inside such a loop');
+    // The pause also fired attach's one-time listener, so compare members rather than a count.
+    for (const listener of (cdpClient as any).listeners('Debugger.paused')) expect(listenersBefore).toContain(listener);
+  });
+
+  // A paused renderer answers the probe, so a long pause is never mistaken for a loop.
+  it('does not terminate an expression while its renderer answers', async () => {
+    const { evaluate, called } = pendingEvaluate();
+    const terminateExecution = vi.fn().mockResolvedValue({});
+    const client = await setupMcpClient(
+      makeMockClient(evaluate as any, undefined, undefined, undefined, { terminateExecution }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const call = client.callTool({ name: 'evaluate_js', arguments: { expression: 'await new Promise(() => {})' } });
+      await called;
+      await vi.advanceTimersByTimeAsync(EVAL_SETTLE_TIMEOUT_MS + 1);
+      const result = await call;
+
+      expect(terminateExecution).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect((result.content as any)[0].text).toContain(`did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms`);
     } finally {
       vi.useRealTimers();
     }
   });
 
   // -32603 is JSON-RPC's generic "Internal error", shared by every internal failure in the
-  // protocol. One that arrives before the deadline is somebody else's fault, and answering it
-  // with the timeout sentence would be a confident lie that also loses the real error.
-  it('does not disguise an early -32603 as a timeout', async () => {
+  // protocol. One that arrives without this server having terminated anything is somebody
+  // else's fault, and answering it with the termination sentence would be a confident lie that
+  // also loses the real error.
+  it('does not disguise an early -32603 as a termination', async () => {
     const { evaluate, called, rejectWith } = pendingEvaluate();
     const client = await setupMcpClient(makeMockClient(evaluate as any));
 
@@ -124,31 +258,8 @@ describe('evaluate_js', () => {
     expect((result.content as any)[0].text).toContain('Session with given id not found');
   });
 
-  // `timeout` does not count time suspended at an `await`, so a promise that never settles
-  // leaves the command pending forever with the renderer perfectly healthy. Only the
-  // client-side race bounds that one.
-  it("reports an expression that never settles, which Chrome's timeout does not cover", async () => {
-    const evaluate = vi.fn().mockReturnValue(new Promise(() => {}));
-    const client = await setupMcpClient(makeMockClient(evaluate));
-
-    vi.useFakeTimers();
-    try {
-      const pending = client.callTool({
-        name: 'evaluate_js',
-        arguments: { expression: 'await new Promise(() => {})' },
-      });
-      await vi.advanceTimersByTimeAsync(EVAL_SETTLE_TIMEOUT_MS + 1);
-      const result = await pending;
-
-      expect(result.isError).toBe(true);
-      expect((result.content as any)[0].text).toContain(`did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms`);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  // Recognising the timeout codes must not turn into swallowing every CDP failure.
-  it('does not disguise an unrelated CDP failure as a timeout', async () => {
+  // Recognising the termination codes must not turn into swallowing every CDP failure.
+  it('does not disguise an unrelated CDP failure as a termination', async () => {
     const response = { code: -32001, message: 'Cannot find context with specified id' };
     const evaluate = vi.fn().mockRejectedValue(Object.assign(new Error(response.message), { response }));
     const client = await setupMcpClient(makeMockClient(evaluate));

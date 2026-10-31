@@ -283,12 +283,12 @@ export const rendererTimedOut = (
 // rendererTimedOut for the debugger/console attach. A breakpoint is not among the causes there:
 // a paused renderer answers both enables straight away (measured at InspectorSession.attach).
 //
-// The retry advice holds for every caller: most never ran their operation, and switch_tab, which
-// already switched, finds itself on that tab and does nothing more.
+// The retry advice holds for every caller: most never ran their operation, and switch_tab has
+// already switched, so a retry of switch_tab is already on that tab and does nothing more.
 export const attachTimedOut = (what: string) => {
   const result = rendererTimedOut(what, 'blocked in a synchronous loop, or blocked on a modal dialog');
   result.content[0].text +=
-    ' Retry once the page responds again (the loop ends or the dialog is closed): the attach was not cancelled, and will have finished by then.';
+    ' Retry once the page responds again (the loop ends or the dialog is closed).';
   return result;
 };
 

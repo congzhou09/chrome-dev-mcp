@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import CDP from 'chrome-remote-interface';
 import { makeMockClient, setupMcpClient } from '../test-helpers.js';
 import { probeVisible } from '../targets.js';
@@ -118,7 +118,12 @@ describe('list_tabs', () => {
 });
 
 describe('switch_tab', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('calls switchToTarget and returns new tab info', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
     const newClient = makeMockClient(
       vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
     );
@@ -132,12 +137,44 @@ describe('switch_tab', () => {
     expect(result.structuredContent).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/' });
   });
 
-  it('returns error message when target is not found', async () => {
-    const switchToTarget = vi.fn().mockResolvedValue(null);
-    const mcpClient = await setupMcpClient(null, switchToTarget);
+  it('refuses a targetId Chrome does not list, and keeps the current connection', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    const switchToTarget = vi.fn();
+    const mcpClient = await setupMcpClient(null, switchToTarget, () => 'tab-1');
 
     const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'nonexistent' } });
 
-    expect((result.content as any)[0].text).toMatch(/Failed to connect/);
+    // switchToTarget closes the current connection before it connects, so it must not be reached.
+    expect(switchToTarget).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    const text = (result.content as any)[0].text;
+    expect(text).toMatch(/^No tab nonexistent: it is not among the tabs list_tabs reports/);
+    expect(text).toMatch(/still connected to tab tab-1/);
+  });
+
+  it('says no tab is connected when the connect fails after the previous connection was closed', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    const switchToTarget = vi.fn().mockResolvedValue(null);
+    const mcpClient = await setupMcpClient(null, switchToTarget, () => 'tab-1');
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-2' } });
+
+    expect(switchToTarget).toHaveBeenCalledWith('tab-2');
+    expect(result.isError).toBe(true);
+    const text = (result.content as any)[0].text;
+    expect(text).toMatch(/^Failed to connect to tab tab-2\./);
+    expect(text).toMatch(/connection to tab tab-1 was closed before this attempt, so no tab is connected now/);
+  });
+
+  it('returns not-connected when Chrome is unavailable, without switching', async () => {
+    vi.spyOn(CDP, 'List' as any).mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const switchToTarget = vi.fn();
+    const mcpClient = await setupMcpClient(null, switchToTarget);
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
+
+    expect(switchToTarget).not.toHaveBeenCalled();
+    expect((result.content as any)[0].text).toMatch(/Chrome is not connected/);
+    expect(result.isError).toBe(true);
   });
 });

@@ -172,7 +172,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 | Tool         | Description                                                                                                                                 |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list_tabs`  | List all open Chrome page tabs as `[{ targetId, title, url, active?, connected }]` — `active` marks a tab showing on screen (one per visible window; absent if the tab did not answer), `connected` the tab this server acts on |
-| `switch_tab` | Switch the MCP connection to a specific tab by `targetId` (obtained from `list_tabs`)                                                       |
+| `switch_tab` | Connect this server to another tab by `targetId` (from `list_tabs`), without bringing it to the front. Breakpoints and the console and network buffers start over on the new tab |
 
 ### Page inspection
 

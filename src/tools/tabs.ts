@@ -2,6 +2,7 @@ import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
+  CONNECT_TIMEOUT_MS,
   NOT_CONNECTED,
   OWN_EXPRESSION,
   PAGE_COMMAND_TIMEOUT_MS,
@@ -11,6 +12,8 @@ import {
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import { type PageTarget, listPageTargets, probeVisible } from '../targets.js';
 import type { InspectorSession } from '../inspector-session.js';
+
+const toolError = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true });
 
 // ── Tab management tools ──────────────────────────────────────────────────────
 
@@ -78,7 +81,10 @@ export function registerTabTools(
     'switch_tab',
     {
       description:
-        'Switch the MCP connection to a specific Chrome tab. Use list_tabs first to get available targetIds.',
+        'Connect this server to another Chrome tab, without bringing it to the front. ' +
+        'Breakpoints this server set in the previous tab are removed. ' +
+        'A pause there ends, unless DevTools is open on that tab. ' +
+        'The console and network buffers are emptied and refilled from the new tab.',
       inputSchema: z.object({
         targetId: z.string().describe('Target ID from list_tabs'),
       }),
@@ -92,14 +98,45 @@ export function registerTabTools(
       },
     },
     async ({ targetId }) => {
+      // switchToTarget closes the current connection before it opens the new one. So when it cannot
+      // connect to `targetId`, no tab is connected afterwards, and the next tool call that acts on a
+      // page connects to the tab index.ts picks: one that answers, preferring one showing on
+      // screen. The usual such id is one Chrome does not list, because it was mistyped or its tab
+      // has closed since list_tabs. Looking the id up first keeps the current connection in that
+      // case. Measured, Chrome 155: connecting to an unlisted id fails in 18ms, with "Cannot read
+      // properties of undefined (reading 'webSocketDebuggerUrl')", which says nothing about the
+      // id. The same lookup refuses a DevTools window: Chrome lists it as a page, and list_tabs
+      // leaves it out.
+      let pages: PageTarget[];
+      try {
+        pages = await listPageTargets();
+      } catch {
+        return NOT_CONNECTED;
+      }
+      const previous = getCurrentTargetId();
+      if (!pages.some((t) => t.id === targetId)) {
+        return toolError(
+          `No tab ${targetId}: it is not among the tabs list_tabs reports. ` +
+            (previous ? `Nothing was switched or dropped: this server is still connected to tab ${previous}. ` : '') +
+            'Call list_tabs for the targetIds of the open tabs.',
+        );
+      }
+
       const client = await switchToTarget(targetId);
       if (!client) {
-        return {
-          content: [
-            { type: 'text', text: `Failed to connect to tab ${targetId}. Use list_tabs to check available targets.` },
-          ],
-          isError: true,
-        };
+        // The tab was listed a moment ago. So either it has closed since, or its renderer did not
+        // answer the enables that connectToTarget (index.ts) sends. switchToTarget learns of either
+        // only after it has closed the previous connection.
+        return toolError(
+          `Failed to connect to tab ${targetId}. Either it was closed, or it did not answer within ` +
+            `${CONNECT_TIMEOUT_MS / 1000}s: a tab blocked in a synchronous loop or on a modal dialog does not answer. ` +
+            (previous
+              ? `The connection to tab ${previous} was closed before this attempt, so no tab is connected now. `
+              : 'No tab is connected now. ') +
+            'The next tool call that acts on a page will automatically connect to a tab that answers, preferring one showing on screen. ' +
+            'Call list_tabs, then switch_tab to the tab you want. ' +
+            'If the tab is blocked, retry switch_tab once its loop ends or its dialog is closed in Chrome.',
+        );
       }
 
       // The attach and the title read are both bounded: reporting the switch is not worth parking

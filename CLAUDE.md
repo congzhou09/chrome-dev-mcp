@@ -8,6 +8,7 @@
 
 - This MCP server is generic: do not design tools or write docs around any one client, Claude Code included.
 - Only a tool's name, description and inputSchema are certain to reach the model. Whether `outputSchema` and `annotations` do is up to the client (Claude Code drops them), so anything a caller needs to read a result correctly must not live only there.
+- A tool description says only what the caller cannot learn elsewhere: not what its inputSchema says, nor what another tool's description already says, unless a caller would otherwise misread a result or pick the wrong tool. Many clients send every description with every request.
 
 # Temporary Docs
 

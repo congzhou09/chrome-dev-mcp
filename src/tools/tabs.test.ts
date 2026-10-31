@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import CDP from 'chrome-remote-interface';
-import { makeMockClient, setupMcpClient } from '../test-helpers.js';
+import { fireCdp, makeMockClient, setupMcpClient } from '../test-helpers.js';
 import { probeVisible } from '../targets.js';
 
 // The probe opens a real connection per tab; listing stays real so CDP.List can be stubbed.
@@ -135,6 +135,31 @@ describe('switch_tab', () => {
     expect(switchToTarget).toHaveBeenCalledWith('tab-1');
     expect((result.content as any)[0].text).toBe('Switched to: My App — http://localhost:3000/');
     expect(result.structuredContent).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/' });
+  });
+
+  it('says so when the tab switched to is already paused', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    const paused = { reason: 'other', callFrames: [] };
+    const newClient = makeMockClient(
+      vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
+      vi.fn(),
+      {
+        // As Chrome does on a tab already paused: Debugger.enable reports the pause at once.
+        enable: vi.fn().mockImplementation(async () => {
+          fireCdp(newClient, 'Debugger', 'paused', paused);
+          (newClient as any).emit('Debugger.paused', paused);
+          return {};
+        }),
+      },
+    );
+    const mcpClient = await setupMcpClient(null, vi.fn().mockResolvedValue(newClient));
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
+
+    expect((result.content as any)[0].text).toBe(
+      'Switched to: My App — http://localhost:3000/\n' +
+        'Execution in this tab is paused (reason: other). get_debugger_state shows where.',
+    );
   });
 
   it('refuses a targetId Chrome does not list, and keeps the current connection', async () => {

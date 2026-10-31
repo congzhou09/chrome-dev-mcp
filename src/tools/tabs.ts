@@ -155,8 +155,12 @@ export function registerTabTools(
       );
       if (result === TIMED_OUT) return rendererTimedOut(`switch_tab (connected to ${targetId}, but reading its title)`);
       const { title, url } = result.result.value as { title: string; url: string };
+      // A pause already in place is known by now: Debugger.enable reports it at once (2ms, Chrome 155).
+      const paused = session.state.paused
+        ? `\nExecution in this tab is paused (reason: ${session.state.pauseReason}). get_debugger_state shows where.`
+        : '';
       return {
-        content: [{ type: 'text', text: `Switched to: ${title} — ${url}` }],
+        content: [{ type: 'text', text: `Switched to: ${title} — ${url}${paused}` }],
         structuredContent: { targetId, title, url },
       };
     },

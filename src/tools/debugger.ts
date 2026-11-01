@@ -125,8 +125,18 @@ export function registerDebuggerTools(
   server.registerTool(
     'get_debugger_state',
     {
+      // Measured, Chrome 156, with a second CDP session standing in for DevTools. This server was
+      // sent Debugger.paused for each cause tried: a breakpoint DevTools set, a `debugger`
+      // statement, DevTools' pause button, and pause on exceptions turned on by DevTools. A pause
+      // already in place was reported by this server's Debugger.enable, in 1ms. Each session's
+      // hitBreakpoints lists only the breakpoints that session set: at a breakpoint DevTools set,
+      // this server's list was empty and the pause reason was "other", as at a `debugger` statement.
       description:
-        'Get current debugger state: whether execution is paused, the pause reason, hit breakpoints, and the full call stack with file/line info.',
+        'Get the debugger state: whether execution is paused, the pause reason, hit breakpoints and the full call ' +
+        'stack. A pause is reported whatever caused it. `hitBreakpoints` lists only breakpoints set through this ' +
+        'server, so it is empty at a breakpoint set in DevTools. Positions are 1-based, and source-mapped where the ' +
+        'script has a source map. A source-mapped frame also gives `compiledUrl`/`compiledLine`/`compiledColumn`, ' +
+        'its position in the loaded script.',
       inputSchema: z.object({}),
       outputSchema: z.object({
         paused: z.boolean(),

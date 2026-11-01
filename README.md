@@ -206,7 +206,7 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 | Tool                  | Description                                                                                                         |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line (map to source code if possible) |
+| `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line, source-mapped when possible (with the position in the loaded script alongside) |
 | `get_scope_variables` | Variable values inside a call frame scope (`local`, `closure`, `block`, `global`, …)                                |
 | `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — reads local variables, closures, and `this`. Errors out when not paused rather than falling back to global scope       |
 | `set_breakpoint`      | Set a breakpoint by source file + line (mapped through source maps), or by script URL / regex; supports conditions  |

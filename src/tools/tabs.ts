@@ -6,7 +6,6 @@ import {
   NOT_CONNECTED,
   OWN_EXPRESSION,
   PAGE_COMMAND_TIMEOUT_MS,
-  attachTimedOut,
   rendererTimedOut,
 } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
@@ -143,7 +142,7 @@ export function registerTabTools(
       // the call. A fresh connect has just proved the target answers, so a hang here usually means
       // it wedged in between; staying on the current tab proves nothing, and it may already be stuck.
       if (!(await session.attach(client))) {
-        return attachTimedOut(`switch_tab (connected to ${targetId}, but still attaching to it)`);
+        return rendererTimedOut(`switch_tab (connected to ${targetId}, but still attaching to it)`);
       }
       const result = await withTimeout(
         client.Runtime.evaluate({

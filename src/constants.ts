@@ -178,6 +178,12 @@ export const SCREENSHOT_TIMEOUT_MS = 10_000;
 // compositor, so they do not share the frame-production stall `Page.captureScreenshot` has
 // to defend against.
 //
+// A pause at a breakpoint is not among the causes of a timeout here: a paused renderer answers
+// both at once. Measured, Chrome 156, a background tab stopped at a `debugger` statement: both
+// answered in 1–6ms over three connections — the one holding the pause, one connected before
+// it, and one connected during it. Sent 200ms into a 3000ms synchronous loop, both were
+// answered 2789ms later, once the loop ended.
+//
 // Short, and non-fatal on expiry: sizing is best-effort, capturing is the job. A timeout
 // here falls through to a native capture rather than failing the tool, so the whole cost of
 // this bound being too tight is a screenshot larger than the caller asked for.
@@ -264,33 +270,35 @@ export const OWN_EXPRESSION = { disableBreaks: true } as const;
 
 // The answer to a CDP round-trip that outlived its bound. Deliberately a normal tool error
 // rather than a thrown one: "this renderer never answered" is a state the caller can act on
-// (resume the debugger, dismiss the dialog, reload the tab), not a fault in this server.
+// (wait for the loop to end, dismiss the dialog, reload the tab), not a fault in this server.
+//
+// The defaults fit a call that enables a domain, or that evaluates an expression this server
+// wrote. A breakpoint is not among the causes for such a call: a paused renderer answers it at
+// once (measured at the top of this file, and at InspectorSession.attach). Once the loop ends or
+// the dialog is closed, a retry of such a call succeeds, for one of two reasons:
+// - The call has only read the page, or has not run its operation yet.
+// - switch_tab is the one call that has acted by then: it is connected to the new tab. A retry of
+//   switch_tab is already on that tab, and only reports the switch.
+//
+// A call with other causes passes its own, along with its own advice, or `advice: ''` for none.
 export const rendererTimedOut = (
   what: string,
-  causes = 'paused at a breakpoint, blocked in a synchronous loop, or blocked on a modal dialog',
+  {
+    causes = 'blocked in a synchronous loop, or blocked on a modal dialog',
+    advice = 'Retry once the page responds again (the loop ends or the dialog is closed).',
+  }: { causes?: string; advice?: string } = {},
 ) => ({
   content: [
     {
       type: 'text' as const,
       text:
         `Error: ${what} did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms. ` +
-        `The tab's renderer is not responding — it may be ${causes}.`,
+        `The tab's renderer is not responding — it may be ${causes}.` +
+        (advice && ` ${advice}`),
     },
   ],
   isError: true,
 });
-
-// rendererTimedOut for the debugger/console attach. A breakpoint is not among the causes there:
-// a paused renderer answers both enables straight away (measured at InspectorSession.attach).
-//
-// The retry advice holds for every caller: most never ran their operation, and switch_tab has
-// already switched, so a retry of switch_tab is already on that tab and does nothing more.
-export const attachTimedOut = (what: string) => {
-  const result = rendererTimedOut(what, 'blocked in a synchronous loop, or blocked on a modal dialog');
-  result.content[0].text +=
-    ' Retry once the page responds again (the loop ends or the dialog is closed).';
-  return result;
-};
 
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused

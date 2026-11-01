@@ -700,8 +700,8 @@ export function registerPageTools(
             // for all of them.
             const why =
               probed === TIMED_OUT
-                ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be paused at a ` +
-                  'breakpoint, blocked in a synchronous loop, or blocked on a modal dialog'
+                ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be ` +
+                  'blocked in a synchronous loop, or blocked on a modal dialog'
                 : metricsError
                   ? `Page.getLayoutMetrics failed: ${metricsError}`
                   : 'Page.getLayoutMetrics answered without a usable layout viewport, which a tab reports when ' +

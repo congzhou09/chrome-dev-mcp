@@ -6,7 +6,6 @@ import {
   PAGE_COMMAND_TIMEOUT_MS,
   PAUSE_WAIT_TIMEOUT_MS,
   STEP_WAIT_TIMEOUT_MS,
-  attachTimedOut,
   rendererTimedOut,
 } from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
@@ -44,24 +43,20 @@ const sourceNotPlaced = (source: string, line: number, lookup: Extract<SourceLoo
   );
 };
 
-// attachTimedOut advises a retry once the page responds, which is no help to a pause: by then the
-// loop is over, and a loop that never ends leaves the page unresponsive until the tab is reloaded
-// or reopened. Only a debugger enabled before a loop began can stop it — Debugger.enable sent
-// during one is not answered until it ends (see InspectorSession.attach), and Debugger.pause is
-// refused without it ("Debugger agent is not enabled"). Hence the advice: a debugger tool call,
+// By default, rendererTimedOut advises a retry once the page responds, which is no help to a pause:
+// by then the loop is over, and a loop that never ends leaves the page unresponsive until the tab
+// is reloaded or reopened. Only a debugger enabled before a loop began can stop it — Debugger.enable
+// sent during one is not answered until it ends (see InspectorSession.attach), and Debugger.pause
+// is refused without it ("Debugger agent is not enabled"). Hence the advice: a debugger tool call,
 // which attaches or finds the attach done, then the hang. Measured, Chrome 156: with the debugger
 // already enabled, a pause sent into a 3s loop was answered in 3ms and landed in 6ms.
-const pauseAttachTimedOut = () => {
-  const result = rendererTimedOut(
-    'pause_execution (attaching the debugger)',
-    'blocked in a synchronous loop, or blocked on a modal dialog',
-  );
-  result.content[0].text +=
-    ' A loop can be paused only by a debugger attached before it started. Once the page responds again — for a ' +
-    'loop that never ends, once the tab has been reloaded or reopened — call any debugger tool, such as ' +
-    'get_debugger_state, before reproducing the hang; pause_execution can then stop it.';
-  return result;
-};
+const pauseAttachTimedOut = () =>
+  rendererTimedOut('pause_execution (attaching the debugger)', {
+    advice:
+      'A loop can be paused only by a debugger attached before it started. Once the page responds again — for a ' +
+      'loop that never ends, once the tab has been reloaded or reopened — call any debugger tool, such as ' +
+      'get_debugger_state, before reproducing the hang; pause_execution can then stop it.',
+  });
 
 // A step tool's answer when its step has not paused within STEP_WAIT_TIMEOUT_MS. Not an error: the
 // step is still in effect. Measured, Chrome 156, one case at a time:
@@ -119,7 +114,7 @@ export function registerDebuggerTools(
   const step = async (tool: string, send: (client: CDP.Client) => Promise<unknown>) => {
     const client = await getClient();
     if (!client) return NOT_CONNECTED;
-    if (!(await session.attach(client))) return attachTimedOut(tool);
+    if (!(await session.attach(client))) return rendererTimedOut(tool);
     if (!session.state.paused) return toolError('Not paused. Cannot step.');
     const landed = session.waitForNextPause(client, STEP_WAIT_TIMEOUT_MS);
     await send(client);
@@ -168,7 +163,7 @@ export function registerDebuggerTools(
     async () => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('get_debugger_state');
+      if (!(await session.attach(client))) return rendererTimedOut('get_debugger_state');
 
       // A hot update applies without any navigation, so this is where a breakpoint it dropped
       // is most likely to be noticed — typically while checking why a pause never came.
@@ -230,7 +225,7 @@ export function registerDebuggerTools(
     async ({ frameIndex, scopeType }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('get_scope_variables');
+      if (!(await session.attach(client))) return rendererTimedOut('get_scope_variables');
 
       if (!session.state.paused) {
         return { content: [{ type: 'text', text: 'Debugger is not paused.' }], isError: true };
@@ -275,11 +270,12 @@ export function registerDebuggerTools(
         PAGE_COMMAND_TIMEOUT_MS,
       );
       if (props === TIMED_OUT) {
-        return rendererTimedOut(
-          'get_scope_variables',
-          'running again after the pause was read, wedged since, or holding a scope wide enough that ' +
+        return rendererTimedOut('get_scope_variables', {
+          causes:
+            'running again after the pause was read, wedged since, or holding a scope wide enough that ' +
             'previewing it outruns the bound',
-        );
+          advice: '',
+        });
       }
       const variables = (props.result ?? [])
         .filter((p: any) => !p.name.startsWith('__'))
@@ -369,7 +365,7 @@ export function registerDebuggerTools(
       if (!source && !url && !urlRegex) {
         return toolError('Must provide source, url or urlRegex.');
       }
-      if (!(await session.attach(client))) return attachTimedOut('set_breakpoint');
+      if (!(await session.attach(client))) return rendererTimedOut('set_breakpoint');
 
       // Every breakpoint below is set by the loaded script's URL, never by scriptId, because a
       // URL breakpoint survives a reload — and a reload is how a breakpoint in startup code gets hit.
@@ -474,7 +470,7 @@ export function registerDebuggerTools(
     async ({ breakpointId }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('remove_breakpoint');
+      if (!(await session.attach(client))) return rendererTimedOut('remove_breakpoint');
       let known = false;
       try {
         for (const chromeId of session.chromeBreakpointIds(breakpointId)) {
@@ -610,7 +606,7 @@ export function registerDebuggerTools(
     async ({ terminate }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('resume_execution');
+      if (!(await session.attach(client))) return rendererTimedOut('resume_execution');
       // Chrome decides whether a pause is in place, not session.state. Measured, Chrome 156:
       // Debugger.resume fails with "Can only perform operation while paused" in two cases: nothing
       // is paused, or pause_execution asked for a pause that has not landed yet. In the second case
@@ -702,7 +698,7 @@ export function registerDebuggerTools(
     async ({ expression, frameIndex }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('evaluate_at_frame');
+      if (!(await session.attach(client))) return rendererTimedOut('evaluate_at_frame');
 
       if (!session.state.paused) {
         return {

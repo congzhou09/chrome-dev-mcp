@@ -6,7 +6,7 @@ import {
   NOT_CONNECTED,
   OWN_EXPRESSION,
   PAGE_COMMAND_TIMEOUT_MS,
-  attachTimedOut,
+  rendererTimedOut,
 } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
@@ -62,7 +62,7 @@ export function registerNavigationTools(
     // and only an enabled Debugger domain hears it — including a pause on a breakpoint that
     // DevTools or another client set. Without it, a page stopped during startup would look
     // exactly like one that is slow to load.
-    if (!(await session.attach(client))) return attachTimedOut(what);
+    if (!(await session.attach(client))) return rendererTimedOut(what);
 
     const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
     let committedUrl: string | undefined;

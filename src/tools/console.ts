@@ -1,7 +1,7 @@
 import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { MAX_CONSOLE_LOGS, NOT_CONNECTED, attachTimedOut } from '../constants.js';
+import { MAX_CONSOLE_LOGS, NOT_CONNECTED, rendererTimedOut } from '../constants.js';
 import type { InspectorSession } from '../inspector-session.js';
 
 // ── Console log tool ──────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ export function registerConsoleTools(
     async ({ limit, level, since }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
-      if (!(await session.attach(client))) return attachTimedOut('get_console_logs');
+      if (!(await session.attach(client))) return rendererTimedOut('get_console_logs');
 
       const logs = session.readConsoleLogs({ limit, level, since });
 

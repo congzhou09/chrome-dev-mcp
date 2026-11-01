@@ -279,7 +279,10 @@ describe('evaluate_js', () => {
     const callFunctionOn = vi.fn().mockResolvedValue({ result: { type: 'object', value } });
     const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { callFunctionOn }));
 
-    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: '({a:1,b:{c:[1,2,{d:3}]}})' } });
+    const result = await client.callTool({
+      name: 'evaluate_js',
+      arguments: { expression: '({a:1,b:{c:[1,2,{d:3}]}})' },
+    });
 
     expect((result.content as any)[0].text).toBe(JSON.stringify(value, null, 2));
     // The whole point of going through callFunctionOn: one evaluation, so `n++` increments once.
@@ -373,7 +376,10 @@ describe('evaluate_js', () => {
     const callFunctionOn = vi.fn();
     const client = await setupMcpClient(makeMockClient(evaluate, undefined, undefined, undefined, { callFunctionOn }));
 
-    const result = await client.callTool({ name: 'evaluate_js', arguments: { expression: "document.querySelector('div')" } });
+    const result = await client.callTool({
+      name: 'evaluate_js',
+      arguments: { expression: "document.querySelector('div')" },
+    });
 
     // Trailing marker: Chrome caps a preview, and a partial listing must not read as complete.
     expect((result.content as any)[0].text).toBe('div#root {\n  id: root,\n  …\n}');

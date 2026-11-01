@@ -222,8 +222,8 @@ export function registerPageTools(
   // answers when the renderer cannot. Measured, Chrome 155: with the page in a synchronous
   // loop or showing an alert(), Runtime.evaluate timed out while Page.getNavigationHistory
   // answered in ~1ms; at a breakpoint both answered. All of it held the same with the window
-// in the foreground and minimised (`visibilityState: "hidden"`) — unlike screenshot, nothing
-// here waits on a frame being painted. The current entry tracks the page
+  // in the foreground and minimised (`visibilityState: "hidden"`) — unlike screenshot, nothing
+  // here waits on a frame being painted. The current entry tracks the page
   // without lag — a document.title assignment, history.replaceState and a hash change were
   // all reflected by the very next call. Target.getTargetInfo answers just as well, but
   // reports an empty title as the host ("localhost:5173") where the history entry keeps the

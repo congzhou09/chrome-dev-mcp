@@ -26,7 +26,7 @@
 
 ## step_over / step_into / step_out / resume_execution
 
-**Not merged.** 
+**Not merged.**
 
 ■These are the standard debugger primitives, not overlapping conveniences: `next` / `step` / `finish` / `continue` in gdb, `next` / `stepIn` / `stepOut` / `continue` in DAP, four distinct `Debugger.*` methods in CDP. ■They are mutually exclusive and none can be expressed through another. ■`resume_execution` is not a stepping mode at all.
 ■Collapsing them into `step({ direction })` would remove three names and no decisions.
@@ -65,7 +65,7 @@
 
 ## Cross-references are for disambiguation, not discovery
 
-□Every tool name is already in the caller's context — the tool list is the table of contents, and a description that re-lists its neighbours only spends budget. 
+□Every tool name is already in the caller's context — the tool list is the table of contents, and a description that re-lists its neighbours only spends budget.
 □A cross-reference earns its place only where a caller could plausibly pick the wrong tool and get a wrong answer.
 □That makes the right direction depend on the relationship:
 

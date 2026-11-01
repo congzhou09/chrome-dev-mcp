@@ -153,15 +153,15 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ☆25 tools in seven groups — six domains plus one cross-cutting tool:
 
-| Group | Tools | Covers |
-| --- | --- | --- |
-| Tab management | 2 | Discovering tabs, and choosing which one this server is attached to |
-| Page inspection | 6 | The live page: URL and title, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
-| Navigation | 2 | Loading a URL or reloading, and waiting until the new page has loaded or paused |
-| Console | 1 | Console messages and uncaught exceptions, including output from before this server connected |
-| Debugger | 11 | Breakpoints, stepping, call stack, scopes, frame-scoped evaluation |
-| Network | 2 | Requests captured from connect time onward, plus response bodies fetched on demand |
-| Capture buffers | 1 | `clear_captures` — cross-cutting: resets the console and network buffers above |
+| Group           | Tools | Covers                                                                                                                 |
+| --------------- | ----- | ---------------------------------------------------------------------------------------------------------------------- |
+| Tab management  | 2     | Discovering tabs, and choosing which one this server is attached to                                                    |
+| Page inspection | 6     | The live page: URL and title, HTML, computed CSS, screenshots, the DevTools-selected element, and arbitrary evaluation |
+| Navigation      | 2     | Loading a URL or reloading, and waiting until the new page has loaded or paused                                        |
+| Console         | 1     | Console messages and uncaught exceptions, including output from before this server connected                           |
+| Debugger        | 11    | Breakpoints, stepping, call stack, scopes, frame-scoped evaluation                                                     |
+| Network         | 2     | Requests captured from connect time onward, plus response bodies fetched on demand                                     |
+| Capture buffers | 1     | `clear_captures` — cross-cutting: resets the console and network buffers above                                         |
 
 ☆All 25 serve one workflow. Two things come first, in either order: the agent learns what goes wrong, and the page reaches the state where it does — by hand, or through the agent's own `navigate_tab`, `reload_tab` and breakpoints. From there the agent reads whatever explains it — a console error, a network response, the DOM and its computed CSS, or a paused call stack and its scopes. Once a fix is in, the same tools confirm it: `reload_tab`, then read again.
 
@@ -169,70 +169,70 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ### Tab management
 
-| Tool         | Description                                                                                                                                 |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool         | Description                                                                                                                                                                                                                     |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list_tabs`  | List all open Chrome page tabs as `[{ targetId, title, url, active?, connected }]` — `active` marks a tab showing on screen (one per visible window; absent if the tab did not answer), `connected` the tab this server acts on |
-| `switch_tab` | Connect this server to another tab by `targetId` (from `list_tabs`), without bringing it to the front. Breakpoints and the console and network buffers start over on the new tab |
+| `switch_tab` | Connect this server to another tab by `targetId` (from `list_tabs`), without bringing it to the front. Breakpoints and the console and network buffers start over on the new tab                                                |
 
 ### Page inspection
 
-| Tool                    | Description                                                                                                    |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `get_page_info`         | Current page URL and title as `{ url, title }` — answers even while the page is not responding                 |
-| `get_html`              | Full page HTML (capped at 20,000 chars)                                                                        |
+| Tool                    | Description                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_page_info`         | Current page URL and title as `{ url, title }` — answers even while the page is not responding                                                                                                                                                                                                                                                                                                                    |
+| `get_html`              | Full page HTML (capped at 20,000 chars)                                                                                                                                                                                                                                                                                                                                                                           |
 | `evaluate_js`           | Run arbitrary JavaScript in global scope, with DevTools console semantics: top-level `await` works, and an expression that merely returns a promise stays pending rather than being awaited for you. Returns the real value when it serialises; DOM nodes, Errors, Maps and class instances come back as a preview instead — class name plus a first level of properties, readable but not parseable as the value |
-| `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                 |
-| `screenshot`            | PNG screenshot of the current viewport, or of one `region` of it (CSS px from the top-left of the visible area, as `getBoundingClientRect()` reports them). Native pixel size unless capped with `maxEdge` (longest side in px); a capture that was scaled or cut reports that |
-| `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console |
+| `get_computed_style`    | Computed CSS values for the given properties on a CSS selector                                                                                                                                                                                                                                                                                                                                                    |
+| `screenshot`            | PNG screenshot of the current viewport, or of one `region` of it (CSS px from the top-left of the visible area, as `getBoundingClientRect()` reports them). Native pixel size unless capped with `maxEdge` (longest side in px); a capture that was scaled or cut reports that                                                                                                                                    |
+| `get_inspected_element` | Tag, id, classes, attributes, and outerHTML of the element marked via `window.$0 = $0` in the DevTools console                                                                                                                                                                                                                                                                                                    |
 
 ### Navigation
 
-| Tool           | Description |
-| -------------- | ----------- |
+| Tool           | Description                                                                                                                                        |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `navigate_tab` | Load a URL in the connected tab and wait for the new page's load event — or for execution to pause first, in which case the call stack is returned |
-| `reload_tab`   | Reload the connected tab and wait the same way as `navigate_tab`. `ignoreCache` bypasses the HTTP cache, as Shift+F5 does |
+| `reload_tab`   | Reload the connected tab and wait the same way as `navigate_tab`. `ignoreCache` bypasses the HTTP cache, as Shift+F5 does                          |
 
-▲Both work while paused at a breakpoint: the pause ends with the old page, and breakpoints hit again in the new one — so "set a breakpoint, then `reload_tab`" stops in the page's startup code and returns the call stack where it paused. 
+▲Both work while paused at a breakpoint: the pause ends with the old page, and breakpoints hit again in the new one — so "set a breakpoint, then `reload_tab`" stops in the page's startup code and returns the call stack where it paused.
 
 ▲A failed navigation is reported as an error, not as `loaded` — Chrome still loads its own error page in that case and fires its load event — and a page whose load event does not fire within 30s comes back as `still-loading`.
 
 ### Console
 
-| Tool               | Description                                                                                                                                                                                                                                                                                                                                               |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `get_console_logs` | All messages visible in the DevTools Console, including output that predates this server's connection. Exceptions are reported with their full stack trace (source-mapped when available). Filterable by level (`error`, `warning`, …). Not pruned on navigation: entries from a replaced document, or from before the connection, carry a `from` marker while the current document's are unmarked, and `since: "current-page-load"` narrows the result to those; `clear_captures` empties the buffer outright. |
 
 ### Debugger
 
-| Tool                  | Description                                                                                                         |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line, source-mapped when possible (with the position in the loaded script alongside) |
-| `get_scope_variables` | Variable values inside a call frame scope (`local`, `closure`, `block`, `global`, …)                                |
-| `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — reads local variables, closures, and `this`. Errors out when not paused rather than falling back to global scope       |
-| `set_breakpoint`      | Set a breakpoint by source file + line (mapped through source maps), or by script URL / regex; supports conditions  |
-| `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                       |
-| `list_breakpoints`    | All breakpoints active in this session                                                                              |
-| `pause_execution`     | Pause JS at the next statement that runs, returning the call stack if that happens within 2s. On an idle page the pause stays pending until script runs — a timer, a click, an `evaluate_js` expression |
+| Tool                  | Description                                                                                                                                                                                                     |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_debugger_state`  | Paused status, pause reason, hit breakpoints, and full call stack with file + line, source-mapped when possible (with the position in the loaded script alongside)                                              |
+| `get_scope_variables` | Variable values inside a call frame scope (`local`, `closure`, `block`, `global`, …)                                                                                                                            |
+| `evaluate_at_frame`   | Evaluate a JS expression in a paused call frame's scope — reads local variables, closures, and `this`. Errors out when not paused rather than falling back to global scope                                      |
+| `set_breakpoint`      | Set a breakpoint by source file + line (mapped through source maps), or by script URL / regex; supports conditions                                                                                              |
+| `remove_breakpoint`   | Remove a breakpoint by its ID                                                                                                                                                                                   |
+| `list_breakpoints`    | All breakpoints active in this session                                                                                                                                                                          |
+| `pause_execution`     | Pause JS at the next statement that runs, returning the call stack if that happens within 2s. On an idle page the pause stays pending until script runs — a timer, a click, an `evaluate_js` expression         |
 | `resume_execution`    | Resume after a pause or breakpoint. With `terminate: true`, skip the rest of the paused function and of its callers, `finally` blocks included, e.g. to stop an endless loop; the page may be left half-updated |
-| `step_over`           | Run the current statement without stepping into the functions it calls, and pause at the next one; returns the new call stack |
-| `step_into`           | Step into the function the current statement calls, or to the next statement if it calls none; returns the new call stack |
-| `step_out`            | Run the rest of the current function and pause in its caller; returns the new call stack                            |
+| `step_over`           | Run the current statement without stepping into the functions it calls, and pause at the next one; returns the new call stack                                                                                   |
+| `step_into`           | Step into the function the current statement calls, or to the next statement if it calls none; returns the new call stack                                                                                       |
+| `step_out`            | Run the rest of the current function and pause in its caller; returns the new call stack                                                                                                                        |
 
 ▲The three step tools work only while paused, and go by statement rather than by line, since a minified line holds many statements. A step past the end of an event handler or timer callback — from its last statement, or out of it — pauses at the first statement of whatever script runs next, which may be unrelated code. When a step has not paused within 5s, the result lists the possible reasons: the step went past the end of the code that was running, the code is waiting at an `await`, or the page is not responding.
 
 ### Network
 
-| Tool                        | Description                                                                                                                                                                                                                                                                                                                                                                            |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool                        | Description                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `get_network_requests`      | HTTP requests captured from the connected tab — method, URL, resource type, status, transferred size, duration, initiator, and failure reason. Redirects appear as one record per hop. Filter by URL substring, resource type, or status class (`2xx` / `3xx` / `4xx` / `5xx` / `failed` / `pending`). `headerKeys` returns the named request/response headers (omit for none, `["*"]` for all). |
-| `get_network_response_body` | Response body for one `requestId` from `get_network_requests`. Fetched from Chrome on demand — never buffered by this server, and Chrome discards it on navigation, so fetch while the page is still up. Binary bodies are reported as metadata only.                                                                                                                                                                                                             |
+| `get_network_response_body` | Response body for one `requestId` from `get_network_requests`. Fetched from Chrome on demand — never buffered by this server, and Chrome discards it on navigation, so fetch while the page is still up. Binary bodies are reported as metadata only.                                                                                                                                            |
 
 ▲Unlike `get_console_logs`, network capture is **not** retroactive: `Network.enable()` has no history replay, so capture begins when this server connects to the tab and nothing before that is visible. Requests belonging to a previous page are then pruned on navigation, mirroring the DevTools Network panel default — the new document's own request is kept.
 
 ### Capture buffers
 
-| Tool             | Description                                                                                                                                              |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool             | Description                                                                                                                                               |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `clear_captures` | Discard the console and/or network buffers this server holds, so the next read shows only what happens afterwards. Pick with `targets`; defaults to both. |
 
 ▲Affects this server only — nothing is cleared in Chrome or in the DevTools UI, and capture keeps running. Clearing cannot be undone: console entries are gone for good, since `Console.enable()` replays history only at attach time, while cleared network `requestId`s still resolve in `get_network_response_body` for as long as Chrome itself holds the body.

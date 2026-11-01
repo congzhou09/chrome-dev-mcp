@@ -44,7 +44,7 @@ export const TRANSITION_WAIT_TIMEOUT_MS = 15_000;
 //   await new Promise(() => {})     idle       yes               the client-side race
 //
 // A synchronous loop holds the renderer, which then answers no CDP command at all. The
-// client-side race in evaluate_js would hand control back to the caller without stopping the loop, 
+// client-side race in evaluate_js would hand control back to the caller without stopping the loop,
 // and every later tool call would inherit a dead target; only terminating the loop stops it. An
 // expression suspended at an `await` holds nothing, and the client-side race in evaluate_js is
 // the only thing that ends that call.

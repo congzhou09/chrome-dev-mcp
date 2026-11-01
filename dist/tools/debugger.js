@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut, rendererTimedOut } from '../constants.js';
+import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, PAUSE_WAIT_TIMEOUT_MS, STEP_WAIT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
@@ -24,17 +24,96 @@ const sourceNotPlaced = (source, line, lookup) => {
     return (`Error: no loaded script has "${source}" — its code has not loaded yet (a route or chunk loaded on ` +
         'demand), or it is not part of this page. Load it, then set the breakpoint.');
 };
+// By default, rendererTimedOut advises a retry once the page responds, which is no help to a pause:
+// by then the loop is over, and a loop that never ends leaves the page unresponsive until the tab
+// is reloaded or reopened. Only a debugger enabled before a loop began can stop it — Debugger.enable
+// sent during one is not answered until it ends (see InspectorSession.attach), and Debugger.pause
+// is refused without it ("Debugger agent is not enabled"). Hence the advice: a debugger tool call,
+// which attaches or finds the attach done, then the hang. Measured, Chrome 156: with the debugger
+// already enabled, a pause sent into a 3s loop was answered in 3ms and landed in 6ms.
+const pauseAttachTimedOut = () => rendererTimedOut('pause_execution (attaching the debugger)', {
+    advice: 'A loop can be paused only by a debugger attached before it started. Once the page responds again — for a ' +
+        'loop that never ends, once the tab has been reloaded or reopened — call any debugger tool, such as ' +
+        'get_debugger_state, before reproducing the hang; pause_execution can then stop it.',
+});
+// A step tool's answer when its step has not paused within STEP_WAIT_TIMEOUT_MS. Not an error: the
+// step is still in effect. Measured, Chrome 156, one case at a time:
+//
+// - Past the end of the code that was running, the next Runtime.evaluate paused on its own first
+//   statement. One with `disableBreaks` did not, and the step stayed in effect after it.
+//   Debugger.resume fails ("Can only perform operation while paused"), and the step stays in effect
+//   after the failed resume too. A reload or a navigation drops the step.
+// - Over an `await`, the step paused on the statement after it once the promise settled. A 100ms
+//   interval ran meanwhile, and its callback did not pause.
+// - In an endless loop, Debugger.pause was answered in 2ms and paused inside the loop in 5ms. A
+//   resume with terminateOnResume then ended the loop; see resume_execution.
+// - Over alert(), the step command was answered in 2ms. Once the dialog was closed, the step paused
+//   at the next statement.
+const STEP_NOT_PAUSED = `The step has not paused within ${STEP_WAIT_TIMEOUT_MS / 1000}s, but it is still in effect. Execution is in one ` +
+    'of four states:\n' +
+    '- Past the end of the code that was running, such as an event handler: the step pauses in the next script ' +
+    'that runs, including an evaluate_js expression. Only a reload or a navigation cancels it.\n' +
+    '- Waiting at an `await`: the step pauses once the awaited promise settles.\n' +
+    '- In a long or endless loop: the page does not respond. pause_execution pauses inside the loop, and ' +
+    'resume_execution with terminate: true then ends the loop.\n' +
+    '- Blocked by an alert, confirm or prompt dialog: the page does not respond until the dialog is closed in the ' +
+    'browser.\n' +
+    'get_debugger_state shows whether the step has paused.';
 // ── Debugger tools ────────────────────────────────────────────────────────────
 export function registerDebuggerTools(server, getClient, session) {
+    // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
+    // returned, a single id even for a file it placed in several scripts.
+    const hitBreakpoints = () => [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))];
+    // Where execution stopped, for the tools that wait for a pause of their own: pause_execution
+    // and the step tools. A step over a function call stops at any breakpoint inside that call,
+    // not at the next statement. Chrome then gives the reason as "ambiguous" (measured, Chrome 156),
+    // so the result names the breakpoint.
+    const reportPause = async () => {
+        const hit = hitBreakpoints();
+        const data = {
+            paused: true,
+            reason: session.state.pauseReason,
+            ...(hit.length > 0 && { hitBreakpoints: hit }),
+            callStack: await session.formatCallStack(),
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    };
+    // The step tools differ only in the command they send. Each waits for the pause its step causes.
+    // When no pause comes, the answer lists the possible reasons.
+    const step = async (tool, send) => {
+        const client = await getClient();
+        if (!client)
+            return NOT_CONNECTED;
+        if (!(await session.attach(client)))
+            return rendererTimedOut(tool);
+        if (!session.state.paused)
+            return toolError('Not paused. Cannot step.');
+        const landed = session.waitForNextPause(client, STEP_WAIT_TIMEOUT_MS);
+        await send(client);
+        if (await landed)
+            return reportPause();
+        return { content: [{ type: 'text', text: STEP_NOT_PAUSED }] };
+    };
     server.registerTool('get_debugger_state', {
-        description: 'Get current debugger state: whether execution is paused, the pause reason, hit breakpoints, and the full call stack with file/line info.',
+        // Measured, Chrome 156, with a second CDP session standing in for DevTools. This server was
+        // sent Debugger.paused for each cause tried: a breakpoint DevTools set, a `debugger`
+        // statement, DevTools' pause button, and pause on exceptions turned on by DevTools. A pause
+        // already in place was reported by this server's Debugger.enable, in 1ms. Each session's
+        // hitBreakpoints lists only the breakpoints that session set: at a breakpoint DevTools set,
+        // this server's list was empty and the pause reason was "other", as at a `debugger` statement.
+        description: 'Get the debugger state: whether execution is paused, the pause reason, hit breakpoints and the full call ' +
+            'stack. A pause is reported whatever caused it. `hitBreakpoints` lists only breakpoints set through this ' +
+            'server, so it is empty at a breakpoint set in DevTools. Positions are 1-based, and source-mapped where the ' +
+            'script has a source map. A source-mapped frame also gives `compiledUrl`/`compiledLine`/`compiledColumn`, ' +
+            'its position in the loaded script.',
         inputSchema: z.object({}),
         outputSchema: z.object({
             paused: z.boolean(),
+            // Measured, Chrome 156: every breakpoint, this server's or DevTools', arrives as "other".
             reason: z
                 .string()
                 .optional()
-                .describe('Pause reason (e.g. "breakpoint", "exception"). Present only when paused.'),
+                .describe('Pause reason (e.g. "other" for a breakpoint, "step", "exception"). Present only when paused.'),
             hitBreakpoints: z.array(z.string()).optional().describe('IDs of breakpoints hit. Present only when paused.'),
             callStack: z
                 .array(z.object({
@@ -62,7 +141,7 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('get_debugger_state');
+            return rendererTimedOut('get_debugger_state');
         // A hot update applies without any navigation, so this is where a breakpoint it dropped
         // is most likely to be noticed — typically while checking why a pause never came.
         await session.settleSourceChecks();
@@ -80,9 +159,7 @@ export function registerDebuggerTools(server, getClient, session) {
         const state = {
             paused: true,
             reason: session.state.pauseReason,
-            // Chrome names the breakpoint it hit by its own id; the caller holds the one set_breakpoint
-            // returned, a single id even for a file it placed in several scripts.
-            hitBreakpoints: [...new Set(session.state.hitBreakpoints.map((id) => session.breakpointIdFor(id)))],
+            hitBreakpoints: hitBreakpoints(),
             callStack,
             ...(note && { note }),
             ...droppedPart,
@@ -118,7 +195,7 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('get_scope_variables');
+            return rendererTimedOut('get_scope_variables');
         if (!session.state.paused) {
             return { content: [{ type: 'text', text: 'Debugger is not paused.' }], isError: true };
         }
@@ -159,8 +236,11 @@ export function registerDebuggerTools(server, getClient, session) {
             generatePreview: true,
         }), PAGE_COMMAND_TIMEOUT_MS);
         if (props === TIMED_OUT) {
-            return rendererTimedOut('get_scope_variables', 'running again after the pause was read, wedged since, or holding a scope wide enough that ' +
-                'previewing it outruns the bound');
+            return rendererTimedOut('get_scope_variables', {
+                causes: 'running again after the pause was read, wedged since, or holding a scope wide enough that ' +
+                    'previewing it outruns the bound',
+                advice: '',
+            });
         }
         const variables = (props.result ?? [])
             .filter((p) => !p.name.startsWith('__'))
@@ -236,7 +316,7 @@ export function registerDebuggerTools(server, getClient, session) {
             return toolError('Must provide source, url or urlRegex.');
         }
         if (!(await session.attach(client)))
-            return attachTimedOut('set_breakpoint');
+            return rendererTimedOut('set_breakpoint');
         let placements;
         let lookup;
         if (source) {
@@ -329,7 +409,7 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('remove_breakpoint');
+            return rendererTimedOut('remove_breakpoint');
         let known = false;
         try {
             for (const chromeId of session.chromeBreakpointIds(breakpointId)) {
@@ -369,101 +449,133 @@ export function registerDebuggerTools(server, getClient, session) {
         };
     });
     server.registerTool('pause_execution', {
-        description: 'Pause JavaScript execution immediately. After pausing, use get_debugger_state to inspect the call stack.',
+        description: 'Pause JavaScript at the next statement that runs, and return the call stack if that happens within ' +
+            `${PAUSE_WAIT_TIMEOUT_MS / 1000}s. On an idle page nothing runs, so the pause stays pending until script ` +
+            'next does — a timer, an event, a click — and get_debugger_state reports it once it lands.',
         inputSchema: z.object({}),
         annotations: {
             title: 'Pause execution',
+            destructiveHint: false,
+            idempotentHint: true,
         },
     }, async () => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('pause_execution');
-        await client.Debugger.pause();
+            return pauseAttachTimedOut();
+        if (session.state.paused)
+            return reportPause();
+        // Listening first: in a loop the pause lands within milliseconds of the command.
+        const landed = session.waitForNextPause(client, PAUSE_WAIT_TIMEOUT_MS);
+        // Bounded, because a page showing a modal dialog does not answer even this. Measured, Chrome
+        // 156, the debugger already enabled: no answer while an alert() was open; once it was closed,
+        // the pause was pending, and landed at the next statement that ran.
+        const sent = await withTimeout(client.Debugger.pause(), PAUSE_WAIT_TIMEOUT_MS);
+        if (sent === TIMED_OUT) {
+            return toolError(`Error: the page did not take the pause within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s — it may be showing a ` +
+                'modal dialog (alert, confirm or prompt), which holds every command back until it is closed. The pause ' +
+                'is still queued: once the dialog closes, it lands at the next statement that runs.');
+        }
+        if (await landed)
+            return reportPause();
+        // Not an error: the pause is in place, it has only not landed. Measured, Chrome 156:
+        // Debugger.resume refuses a pause that has not landed ("Can only perform operation while
+        // paused"), and a navigation drops it — a reload included, a #hash change not.
         return {
             content: [
-                { type: 'text', text: 'Pause command sent. Call get_debugger_state to inspect the current position.' },
+                {
+                    type: 'text',
+                    text: `No script ran within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s, so nothing is paused yet. The pause stays ` +
+                        'pending, and cannot be withdrawn short of reloading the page: it lands at the next statement that ' +
+                        'runs — a timer, an event such as a click, or an evaluate_js expression. get_debugger_state shows it ' +
+                        'once it has landed, and resume_execution continues from there.',
+                },
             ],
         };
     });
+    // `terminate` is DevTools' "Terminate current JavaScript call", which sends Runtime.terminateExecution
+    // and then Debugger.resume; {terminateOnResume: true} does the same in one command. Measured, Chrome 156,
+    // paused in an endless loop in a message event listener, both ways alike:
+    // - The whole stack up to the listener stopped: no catch, no finally, no code after the loop.
+    // - In an async function, past an `await`: the function's promise never settled, and the other
+    //   microtasks already queued never ran.
+    // - Nothing was reported: no console error, no window.onerror, no unhandledrejection.
+    // - The event's next listener ran, and so did later timers, events and promise callbacks.
     server.registerTool('resume_execution', {
-        description: 'Resume JavaScript execution after a breakpoint or pause.',
-        inputSchema: z.object({}),
+        description: 'Resume execution while paused; it runs until the next breakpoint or pause. Returns at once rather than ' +
+            'waiting for one.',
+        inputSchema: z.object({
+            terminate: z
+                .boolean()
+                .default(false)
+                .describe('Resume, but skip the rest of the paused function and of its callers, finally blocks included, e.g. to ' +
+                'stop an endless loop. The page may be left half-updated; reload_tab gives a clean state.'),
+        }),
         annotations: {
             title: 'Resume execution',
+            // Resuming ends the pause, and the paused state may be hard to reproduce. terminate also ends
+            // the page's code partway.
+            destructiveHint: true,
         },
-    }, async () => {
+    }, async ({ terminate }) => {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('resume_execution');
-        await client.Debugger.resume({});
-        return { content: [{ type: 'text', text: 'Execution resumed.' }] };
+            return rendererTimedOut('resume_execution');
+        // Chrome decides whether a pause is in place, not session.state. Measured, Chrome 156:
+        // Debugger.resume fails with "Can only perform operation while paused" in two cases: nothing
+        // is paused, or pause_execution asked for a pause that has not landed yet. In the second case
+        // the failed resume does not cancel that pause; it still lands at the next statement that runs.
+        // While a loop ran with nothing paused, Debugger.resume still failed within 5ms.
+        try {
+            await client.Debugger.resume(terminate ? { terminateOnResume: true } : {});
+        }
+        catch (err) {
+            if (!/only perform operation while paused/i.test(err.message))
+                throw err;
+            return toolError('Error: not paused — nothing to resume. ' +
+                (terminate
+                    ? 'To stop code that is still running, such as an endless loop, pause it with pause_execution first.'
+                    : 'A pause requested by pause_execution that has not landed yet is not withdrawn by this.'));
+        }
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: terminate ? 'The paused code was terminated, and execution resumed.' : 'Execution resumed.',
+                },
+            ],
+        };
     });
+    // CDP steps by statement, not by line, and a minified line holds many statements. Measured, Chrome
+    // 156: the one line `a(); b(); c(); const x = a(), y = b(); return x + y;` took seven steps — one per
+    // statement, one more for the second initializer, and one for the function's exit.
     server.registerTool('step_over', {
-        description: 'Execute the current line and pause at the next line (does not enter function calls). Returns the new call stack position.',
+        description: 'While paused, run the current statement without stepping into the functions it calls, and pause at the ' +
+            'next statement. After an event handler or timer callback returns, the step stays in effect: it pauses at ' +
+            'the first statement of whatever script runs next, which may be unrelated code. Returns the new call ' +
+            'stack, or a note if execution has not paused again within ' +
+            `${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
         inputSchema: z.object({}),
         annotations: {
             title: 'Step over',
+            destructiveHint: false,
         },
-    }, async () => {
-        const client = await getClient();
-        if (!client)
-            return NOT_CONNECTED;
-        if (!(await session.attach(client)))
-            return attachTimedOut('step_over');
-        if (!session.state.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-        }
-        const pausePromise = session.waitForNextPause(client);
-        await client.Debugger.stepOver({});
-        const paused = await pausePromise;
-        if (!paused) {
-            return {
-                content: [{ type: 'text', text: 'Stepped over — execution did not pause again (no more breakpoints).' }],
-            };
-        }
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({ paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() }, null, 2),
-                },
-            ],
-        };
-    });
+    }, () => step('step_over', (client) => client.Debugger.stepOver({})));
     server.registerTool('step_into', {
-        description: 'Step into the function call on the current line. Returns the new call stack position.',
+        description: 'While paused, step into the function the current statement calls, or to the next statement if it calls ' +
+            'none. After an event handler or timer callback returns, the step stays in effect: it pauses at the first ' +
+            'statement of whatever script runs next, which may be unrelated code. Returns the new call stack, or a ' +
+            'note if execution has not paused again within ' +
+            `${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
         inputSchema: z.object({}),
         annotations: {
             title: 'Step into',
+            destructiveHint: false,
         },
-    }, async () => {
-        const client = await getClient();
-        if (!client)
-            return NOT_CONNECTED;
-        if (!(await session.attach(client)))
-            return attachTimedOut('step_into');
-        if (!session.state.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-        }
-        const pausePromise = session.waitForNextPause(client);
-        await client.Debugger.stepInto({});
-        const paused = await pausePromise;
-        if (!paused) {
-            return { content: [{ type: 'text', text: 'Stepped into — execution did not pause again.' }] };
-        }
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({ paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() }, null, 2),
-                },
-            ],
-        };
-    });
+    }, () => step('step_into', (client) => client.Debugger.stepInto({})));
     server.registerTool('evaluate_at_frame', {
         description: 'Evaluate a JavaScript expression in the scope of a paused call frame — it reads local variables, closure ' +
             'variables and the current `this`, which evaluate_js cannot. Only works while execution is paused: when it is ' +
@@ -487,7 +599,7 @@ export function registerDebuggerTools(server, getClient, session) {
         if (!client)
             return NOT_CONNECTED;
         if (!(await session.attach(client)))
-            return attachTimedOut('evaluate_at_frame');
+            return rendererTimedOut('evaluate_at_frame');
         if (!session.state.paused) {
             return {
                 content: [{ type: 'text', text: 'Debugger is not paused. Use evaluate_js for global-scope evaluation.' }],
@@ -515,33 +627,13 @@ export function registerDebuggerTools(server, getClient, session) {
         return { content: [{ type: 'text', text }] };
     });
     server.registerTool('step_out', {
-        description: 'Step out of the current function and pause at the caller. Returns the new call stack position.',
+        description: 'While paused, run the rest of the current function and pause in its caller. An event handler or timer ' +
+            'callback has no caller, so stepping out of one pauses in whatever script runs next. Returns the new ' +
+            `call stack, or a note if execution has not paused again within ${STEP_WAIT_TIMEOUT_MS / 1000}s.`,
         inputSchema: z.object({}),
         annotations: {
             title: 'Step out',
+            destructiveHint: false,
         },
-    }, async () => {
-        const client = await getClient();
-        if (!client)
-            return NOT_CONNECTED;
-        if (!(await session.attach(client)))
-            return attachTimedOut('step_out');
-        if (!session.state.paused) {
-            return { content: [{ type: 'text', text: 'Not paused. Cannot step.' }], isError: true };
-        }
-        const pausePromise = session.waitForNextPause(client);
-        await client.Debugger.stepOut();
-        const paused = await pausePromise;
-        if (!paused) {
-            return { content: [{ type: 'text', text: 'Stepped out — execution did not pause again.' }] };
-        }
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({ paused: true, reason: session.state.pauseReason, callStack: await session.formatCallStack() }, null, 2),
-                },
-            ],
-        };
-    });
+    }, () => step('step_out', (client) => client.Debugger.stepOut()));
 }

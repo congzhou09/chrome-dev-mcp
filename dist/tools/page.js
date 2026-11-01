@@ -1,10 +1,11 @@
 import { z } from 'zod';
-import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_SETTLE_TIMEOUT_MS, FRAME_WAIT_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_PROBE_INTERVAL_MS, EVAL_SETTLE_TIMEOUT_MS, EVAL_TERMINATE_WAIT_MS, FRAME_WAIT_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, OWN_EXPRESSION, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
-// Chrome reports a `timeout` kill as a REJECTED command rather than through
+// Chrome reports a terminated evaluation as a REJECTED command rather than through
 // `exceptionDetails`, so it bypasses the normal error path entirely. The code it rejects
-// with also degrades once replMode is on — measured, Chrome 141, reproducible over repeats:
+// with also degrades once replMode is on — measured, Chrome 141, reproducible over repeats,
+// and again on Chrome 156 for a Runtime.terminateExecution:
 //
 //   replMode: false  ->  -32000  "Execution was terminated"
 //   replMode: true   ->  -32603  "Internal error"
@@ -13,16 +14,32 @@ import { TIMED_OUT, withTimeout } from '../timeout.js';
 // all, so both are recognised here and answered with our own text.
 //
 // -32603 is JSON-RPC's generic "Internal error" though, not a fingerprint for termination:
-// every other internal failure in the protocol can carry it too. Claiming a timeout kill on
+// every other internal failure in the protocol can carry it too. Claiming a termination on
 // the code alone would answer an unrelated fault with a confident, fully wrong sentence and
-// swallow the real error, so it is only trusted once the kill we asked for is actually due.
-// `elapsedMs` is measured from before the command is sent, while Chrome starts its own
-// `timeout` clock only after receiving it, so a genuine kill always lands on the far side.
-const isExecutionTerminated = (err, elapsedMs) => {
+// swallow the real error, so evaluate_js consults this only after it has sent
+// Runtime.terminateExecution itself.
+const isExecutionTerminated = (err) => {
     const response = err?.response;
-    if (response?.message === 'Execution was terminated')
-        return true;
-    return response?.code === -32603 && elapsedMs >= EVAL_EXECUTION_TIMEOUT_MS;
+    return response?.message === 'Execution was terminated' || response?.code === -32603;
+};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const never = () => new Promise(() => { });
+// Resolves once the renderer has gone EVAL_EXECUTION_TIMEOUT_MS without answering a probe — it is
+// held by synchronous code — and never while it keeps answering. The measurements behind the probe
+// are at EVAL_EXECUTION_TIMEOUT_MS. `done` ends the watch once the caller stops listening. A probe
+// that fails still counts as an answer: only a renderer that says nothing at all is held.
+const watchForBlockedRenderer = async (client, done) => {
+    for (;;) {
+        await sleep(EVAL_PROBE_INTERVAL_MS);
+        if (done())
+            return never();
+        const probe = client.Runtime.evaluate({ expression: '0', ...OWN_EXPRESSION }).catch(() => null);
+        const answered = await withTimeout(probe, EVAL_EXECUTION_TIMEOUT_MS);
+        if (done())
+            return never();
+        if (answered === TIMED_OUT)
+            return;
+    }
 };
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
 // Pixel dimensions straight out of a PNG's IHDR, which puts width at byte 16 and height at
@@ -142,15 +159,21 @@ const captureScaleFactor = (metrics, reported) => {
 };
 // ── Page inspection tools ─────────────────────────────────────────────────────
 //
-// Every tool here is a bare CDP command — Runtime.evaluate, Page.captureScreenshot,
-// Page.getNavigationHistory — so this group needs nothing but getClient — no session state
-// at all.
+// Every tool here other than evaluate_js is a bare CDP command — Runtime.evaluate,
+// Page.captureScreenshot, Page.getNavigationHistory — so those tools need nothing but getClient.
+// evaluate_js also reads the session, for one thing only: when execution pauses before the
+// expression finishes, evaluate_js reports the source-mapped position where execution paused.
 //
-// Every one of them is also bounded. A CDP command sent to a renderer that is looping or
+// evaluate_js reads the session without attaching it. Chrome sends Debugger.paused to this server
+// only while this server's Debugger domain is enabled. Only attaching the session enables that
+// domain. So whenever evaluate_js receives Debugger.paused, another tool has already attached the
+// session.
+//
+// Every tool here is also bounded. A CDP command sent to a renderer that is looping or
 // sitting on a modal neither returns nor rejects (see timeout.ts), so a small read is just as
 // capable of hanging forever as evaluating an arbitrary expression is — the difference is
 // only in how surprising it looks when it happens.
-export function registerPageTools(server, getClient) {
+export function registerPageTools(server, getClient, session) {
     // Read from the browser's navigation history rather than evaluated in the page, so it
     // answers when the renderer cannot. Measured, Chrome 155: with the page in a synchronous
     // loop or showing an alert(), Runtime.evaluate timed out while Page.getNavigationHistory
@@ -213,6 +236,7 @@ export function registerPageTools(server, getClient) {
             })()
           `,
             returnByValue: true,
+            ...OWN_EXPRESSION,
         }), PAGE_COMMAND_TIMEOUT_MS);
         if (result === TIMED_OUT)
             return rendererTimedOut('get_html');
@@ -227,6 +251,34 @@ export function registerPageTools(server, getClient) {
             : html;
         return { content: [{ type: 'text', text }] };
     });
+    // evaluate_js's answer when execution pauses before the expression finishes. Not an error: the
+    // expression continues once execution resumes. This call returns now, without waiting for
+    // execution to resume. So the result of the expression is not returned to the caller. For the
+    // same reason, if the expression enters a loop after execution resumes, this call does not
+    // terminate the loop. A later evaluate_js call does terminate it, and says so in a note.
+    const reportPausedEvaluation = async (event) => {
+        const top = event?.callFrames?.[0];
+        let where = '';
+        if (top) {
+            const loc = await session.describeLocation(top.location.scriptId, top.location.lineNumber, top.location.columnNumber ?? 0);
+            const position = loc.source
+                ? `${loc.source}:${loc.sourceLine}:${loc.sourceColumn}`
+                : loc.url
+                    ? `${loc.url}:${loc.lineNumber}:${loc.columnNumber}`
+                    : `line ${loc.lineNumber} of a script with no URL, such as this expression`;
+            where = ` in ${top.functionName || '(anonymous)'} at ${position}`;
+        }
+        // Measured, Chrome 156, an expression resumed into `for (;;) {}`: pause_execution landed inside
+        // the loop in 10ms. A resume with terminateOnResume then ended the expression: its
+        // Runtime.evaluate failed with -32603, and the page answered the next command at once.
+        const text = `Execution paused (reason: ${event?.reason ?? 'unknown'})${where}. The expression has not finished: ` +
+            'it continues once execution resumes, but its result will not be returned. ' +
+            'get_debugger_state shows the full call stack. ' +
+            'After execution resumes, this call does not terminate an endless loop in the expression: the page stops ' +
+            'responding. pause_execution pauses inside such a loop, and resume_execution with terminate: true then ' +
+            'ends the expression.';
+        return { content: [{ type: 'text', text }] };
+    };
     server.registerTool('evaluate_js', {
         description: 'Evaluate a JavaScript expression in the page, in global scope, with the same semantics as the DevTools console. ' +
             'Returns the real value when it serialises; objects that cannot (DOM nodes, Errors, Maps, class instances) come back ' +
@@ -270,39 +322,97 @@ export function registerPageTools(server, getClient) {
         // `awaitPromise` has nothing left to act on. So "console semantics plus auto-await" is
         // not a reachable combination, and passing awaitPromise here would only be dead weight
         // that reads as if it did something.
-        const startedAt = Date.now();
+        //
+        // No `timeout`: Chrome keeps counting it while execution is paused, and ends the expression
+        // at the next resume or step once it has run out. watchForBlockedRenderer stops a loop
+        // instead — see EVAL_EXECUTION_TIMEOUT_MS for both measurements.
         const evaluation = client.Runtime.evaluate({
             expression,
             returnByValue: false,
             generatePreview: true,
             replMode: true,
-            timeout: EVAL_EXECUTION_TIMEOUT_MS,
         });
-        // The settle race below abandons this promise on timeout. Without a handler of its own,
-        // a later rejection would surface as an unhandledRejection with nobody listening.
+        // The races below can abandon this promise. Without a handler of its own, a later
+        // rejection would surface as an unhandledRejection with nobody listening.
         evaluation.catch(() => { });
+        // A pause holds the expression until execution resumes, so it is answered at once rather
+        // than after EVAL_SETTLE_TIMEOUT_MS. Only heard while this server's Debugger is enabled.
+        // The pause may also be in the page's own code while the expression waits at an `await`;
+        // either way the expression cannot finish before execution resumes.
+        const emitter = client;
+        let onPaused = (_event) => { };
+        const paused = new Promise((resolve) => {
+            onPaused = (event) => resolve({ kind: 'paused', event });
+            emitter.on('Debugger.paused', onPaused);
+        });
+        let done = false;
         let result;
+        // Set when this call terminated code and the expression still finished; see that branch.
+        let note;
         try {
-            const settled = await withTimeout(evaluation, EVAL_SETTLE_TIMEOUT_MS);
-            if (settled === TIMED_OUT) {
-                return toolError(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. It is suspended on something ` +
-                    'that has not resolved — a pending promise, a request that never returns. The page is still running it.');
+            const outcome = await withTimeout(Promise.race([
+                evaluation.then((value) => ({ kind: 'settled', value })),
+                paused,
+                watchForBlockedRenderer(client, () => done).then(() => ({ kind: 'blocked' })),
+            ]), EVAL_SETTLE_TIMEOUT_MS);
+            if (outcome === TIMED_OUT) {
+                return toolError(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. Either it is waiting on ` +
+                    'something that has not resolved (a pending promise, a request that never returns), or execution ' +
+                    'is paused in the debugger, for example at a breakpoint set in DevTools; get_debugger_state shows ' +
+                    'which. The page is still running the expression.');
             }
-            result = settled;
+            if (outcome.kind === 'paused')
+                return await reportPausedEvaluation(outcome.event);
+            if (outcome.kind === 'settled') {
+                result = outcome.value;
+            }
+            else {
+                client.Runtime.terminateExecution().catch(() => { });
+                const ended = await withTimeout(evaluation.then((value) => ({ value }), (err) => ({ err })), EVAL_TERMINATE_WAIT_MS);
+                if (ended === TIMED_OUT) {
+                    return toolError(`Error: the page has not responded for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s, and the expression did ` +
+                        'not stop when terminated. The page may be showing a modal dialog (alert, confirm or prompt); ' +
+                        'once the dialog is closed, the expression continues.');
+                }
+                if ('err' in ended) {
+                    if (!isExecutionTerminated(ended.err))
+                        throw ended.err;
+                    return toolError(`Error: expression was terminated after the page had not responded for ` +
+                        `${EVAL_EXECUTION_TIMEOUT_MS / 1000}s — it was still running synchronous code (an infinite loop, ` +
+                        'or a blocking computation). The loop was stopped.');
+                }
+                // This expression finished, so the termination did not stop it: a terminated expression
+                // cannot finish. Most often the termination stopped other code that held the renderer
+                // (see EVAL_EXECUTION_TIMEOUT_MS). Rarely it stopped nothing. That happens when the code
+                // holding the renderer ended before the termination took effect. Measured, Chrome 156, a 1000ms loop,
+                // five runs per offset: a termination sent 60ms before the loop ended stopped it in all
+                // five runs, 30ms before in three, 10ms before in one, 5ms before in none. The order of
+                // the two responses does not tell these cases apart: Runtime.terminateExecution was
+                // answered first in most runs, the runs where the loop then finished included. Hence
+                // "most likely" in the note.
+                result = ended.value;
+                note =
+                    `Note: the page did not respond for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s while this call waited, so ` +
+                        'this call terminated the JavaScript that was running. This expression still finished, so the ' +
+                        "JavaScript terminated was most likely other code: the page's own code, or an expression an earlier " +
+                        'evaluate_js call left running.';
+            }
         }
-        catch (err) {
-            if (!isExecutionTerminated(err, Date.now() - startedAt))
-                throw err;
-            return toolError(`Error: expression was terminated after ${EVAL_EXECUTION_TIMEOUT_MS}ms of execution — it was still ` +
-                'running (an infinite loop, or a blocking computation). The tab was not left spinning.');
+        finally {
+            done = true;
+            emitter.removeListener('Debugger.paused', onPaused);
         }
+        const withNote = (text) => [
+            { type: 'text', text },
+            ...(note ? [{ type: 'text', text: note }] : []),
+        ];
         if (result.exceptionDetails) {
             const msg = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
-            return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
+            return { content: withNote(`Error: ${msg}`), isError: true };
         }
         const text = await renderValueFirst(client, result.result);
         releaseRemoteObject(client, result.result);
-        return { content: [{ type: 'text', text }] };
+        return { content: withNote(text) };
     });
     server.registerTool('get_computed_style', {
         description: 'Get computed CSS values for the given properties on the element matched by selector.',
@@ -335,7 +445,7 @@ export function registerPageTools(server, getClient) {
           return out;
         })()
       `;
-        const result = await withTimeout(client.Runtime.evaluate({ expression, returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS);
+        const result = await withTimeout(client.Runtime.evaluate({ expression, returnByValue: true, ...OWN_EXPRESSION }), PAGE_COMMAND_TIMEOUT_MS);
         if (result === TIMED_OUT)
             return rendererTimedOut('get_computed_style');
         if (result.result.value === null) {
@@ -465,6 +575,7 @@ export function registerPageTools(server, getClient) {
             const ratio = client.Runtime.evaluate({
                 expression: '({ dpr: devicePixelRatio, hidden: document.hidden })',
                 returnByValue: true,
+                ...OWN_EXPRESSION,
             })
                 .then((r) => r.result?.value)
                 .catch(() => undefined);
@@ -485,8 +596,8 @@ export function registerPageTools(server, getClient) {
                     // the message names the one that actually happened rather than blaming the clock
                     // for all of them.
                     const why = probed === TIMED_OUT
-                        ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be paused at a ` +
-                            'breakpoint, blocked in a synchronous loop, or blocked on a modal dialog'
+                        ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be ` +
+                            'blocked in a synchronous loop, or blocked on a modal dialog'
                         : metricsError
                             ? `Page.getLayoutMetrics failed: ${metricsError}`
                             : 'Page.getLayoutMetrics answered without a usable layout viewport, which a tab reports when ' +
@@ -535,10 +646,17 @@ export function registerPageTools(server, getClient) {
                 front.catch(() => { });
                 if ((await withTimeout(front, BRING_TO_FRONT_TIMEOUT_MS)) !== TIMED_OUT) {
                     broughtToFront = true;
+                    // The second frame is asked for by a bound requestAnimationFrame, not by an arrow
+                    // function: the frames call only browser functions, so this leaves no JS of its own
+                    // to run once OWN_EXPRESSION has stopped covering it. Measured, Chrome 156, a pause
+                    // pending on a foreground tab: it landed in `() => requestAnimationFrame(resolve)`
+                    // after 5ms; with the bound form it did not land in three runs and stayed pending
+                    // for the page's own code. Two frames either way: 31ms with no pause.
                     const painted = client.Runtime.evaluate({
-                        expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+                        expression: 'new Promise(resolve => requestAnimationFrame(requestAnimationFrame.bind(window, resolve)))',
                         returnByValue: true,
                         awaitPromise: true,
+                        ...OWN_EXPRESSION,
                     });
                     painted.catch(() => { });
                     await withTimeout(painted, FRAME_WAIT_TIMEOUT_MS);
@@ -702,6 +820,7 @@ export function registerPageTools(server, getClient) {
           })()
         `,
             returnByValue: true,
+            ...OWN_EXPRESSION,
         }), PAGE_COMMAND_TIMEOUT_MS);
         if (result === TIMED_OUT)
             return rendererTimedOut('get_inspected_element');

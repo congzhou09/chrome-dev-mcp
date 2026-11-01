@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, attachTimedOut } from '../constants.js';
+import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, OWN_EXPRESSION, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import { droppedBreakpointsSchema } from './debugger.js';
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
@@ -40,7 +40,7 @@ export function registerNavigationTools(server, getClient, session) {
         // DevTools or another client set. Without it, a page stopped during startup would look
         // exactly like one that is slow to load.
         if (!(await session.attach(client)))
-            return attachTimedOut(what);
+            return rendererTimedOut(what);
         const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
         let committedUrl;
         const emitter = client;
@@ -116,7 +116,11 @@ export function registerNavigationTools(server, getClient, session) {
     // Best-effort: the navigation has already succeeded, so a page that does not answer here
     // costs the caller the url and title, not the result.
     const readPage = async (client) => {
-        const read = await withTimeout(client.Runtime.evaluate({ expression: '({ url: location.href, title: document.title })', returnByValue: true }), PAGE_COMMAND_TIMEOUT_MS).catch(() => TIMED_OUT);
+        const read = await withTimeout(client.Runtime.evaluate({
+            expression: '({ url: location.href, title: document.title })',
+            returnByValue: true,
+            ...OWN_EXPRESSION,
+        }), PAGE_COMMAND_TIMEOUT_MS).catch(() => TIMED_OUT);
         if (read === TIMED_OUT)
             return {};
         return read.result?.value ?? {};

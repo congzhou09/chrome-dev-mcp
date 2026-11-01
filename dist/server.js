@@ -24,7 +24,7 @@ export function createServer(getClient, switchToTarget, getCurrentTargetId) {
         version: pkgInfo.version,
     });
     registerTabTools(server, { switchToTarget, getCurrentTargetId, session });
-    registerPageTools(server, getClient);
+    registerPageTools(server, getClient, session);
     registerNavigationTools(server, getClient, session);
     registerDebuggerTools(server, getClient, session);
     registerConsoleTools(server, getClient, session);

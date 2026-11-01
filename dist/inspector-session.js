@@ -440,14 +440,19 @@ export function createInspectorSession() {
                 ...(orig && { source: orig.source, sourceLine: orig.line, sourceColumn: orig.column + 1 }),
             };
         },
-        // Resolves true when the next paused event arrives, false on timeout.
-        // Call BEFORE issuing the step command to avoid missing the event.
-        waitForNextPause: (client, timeoutMs = 5000) => new Promise((resolve) => {
-            const timer = setTimeout(() => resolve(false), timeoutMs);
-            client.once('Debugger.paused', () => {
+        waitForNextPause: (client, timeoutMs) => new Promise((resolve) => {
+            const emitter = client;
+            const onPaused = () => {
                 clearTimeout(timer);
                 resolve(true);
-            });
+            };
+            // Taken off when nothing came. pause_execution times out on every idle page, and a
+            // listener left behind each time would stay on the client for as long as it lives.
+            const timer = setTimeout(() => {
+                emitter.removeListener('Debugger.paused', onPaused);
+                resolve(false);
+            }, timeoutMs);
+            emitter.once('Debugger.paused', onPaused);
         }),
         readConsoleLogs({ limit, level, since = 'before-connect' }) {
             // The three buckets are ordered, so the filter and the label are the same question

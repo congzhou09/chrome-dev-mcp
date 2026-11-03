@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { describe, it, expect, vi } from 'vitest';
 import {
   BRING_TO_FRONT_TIMEOUT_MS,
@@ -178,6 +179,28 @@ describe('get_computed_style', () => {
     expect(result.isError).toBeFalsy();
   });
 
+  it('explains empty values in the result when there is one', async () => {
+    const style = { color: 'rgb(0, 0, 0)', border: '', colour: '' };
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: style } });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({
+      name: 'get_computed_style',
+      arguments: { selector: '#app', properties: ['color', 'border', 'colour'] },
+    });
+
+    expect(result.content).toEqual([
+      { type: 'text', text: JSON.stringify(style, null, 2) },
+      {
+        type: 'text',
+        text: expect.stringMatching(
+          /^An unknown property comes back as an empty string\. So does a shorthand .*longhands instead\.$/,
+        ),
+      },
+    ]);
+    expect(result.structuredContent).toEqual({ styles: style });
+  });
+
   it('sets isError with a not-found message when element does not match', async () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { value: null } });
     const client = await setupMcpClient(makeMockClient(evaluate));
@@ -187,9 +210,71 @@ describe('get_computed_style', () => {
       arguments: { selector: '.nonexistent', properties: ['display'] },
     });
 
-    expect(result.content).toEqual([{ type: 'text', text: 'No element matches selector: .nonexistent' }]);
+    const text = (result.content as any)[0].text as string;
+    expect(text).toMatch(/^No element matches selector: \.nonexistent\. /);
+    // The element may well exist where querySelector does not look, so the message says where that is.
+    expect(text).toContain('shadow roots');
+    expect(text).toContain('pseudo-element');
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toBeUndefined();
+  });
+
+  // Without this check, the undefined value of a thrown querySelector reached the outputSchema, and
+  // the caller got a protocol error about `styles` instead of one about the selector.
+  it("reports an invalid selector with the first line of Chrome's error", async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: { type: 'object', subtype: 'error', className: 'SyntaxError' },
+      exceptionDetails: {
+        text: 'Uncaught',
+        exception: {
+          description:
+            "SyntaxError: Failed to execute 'querySelector' on 'Document': '#123' is not a valid selector.\n" +
+            '    at <anonymous>:3:31\n    at <anonymous>:11:11',
+        },
+      },
+    });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await client.callTool({
+      name: 'get_computed_style',
+      arguments: { selector: '#123', properties: ['display'] },
+    });
+
+    expect(result.content).toEqual([
+      {
+        type: 'text',
+        text: "SyntaxError: Failed to execute 'querySelector' on 'Document': '#123' is not a valid selector.",
+      },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+  });
+
+  // The values are read in the page, so the expression itself is run here, against a stand-in for
+  // the style object: kebab-case through getPropertyValue, camelCase as a property, and the style
+  // object's own members (`length` is a number in Chrome, `item` a function) never as a value.
+  it('reads each name as a CSS property and returns only strings', async () => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: {} } });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+    const properties = ['display', 'backgroundColor', 'colour', 'length', 'item'];
+
+    await client.callTool({ name: 'get_computed_style', arguments: { selector: '#app', properties } });
+
+    const style = {
+      getPropertyValue: (name: string) => (name === 'display' ? 'flex' : ''),
+      backgroundColor: 'rgb(1, 2, 3)',
+      length: 481,
+      item: () => '',
+    };
+    const page = { document: { querySelector: () => ({}) }, getComputedStyle: () => style };
+    const value = runInNewContext(evaluate.mock.calls[0][0].expression, page);
+    expect(JSON.parse(JSON.stringify(value))).toEqual({
+      display: 'flex',
+      backgroundColor: 'rgb(1, 2, 3)',
+      colour: '',
+      length: '',
+      item: '',
+    });
   });
 });
 
@@ -880,7 +965,7 @@ describe('screenshot', () => {
 });
 
 describe('get_inspected_element', () => {
-  it('returns element info when window.$0 is set', async () => {
+  it('returns element info when window.$0 is set, and says to read more of it through window.$0', async () => {
     const elementData = {
       tagName: 'div',
       id: 'app',
@@ -893,7 +978,11 @@ describe('get_inspected_element', () => {
 
     const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
 
-    expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(elementData, null, 2) }]);
+    expect(result.content).toEqual([
+      { type: 'text', text: JSON.stringify(elementData, null, 2) },
+      { type: 'text', text: expect.stringContaining('evaluate_js, e.g. `getComputedStyle(window.$0).color`') },
+    ]);
+    expect(result.structuredContent).toEqual(elementData);
   });
 
   it('returns guidance message when window.$0 is not set', async () => {
@@ -903,6 +992,30 @@ describe('get_inspected_element', () => {
     const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
 
     expect((result.content as any)[0].text).toMatch(/window\.\$0 = \$0/);
+  });
+
+  // The expression itself is run here, against a marked element the page has removed.
+  it('reports a marked element the page has since removed', async () => {
+    class Element {}
+    const removed = Object.assign(new Element(), {
+      isConnected: false,
+      tagName: 'SPAN',
+      className: 'label',
+      attributes: [{ name: 'class', value: 'label' }],
+      outerHTML: '<span class="label">B</span>',
+    });
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: { value: runInNewContext(expression, { window: { $0: removed }, Element }) },
+    }));
+    const mcpClient = await setupMcpClient(makeMockClient(evaluate));
+
+    const result = await mcpClient.callTool({ name: 'get_inspected_element', arguments: {} });
+
+    expect((result.content as any)[0].text).toMatch(
+      /^The marked element has been removed from the page\. If another element replaced it, .*window\.\$0 = \$0/,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
   });
 
   it('returns not-connected message with isError when Chrome is unavailable', async () => {

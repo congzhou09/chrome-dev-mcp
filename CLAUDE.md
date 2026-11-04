@@ -4,6 +4,12 @@
 - Chrome may already have active targets, sessions, breakpoints, or enabled domains before this MCP server starts.
 - All tools should handle and synchronize these existing states during server initialization.
 
+# Chrome Behavior
+
+- A behavior measured in one Chrome version is not a guarantee. Before code depends on one, look for what guarantees it: the protocol documentation (anything it marks experimental guarantees nothing: a whole domain, or a single command, event or parameter), a web standard, or a Chromium test that asserts it. The comment names the strongest of these that was found, or says that only the measurement supports the behavior.
+- Code must cope with an unguaranteed behavior changing. The comment says what happens then. Allowed: the feature that depends on the behavior gets slower or less precise, or reports an error. Not allowed: a silently wrong answer, or other features failing too.
+- Keep "Measured, Chrome N" notes. They are the evidence for a number or a design choice, and the version says when that evidence was taken.
+
 # Client-Agnostic
 
 - This MCP server is generic: do not design tools or write docs around any one client, Claude Code included.

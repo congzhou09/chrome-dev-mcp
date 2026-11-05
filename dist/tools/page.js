@@ -415,7 +415,7 @@ export function registerPageTools(server, getClient, session) {
         return { content: withNote(text) };
     });
     server.registerTool('get_computed_style', {
-        description: 'Get computed CSS values for the given properties on the element matched by selector.',
+        description: 'Get computed CSS values for the given properties on the first element matching `selector`.',
         inputSchema: z.object({
             selector: z.string().describe('CSS selector for the target element'),
             properties: z.array(z.string()).min(1).describe('CSS property names to return (kebab-case or camelCase)'),
@@ -423,7 +423,7 @@ export function registerPageTools(server, getClient, session) {
         outputSchema: z.object({
             styles: z
                 .record(z.string(), z.string())
-                .describe('Map of property name → computed value. Keys match the input `properties` verbatim (case preserved). Values are `getComputedStyle` output; unknown properties yield empty string.'),
+                .describe('Map of property name → computed value. Keys match the input `properties` verbatim (case preserved).'),
         }),
         annotations: {
             title: 'Get computed style',
@@ -433,6 +433,9 @@ export function registerPageTools(server, getClient, session) {
         const client = await getClient();
         if (!client)
             return NOT_CONNECTED;
+        // getPropertyValue only reads kebab-case names, so `s[p]` reads a camelCase one such as `backgroundColor`.
+        // `s[p]` also reads the style object's own members: `s.length` is a number, `s.item` a function.
+        // The outputSchema accepts only strings, so any other value becomes an empty string.
         const expression = `
         (() => {
           const el = document.querySelector(${JSON.stringify(selector)});
@@ -440,7 +443,8 @@ export function registerPageTools(server, getClient, session) {
           const s = getComputedStyle(el);
           const out = {};
           for (const p of ${JSON.stringify(properties)}) {
-            out[p] = s.getPropertyValue(p) || s[p] || '';
+            const value = s.getPropertyValue(p) || s[p];
+            out[p] = typeof value === 'string' ? value : '';
           }
           return out;
         })()
@@ -448,15 +452,34 @@ export function registerPageTools(server, getClient, session) {
         const result = await withTimeout(client.Runtime.evaluate({ expression, returnByValue: true, ...OWN_EXPRESSION }), PAGE_COMMAND_TIMEOUT_MS);
         if (result === TIMED_OUT)
             return rendererTimedOut('get_computed_style');
-        if (result.result.value === null) {
-            return {
-                content: [{ type: 'text', text: `No element matches selector: ${selector}` }],
-                isError: true,
-            };
+        // querySelector throws a SyntaxError for an invalid selector, such as `#123` or `div[`. The
+        // first line of the error names the selector; the stack after it points into this expression.
+        if (result.exceptionDetails) {
+            const error = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+            return toolError(error.split('\n')[0]);
         }
+        // Measured, Chrome 156: querySelector returns null, without an error, for an element inside
+        // an iframe or a shadow root, and for a pseudo-element such as `a::before`.
+        if (result.result.value === null) {
+            return toolError(`No element matches selector: ${selector}. Elements inside iframes and shadow roots are not searched. ` +
+                'A pseudo-element such as `::before` never matches.');
+        }
+        // The result explains empty values when there is one, so the description does not carry the
+        // explanation on every request.
+        //
+        // Measured, Chrome 156, all 729 property names Chrome knows, on elements styled to provoke an empty
+        // value. A value came back empty in two cases. One is a name an element has no value for: an at-rule
+        // descriptor such as `src` in `@font-face`, or one of a few legacy -webkit- names. The other is a shorthand
+        // that cannot express the element's longhands: `all` always, `border` and `border-block` with one side
+        // different, `font` with `font-variant-ligatures: none`.
         const styles = result.result.value;
+        const emptyNote = "An unknown property comes back as an empty string. So does a shorthand that cannot express the element's " +
+            'longhands, such as `border` when the sides differ; ask for the longhands instead.';
         return {
-            content: [{ type: 'text', text: JSON.stringify(styles, null, 2) }],
+            content: [
+                { type: 'text', text: JSON.stringify(styles, null, 2) },
+                ...(Object.values(styles).includes('') ? [{ type: 'text', text: emptyNote }] : []),
+            ],
             structuredContent: { styles },
         };
     });
@@ -808,6 +831,7 @@ export function registerPageTools(server, getClient, session) {
           (() => {
             const el = window.$0;
             if (!(el instanceof Element)) return null;
+            if (!el.isConnected) return 'removed';
             const attrs = {};
             for (const a of el.attributes) attrs[a.name] = a.value;
             return {
@@ -825,19 +849,25 @@ export function registerPageTools(server, getClient, session) {
         if (result === TIMED_OUT)
             return rendererTimedOut('get_inspected_element');
         if (result.result.value === null) {
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: 'No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.',
-                    },
-                ],
-                isError: true,
-            };
+            return toolError('No element marked. Select an element in the Elements panel, then run `window.$0 = $0` in the DevTools console.');
+        }
+        // `window.$0` still holds the element after the page removes or replaces it. Measured, Chrome 156:
+        // the removed element keeps its tag, attributes and HTML. getComputedStyle gives every property of
+        // it an empty value.
+        if (result.result.value === 'removed') {
+            return toolError('The marked element has been removed from the page. If another element replaced it, select that one in the Elements panel, then run `window.$0 = $0` in the DevTools console.');
         }
         const el = result.result.value;
+        // A selector built from the element's id or classes can match a different element first, so the
+        // result tells the caller to read more of the element through `window.$0` in evaluate_js.
         return {
-            content: [{ type: 'text', text: JSON.stringify(el, null, 2) }],
+            content: [
+                { type: 'text', text: JSON.stringify(el, null, 2) },
+                {
+                    type: 'text',
+                    text: 'This element is `window.$0` in the page. Read more of it with evaluate_js, e.g. `getComputedStyle(window.$0).color`.',
+                },
+            ],
             structuredContent: el,
         };
     });

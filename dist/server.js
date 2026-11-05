@@ -13,9 +13,9 @@ import { registerTabTools } from './tools/tabs.js';
 // just the dependencies it actually uses, rather than one shared context object.
 //
 // The two sessions attach on deliberately different schedules: network capture is eager
-// (index.ts calls attachNetwork at connect time, because Network.enable() does not replay
-// history), while the Debugger/Console session is lazy (Debugger.enable() has a real cost,
-// and Console.enable() replays history whenever it happens to run).
+// (enableTarget in targets.ts calls attachNetwork at connect time, because Network.enable()
+// does not replay history), while the Debugger/Console session is lazy (Debugger.enable() has
+// a real cost, and Console.enable() replays history whenever it happens to run).
 export function createServer(getClient, switchToTarget, getCurrentTargetId) {
     const session = createInspectorSession();
     const networkCapture = createNetworkCapture();

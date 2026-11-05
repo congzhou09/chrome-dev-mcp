@@ -145,8 +145,8 @@ export function createNetworkCapture() {
             maxResourceBufferSize: NETWORK_MAX_RESOURCE_BUFFER_SIZE,
         });
     };
-    // Attached eagerly from index.ts at connect time, because Network.enable() does NOT
-    // replay history the way Console.enable() does — anything before enable is lost
+    // Attached eagerly at connect time by enableTarget (targets.ts), because Network.enable()
+    // does NOT replay history the way Console.enable() does — anything before enable is lost
     // forever. Unlike Debugger.enable() it has no page-observable side effect (no JIT
     // deoptimisation) and no handshake to wait on, so paying for it on every connection
     // is cheap. Never rejects: a network failure must not fail the whole connection.

@@ -13,15 +13,20 @@ export const MAX_HTML_LENGTH = 20_000;
 // ── Connection timeouts ───────────────────────────────────────────────────────
 //
 // Chrome is never assumed to be in a clean debugging state. A renderer stuck in a synchronous
-// loop or blocked on a modal answers NO CDP command — not even Runtime.enable — and never
-// rejects either. One paused at a breakpoint is not among them: measured, Chrome 156, it
-// answered Runtime.evaluate, Runtime.enable and Page.enable from a fresh connection within
-// 2ms. Every command issued while building a connection is therefore bounded; without that,
-// one wedged tab parks the shared connection promise forever and every tool that needs a
-// client times out at the MCP layer while browser-level tools like list_tabs keep working.
-// Per-target visibility probe. Only has to survive one round-trip to a healthy renderer.
+// loop or blocked on a modal answers no CDP command that the renderer handles — not even
+// Runtime.enable — and never rejects either. Neither does a tab with no renderer at all: Chrome
+// discards a background tab to free memory by ending its renderer (see chromeReportsNoRenderer in
+// targets.ts). One paused at a breakpoint is not among them: measured, Chrome 156, it answered Runtime.evaluate,
+// Runtime.enable and Page.enable from a fresh connection within 2ms. Every command issued while
+// building a connection is therefore bounded; without that, one wedged tab parks the shared
+// connection promise forever and every tool that needs a client times out at the MCP layer while
+// browser-level tools like list_tabs keep working.
+// Per-target visibility probe: one round-trip to the browser process (chromeReportsNoRenderer), then
+// one to a healthy renderer.
 export const TARGET_PROBE_TIMEOUT_MS = 2000;
-// Runtime.enable + Page.enable + Network.enable against the chosen target, as a group.
+// Everything connecting to the chosen target waits for, as a group: Inspector.enable, Runtime.enable,
+// Page.enable and Network.enable. For a tab with no renderer it also covers the reload that
+// connecting starts, until the reloaded page's renderer answers the enables.
 export const CONNECT_TIMEOUT_MS = 10_000;
 // Backstop on the transition queue itself: how long a queued transition waits for its
 // predecessor before giving up on serialisation and running anyway. Serialisation is worth

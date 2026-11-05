@@ -27,7 +27,7 @@ export async function measureToolCost() {
   // are never called and the stubs never have to return a real client.
   const { server } = createServer(
     async () => null,
-    async () => null,
+    async () => ({ client: null, noRenderer: false }),
     () => null,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

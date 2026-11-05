@@ -72,6 +72,19 @@ describe('list_tabs', () => {
     vi.restoreAllMocks();
   });
 
+  it('reports a tab with no renderer as not on screen rather than as not answering', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    vi.mocked(probeVisible).mockImplementation(async (id) => (id === 'tab-1' ? 'no-renderer' : true));
+    const mcpClient = await setupMcpClient(null);
+
+    const result = await mcpClient.callTool({ name: 'list_tabs', arguments: {} });
+
+    const { tabs } = result.structuredContent as any;
+    expect(tabs.map((t: any) => t.active)).toEqual([false, true]);
+
+    vi.restoreAllMocks();
+  });
+
   it('marks a tab in each visible window active', async () => {
     vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
     visibility({ 'tab-1': true, 'tab-2': true });
@@ -127,7 +140,7 @@ describe('switch_tab', () => {
     const newClient = makeMockClient(
       vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
     );
-    const switchToTarget = vi.fn().mockResolvedValue(newClient);
+    const switchToTarget = vi.fn().mockResolvedValue({ client: newClient, noRenderer: false });
     const mcpClient = await setupMcpClient(null, switchToTarget);
 
     const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
@@ -152,7 +165,7 @@ describe('switch_tab', () => {
         }),
       },
     );
-    const mcpClient = await setupMcpClient(null, vi.fn().mockResolvedValue(newClient));
+    const mcpClient = await setupMcpClient(null, vi.fn().mockResolvedValue({ client: newClient, noRenderer: false }));
 
     const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
 
@@ -160,6 +173,40 @@ describe('switch_tab', () => {
       'Switched to: My App — http://localhost:3000/\n' +
         'Execution in this tab is paused (reason: other). get_debugger_state shows where.',
     );
+  });
+
+  it('says it reloaded a tab that Chrome had discarded', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    const newClient = makeMockClient(
+      vi.fn().mockResolvedValue({ result: { value: { title: 'My App', url: 'http://localhost:3000/' } } }),
+    );
+    const switchToTarget = vi.fn().mockResolvedValue({ client: newClient, noRenderer: true });
+    const mcpClient = await setupMcpClient(null, switchToTarget);
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-1' } });
+
+    expect((result.content as any)[0].text).toBe(
+      'Switched to: My App — http://localhost:3000/\n' +
+        'Chrome had discarded this tab to free memory, so switch_tab reloaded it.',
+    );
+    expect(result.structuredContent).toEqual({ targetId: 'tab-1', title: 'My App', url: 'http://localhost:3000/' });
+  });
+
+  it('tells a reload that did not answer apart from a blocked tab', async () => {
+    vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
+    const switchToTarget = vi.fn().mockResolvedValue({ client: null, noRenderer: true });
+    const mcpClient = await setupMcpClient(null, switchToTarget, () => 'tab-1');
+
+    const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-2' } });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content as any)[0].text;
+    expect(text).toMatch(/^Failed to connect to tab tab-2\. It had no page loaded, so switch_tab had Chrome reload it/);
+    expect(text).toMatch(/connection to tab tab-1 was closed before this attempt, so no tab is connected now/);
+    expect(text).toMatch(
+      /Select the tab in Chrome, and reload it there if Chrome shows an error page in it\. Then retry switch_tab\.$/,
+    );
+    expect(text).not.toMatch(/synchronous loop/);
   });
 
   it('refuses a targetId Chrome does not list, and keeps the current connection', async () => {
@@ -179,7 +226,7 @@ describe('switch_tab', () => {
 
   it('says no tab is connected when the connect fails after the previous connection was closed', async () => {
     vi.spyOn(CDP, 'List' as any).mockResolvedValueOnce(TWO_TABS);
-    const switchToTarget = vi.fn().mockResolvedValue(null);
+    const switchToTarget = vi.fn().mockResolvedValue({ client: null, noRenderer: false });
     const mcpClient = await setupMcpClient(null, switchToTarget, () => 'tab-1');
 
     const result = await mcpClient.callTool({ name: 'switch_tab', arguments: { targetId: 'tab-2' } });

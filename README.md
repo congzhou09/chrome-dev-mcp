@@ -169,10 +169,10 @@ claude mcp add --transport stdio chrome-dev -- node "path/to/chrome-dev-mcp/dist
 
 ### Tab management
 
-| Tool         | Description                                                                                                                                                                                                                     |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_tabs`  | List all open Chrome page tabs as `[{ targetId, title, url, active?, connected }]` — `active` marks a tab showing on screen (one per visible window; absent if the tab did not answer), `connected` the tab this server acts on |
-| `switch_tab` | Connect this server to another tab by `targetId` (from `list_tabs`), without bringing it to the front. Breakpoints and the console and network buffers start over on the new tab                                                |
+| Tool         | Description                                                                                                                                                                                                                              |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_tabs`  | List all open Chrome page tabs as `[{ targetId, title, url, active?, connected }]` — `active` marks a tab showing on screen (one per visible window; absent if the tab did not answer), `connected` the tab this server acts on          |
+| `switch_tab` | Connect this server to another tab by `targetId` (from `list_tabs`), without bringing it to the front. A tab that Chrome discarded to free memory is reloaded. Breakpoints and the console and network buffers start over on the new tab |
 
 ### Page inspection
 

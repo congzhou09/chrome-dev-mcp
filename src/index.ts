@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CONNECT_TIMEOUT_MS, TRANSITION_WAIT_TIMEOUT_MS } from './constants.js';
 import { TIMED_OUT, withTimeout } from './timeout.js';
 import { createServer } from './server.js';
-import { listPageTargets, probeVisible } from './targets.js';
+import { type SwitchResult, chromeReportsNoRenderer, enableTarget, listPageTargets, probeVisible } from './targets.js';
 
 let cdpClient: CDP.Client | null = null;
 let currentTargetId: string | null = null;
@@ -57,17 +57,21 @@ const { server, attachNetwork } = createServer(getClient, switchToTarget, () => 
 //
 // The probe is bounded because an unresponsive target is a normal thing to find: Chrome is
 // never assumed to start in a clean debugging state, and a renderer stuck in a synchronous
-// loop or blocked on a modal answers no CDP command. Falling back to the first page target
-// unconditionally would hand back exactly such a tab and move the hang one layer down, so
-// the fallback is the first target that actually answered.
+// loop or blocked on a modal answers no CDP command that the renderer handles. Falling back to the
+// first page target unconditionally would hand back exactly such a tab and move the hang one layer
+// down, so the fallback is the first target that actually answered.
+//
+// A tab with no renderer is skipped too. Connecting to such a tab reloads its page, and no caller
+// asked for that tab.
 async function findActivePageTargetId(): Promise<string | undefined> {
   let firstResponsive: string | undefined;
 
   // One at a time, unlike list_tabs: the first visible tab ends the search.
   for (const target of await listPageTargets()) {
     const visible = await probeVisible(target.id);
-    if (visible === undefined) {
-      console.error(`[chrome-dev-mcp] Target not responding, skipped: ${target.url}`);
+    if (visible === undefined || visible === 'no-renderer') {
+      const why = visible === undefined ? 'not responding' : 'has no renderer';
+      console.error(`[chrome-dev-mcp] Target ${why}, skipped: ${target.url}`);
       continue;
     }
     firstResponsive ??= target.id;
@@ -77,22 +81,25 @@ async function findActivePageTargetId(): Promise<string | undefined> {
   return firstResponsive;
 }
 
-async function connectToTarget(targetId: string): Promise<CDP.Client> {
+// `onNoRenderer` is called once Chrome reports that the target has no renderer, so the caller learns
+// of the missing renderer even when connecting then fails.
+async function connectToTarget(targetId: string, onNoRenderer?: () => void): Promise<CDP.Client> {
   const client = await CDP({ host: '127.0.0.1', port: 9222, target: targetId });
+  let noRenderer = false;
 
-  // Every enable below is a round-trip the renderer has to answer, and a wedged one answers
-  // none of them — including a target named explicitly through switch_tab, which never went
-  // through findActivePageTargetId's probe. Bounded as a group so a bad target fails the
-  // connection instead of parking it forever.
+  // Every enable is a round-trip the renderer has to answer, and a wedged one answers none of
+  // them — including a target named explicitly through switch_tab, which never went through
+  // findActivePageTargetId's probe. Bounded as a group so a bad target fails the connection
+  // instead of parking it forever.
+  //
+  // A tab with no renderer is reloaded while connecting, as Chrome reloads a discarded tab once it
+  // is selected (see enableTarget). The bound then also covers the wait for the reloaded page's
+  // renderer.
   const ready = await withTimeout(
     (async () => {
-      await client.Runtime.enable();
-      await client.Page.enable();
-
-      // Eager attach: Network.enable() does not replay history, so capture has to start at
-      // connect time rather than on the first tool call. Cheap and side-effect-free, unlike
-      // Debugger.enable() — which is why that one stays lazy. Never rejects.
-      await attachNetwork(client);
+      noRenderer = await chromeReportsNoRenderer(client);
+      if (noRenderer) onNoRenderer?.();
+      await enableTarget(client, attachNetwork, noRenderer);
     })(),
     CONNECT_TIMEOUT_MS,
   ).catch(async (e) => {
@@ -104,7 +111,9 @@ async function connectToTarget(targetId: string): Promise<CDP.Client> {
     // Leaving it open would keep a half-enabled client feeding the shared capture buffer.
     await client.close().catch(() => {});
     throw new Error(
-      `target ${targetId} did not respond within ${CONNECT_TIMEOUT_MS}ms (renderer busy, or blocked on a dialog?)`,
+      noRenderer
+        ? `target ${targetId} had no renderer, and its reloaded page did not respond within ${CONNECT_TIMEOUT_MS}ms`
+        : `target ${targetId} did not respond within ${CONNECT_TIMEOUT_MS}ms (renderer busy, or blocked on a dialog?)`,
     );
   }
 
@@ -144,11 +153,12 @@ async function getClient(): Promise<CDP.Client | null> {
   });
 }
 
-async function switchToTarget(targetId: string): Promise<CDP.Client | null> {
+async function switchToTarget(targetId: string): Promise<SwitchResult> {
+  let noRenderer = false;
   // Queued rather than run immediately: the eager connect from startup can still be in
   // flight with `cdpClient` not yet assigned, and closing before it lands would close
   // nothing and leave that client open on the old target.
-  return queueTransition(async () => {
+  const client = await queueTransition(async () => {
     // Already on this target: hand back the live client instead of rebuilding. A rebuild
     // would reset the network capture buffer and the debugger state for nothing, and it
     // would pull the client out from under a concurrent caller still using it. A client
@@ -163,12 +173,15 @@ async function switchToTarget(targetId: string): Promise<CDP.Client | null> {
       currentTargetId = null;
     }
     try {
-      return await connectToTarget(targetId);
+      return await connectToTarget(targetId, () => {
+        noRenderer = true;
+      });
     } catch (e) {
       console.error('[chrome-dev-mcp] Failed to switch to target:', (e as Error).message);
       return null;
     }
   });
+  return { client, noRenderer };
 }
 
 // Start MCP transport before attempting Chrome connection so Claude Code

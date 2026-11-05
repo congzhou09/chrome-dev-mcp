@@ -10,7 +10,7 @@ import type { NetworkRecord } from './types.js';
 
 export interface NetworkCapture {
   /**
-   * Eager attach, called by index.ts at connect time. Never rejects.
+   * Eager attach, called by enableTarget (targets.ts) at connect time. Never rejects.
    *
    * Resolves true when THIS call performed the attach, which also means the capture
    * buffer and the tombstone set were just reset. Callers turn that into a
@@ -196,8 +196,8 @@ export function createNetworkCapture(): NetworkCapture {
     });
   };
 
-  // Attached eagerly from index.ts at connect time, because Network.enable() does NOT
-  // replay history the way Console.enable() does — anything before enable is lost
+  // Attached eagerly at connect time by enableTarget (targets.ts), because Network.enable()
+  // does NOT replay history the way Console.enable() does — anything before enable is lost
   // forever. Unlike Debugger.enable() it has no page-observable side effect (no JIT
   // deoptimisation) and no handshake to wait on, so paying for it on every connection
   // is cheap. Never rejects: a network failure must not fail the whole connection.

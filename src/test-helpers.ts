@@ -4,6 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import CDP from 'chrome-remote-interface';
 import { createServer } from './server.js';
+import type { SwitchResult } from './targets.js';
 
 export function makeMockClient(
   // Resolves rather than returning undefined: every tool here awaits Runtime.evaluate, and
@@ -65,11 +66,11 @@ export function makeMockClient(
   }) as unknown as CDP.Client;
 }
 
-// Exposes attachNetwork alongside the MCP client. In production index.ts calls it at
-// connect time; tests have to call it explicitly to start network capture.
+// Exposes attachNetwork alongside the MCP client. In production, enableTarget (targets.ts) calls
+// it at connect time; tests have to call it explicitly to start network capture.
 export async function setupServer(
   cdpClient: CDP.Client | null | (() => CDP.Client | null),
-  switchToTarget: (targetId: string) => Promise<CDP.Client | null> = vi.fn(),
+  switchToTarget: (targetId: string) => Promise<SwitchResult> = vi.fn(),
   getCurrentTargetId: () => string | null = () => null,
 ) {
   const getClient = typeof cdpClient === 'function' ? cdpClient : () => cdpClient;
@@ -83,7 +84,7 @@ export async function setupServer(
 
 export async function setupMcpClient(
   cdpClient: CDP.Client | null,
-  switchToTarget: (targetId: string) => Promise<CDP.Client | null> = vi.fn(),
+  switchToTarget: (targetId: string) => Promise<SwitchResult> = vi.fn(),
   getCurrentTargetId: () => string | null = () => null,
 ) {
   const { mcpClient } = await setupServer(cdpClient, switchToTarget, getCurrentTargetId);

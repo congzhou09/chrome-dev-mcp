@@ -1,4 +1,3 @@
-import CDP from 'chrome-remote-interface';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
@@ -9,7 +8,7 @@ import {
   rendererTimedOut,
 } from '../constants.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
-import { type PageTarget, listPageTargets, probeVisible } from '../targets.js';
+import { type PageTarget, type SwitchResult, listPageTargets, probeVisible } from '../targets.js';
 import type { InspectorSession } from '../inspector-session.js';
 
 const toolError = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true });
@@ -19,7 +18,7 @@ const toolError = (text: string) => ({ content: [{ type: 'text' as const, text }
 export function registerTabTools(
   server: McpServer,
   deps: {
-    switchToTarget: (targetId: string) => Promise<CDP.Client | null>;
+    switchToTarget: (targetId: string) => Promise<SwitchResult>;
     getCurrentTargetId: () => string | null;
     session: InspectorSession;
   },
@@ -61,14 +60,19 @@ export function registerTabTools(
       const connectedId = getCurrentTargetId();
       // All at once, so that however many tabs fail to answer, the call waits one
       // TARGET_PROBE_TIMEOUT_MS at most rather than one per tab.
-      const visible = await Promise.all(pages.map((t) => probeVisible(t.id)));
-      const tabs = pages.map((t, i) => ({
-        targetId: t.id,
-        title: t.title,
-        url: t.url,
-        ...(visible[i] !== undefined && { active: visible[i] }),
-        connected: t.id === connectedId,
-      }));
+      const probes = await Promise.all(pages.map((t) => probeVisible(t.id)));
+      const tabs = pages.map((t, i) => {
+        // A tab with no renderer shows no page. Chrome reloads a discarded tab as soon as it is
+        // selected, so a discarded tab is never on screen, and switch_tab reloads it.
+        const active = probes[i] === 'no-renderer' ? false : probes[i];
+        return {
+          targetId: t.id,
+          title: t.title,
+          url: t.url,
+          ...(active !== undefined && { active }),
+          connected: t.id === connectedId,
+        };
+      });
       return {
         content: [{ type: 'text', text: JSON.stringify(tabs, null, 2) }],
         structuredContent: { tabs },
@@ -121,20 +125,31 @@ export function registerTabTools(
         );
       }
 
-      const client = await switchToTarget(targetId);
+      const { client, noRenderer } = await switchToTarget(targetId);
       if (!client) {
         // The tab was listed a moment ago. So either it has closed since, or its renderer did not
         // answer the enables that connectToTarget (index.ts) sends. switchToTarget learns of either
         // only after it has closed the previous connection.
+        const dropped =
+          (previous
+            ? `The connection to tab ${previous} was closed before this attempt, so no tab is connected now. `
+            : 'No tab is connected now. ') +
+          'The next tool call that acts on a page will automatically connect to a tab that answers, preferring one showing on screen. ';
+        // switchToTarget reloads a tab with no renderer while connecting. That reload brings back a
+        // discarded tab but not a crashed one (measured at restoreDiscardedTab). A retry would find a
+        // slow page still without a renderer and start another reload, so the advice is to load the
+        // tab in Chrome instead, which waits for as long as the page takes.
         return toolError(
-          `Failed to connect to tab ${targetId}. Either it was closed, or it did not answer within ` +
-            `${CONNECT_TIMEOUT_MS / 1000}s: a tab blocked in a synchronous loop or on a modal dialog does not answer. ` +
-            (previous
-              ? `The connection to tab ${previous} was closed before this attempt, so no tab is connected now. `
-              : 'No tab is connected now. ') +
-            'The next tool call that acts on a page will automatically connect to a tab that answers, preferring one showing on screen. ' +
-            'Call list_tabs, then switch_tab to the tab you want. ' +
-            'If the tab is blocked, retry switch_tab once its loop ends or its dialog is closed in Chrome.',
+          noRenderer
+            ? `Failed to connect to tab ${targetId}. It had no page loaded, so switch_tab had Chrome reload it, ` +
+                "but the reloaded page did not answer: it is slow to load, or the tab's renderer crashed. " +
+                dropped +
+                'Select the tab in Chrome, and reload it there if Chrome shows an error page in it. Then retry switch_tab.'
+            : `Failed to connect to tab ${targetId}. Either it was closed, or it did not answer within ` +
+                `${CONNECT_TIMEOUT_MS / 1000}s: a tab blocked in a synchronous loop or on a modal dialog does not answer. ` +
+                dropped +
+                'Call list_tabs, then switch_tab to the tab you want. ' +
+                'If the tab is blocked, retry switch_tab once its loop ends or its dialog is closed in Chrome.',
         );
       }
 
@@ -158,8 +173,11 @@ export function registerTabTools(
       const paused = session.state.paused
         ? `\nExecution in this tab is paused (reason: ${session.state.pauseReason}). get_debugger_state shows where.`
         : '';
+      // The reload switchToTarget starts brings back a discarded tab but not a crashed one (measured
+      // at restoreDiscardedTab). So a tab that had no renderer and now answers had been discarded.
+      const reloaded = noRenderer ? '\nChrome had discarded this tab to free memory, so switch_tab reloaded it.' : '';
       return {
-        content: [{ type: 'text', text: `Switched to: ${title} — ${url}${paused}` }],
+        content: [{ type: 'text', text: `Switched to: ${title} — ${url}${reloaded}${paused}` }],
         structuredContent: { targetId, title, url },
       };
     },

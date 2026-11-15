@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.congzhou09/chrome-dev-mcp",
+  "description": "Debug an already-running Chrome tab: breakpoints, stepping, scope variables, console, network",
+  "repository": {
+    "url": "https://github.com/congzhou09/chrome-dev-mcp",
+    "source": "github",
+    "id": "1244366416"
+  },
+  "version": "2.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "chrome-dev-mcp",
+      "version": "2.0.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

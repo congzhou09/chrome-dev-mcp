@@ -133,6 +133,9 @@ export function registerNavigationTools(
       // to an attachment or a non-renderable type answered `errorText: "net::ERR_ABORTED"`,
       // `isDownload: true` and a loaderId, with downloads allowed and denied alike; the old
       // page stayed and no load event followed.
+      // The protocol marks `isDownload` experimental. If Chrome stops sending it, a download
+      // reaches the errorText check below and is reported as a failed navigation with
+      // "net::ERR_ABORTED".
       if (response.isDownload) return finish({ outcome: 'download' });
       // A navigation that fails outright still commits Chrome's own error page, which fires a
       // load event — waiting for it would report the failure as a successful "loaded".
@@ -241,10 +244,7 @@ export function registerNavigationTools(
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       return navigateAndSettle(client, 'navigate', async () => {
-        // `isDownload` is in the protocol but not yet in @types/chrome-remote-interface.
-        const { loaderId, errorText, isDownload } = (await client.Page.navigate({ url })) as Awaited<
-          ReturnType<CDP.Client['Page']['navigate']>
-        > & { isDownload?: boolean };
+        const { loaderId, errorText, isDownload } = await client.Page.navigate({ url });
         // No loaderId means no new document: a #hash change, which fires no load event at all.
         // Measured, Chrome 154: the only event that followed was Page.navigatedWithinDocument.
         return { sameDocument: !loaderId, errorText, isDownload };

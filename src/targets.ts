@@ -1,5 +1,6 @@
 import CDP from 'chrome-remote-interface';
 import { OWN_EXPRESSION, TARGET_PROBE_TIMEOUT_MS } from './constants.js';
+import { watchDialogs } from './dialog.js';
 import { TIMED_OUT, withTimeout } from './timeout.js';
 
 export type PageTarget = { id: string; title: string; url: string };
@@ -87,6 +88,7 @@ export async function enableTarget(
   attachNetwork: (client: CDP.Client) => Promise<boolean>,
   restore: boolean,
 ): Promise<void> {
+  watchDialogs(client);
   const enabled = Promise.all([client.Runtime.enable(), client.Page.enable(), attachNetwork(client)]);
   // `enabled` is awaited below, unless restoreDiscardedTab throws first. In that case the caller
   // closes the connection, which rejects every command still unanswered, and this handler keeps

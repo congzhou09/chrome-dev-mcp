@@ -53,6 +53,8 @@ function targetClient({
         entries: [{ id: 10 }, { id: 11 }, { id: 12 }],
       })),
       navigateToHistoryEntry: record('Page.navigateToHistoryEntry', navigateToHistoryEntry),
+      javascriptDialogOpening: (listener: (event: unknown) => void) => events.on('javascriptDialogOpening', listener),
+      javascriptDialogClosed: (listener: (event: unknown) => void) => events.on('javascriptDialogClosed', listener),
     },
     close: vi.fn().mockResolvedValue(undefined),
   };

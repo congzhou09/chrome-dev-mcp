@@ -16,6 +16,7 @@ import {
   SCREENSHOT_TIMEOUT_MS,
   rendererTimedOut,
 } from '../constants.js';
+import { currentDialog, dialogHold } from '../dialog.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import type { InspectorSession } from '../inspector-session.js';
@@ -450,10 +451,14 @@ export function registerPageTools(
             EVAL_TERMINATE_WAIT_MS,
           );
           if (ended === TIMED_OUT) {
+            const dialog = currentDialog();
             return toolError(
               `Error: the page has not responded for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s, and the expression did ` +
-                'not stop when terminated. The page may be showing a modal dialog (alert, confirm or prompt); ' +
-                'once the dialog is closed, the expression continues.',
+                'not stop when terminated. ' +
+                (dialog
+                  ? `The renderer is ${dialogHold(dialog).causes}. `
+                  : 'The page may be showing a modal dialog (alert, confirm or prompt). ') +
+                'Once the dialog is closed in Chrome, the expression continues.',
             );
           }
           if ('err' in ended) {
@@ -727,6 +732,15 @@ export function registerPageTools(
             // Three different failures land here and they call for different next moves, so
             // the message names the one that actually happened rather than blaming the clock
             // for all of them.
+            // A capture without `region` would be held by the dialog just the same.
+            const dialog = probed === TIMED_OUT ? currentDialog() : null;
+            if (dialog) {
+              const { causes, advice } = dialogHold(dialog);
+              return toolError(
+                `Error: the viewport could not be measured: the renderer did not answer within ` +
+                  `${LAYOUT_METRICS_TIMEOUT_MS}ms — it is ${causes}. ${advice}`,
+              );
+            }
             const why =
               probed === TIMED_OUT
                 ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be ` +
@@ -832,6 +846,18 @@ export function registerPageTools(
 
         let result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
 
+        // A dialog explains the timeout, and bringing the tab to the front does not close it.
+        const dialog = result === TIMED_OUT ? currentDialog() : null;
+        if (dialog) {
+          const { causes, advice } = dialogHold(dialog);
+          return {
+            ok: false,
+            error: toolError(
+              `Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms. The renderer is ${causes}. ` +
+                `${advice} Nothing was captured.`,
+            ),
+          };
+        }
         if (result === TIMED_OUT) {
           const front = client.Page.bringToFront();
           front.catch(() => {});

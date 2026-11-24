@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { makeMockClient, setupMcpClient, fireCdp, inlineSourceMap } from '../test-helpers.js';
+import { watchDialogs } from '../dialog.js';
 
 // The mock client is an EventEmitter, so the tool's own listeners hear `cdp.emit`. The
 // session's handlers are mock registrations instead, reached through fireCdp.
@@ -9,6 +10,14 @@ const commit = (cdp: any, url: string) => cdp.emit('Page.frameNavigated', { fram
 
 const pageRead = (url: string, title: string) =>
   vi.fn().mockResolvedValue({ result: { type: 'object', value: { url, title } } });
+
+// Subscriptions for watchDialogs, on the same emitter the tool listens on. watchDialogs subscribes
+// at connect time in the server, and setupMcpClient does not connect, so each test calls it.
+const dialogEvents = (cdp: () => any) => ({
+  javascriptDialogOpening: vi.fn((listener: any) => cdp().on('Page.javascriptDialogOpening', listener)),
+  javascriptDialogClosed: vi.fn((listener: any) => cdp().on('Page.javascriptDialogClosed', listener)),
+});
+const dialogEvent = (type: string, message = '') => ({ url: 'http://localhost/', message, type, hasBrowserHandler: true });
 
 const call = async (client: any, name: string, args: Record<string, unknown> = {}) => {
   const result: any = await client.callTool({ name, arguments: args });
@@ -83,6 +92,23 @@ describe('navigate_tab', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Cannot navigate to invalid URL');
   });
+
+  // Page.navigate answers only once the new document commits, which a beforeunload dialog holds back.
+  it('stops waiting for the commit when a dialog opens', async () => {
+    let cdp: any;
+    const navigate = vi.fn(() => {
+      later(() => cdp.emit('Page.javascriptDialogOpening', dialogEvent('beforeunload')));
+      return new Promise(() => {});
+    });
+    cdp = makeMockClient(undefined, undefined, {}, {}, {}, { navigate, ...dialogEvents(() => cdp) });
+    watchDialogs(cdp);
+    const client = await setupMcpClient(cdp);
+
+    const result = await call(client, 'navigate_tab', { url: 'http://localhost/next' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('The navigation waits for an answer in Chrome');
+  });
 });
 
 describe('reload_tab', () => {
@@ -131,6 +157,63 @@ describe('reload_tab', () => {
 
     expect(reload).toHaveBeenCalledWith({ ignoreCache: false });
     expect(result.structuredContent).toEqual({ outcome: 'loaded', url: 'http://localhost/', title: 'Home' });
+  });
+
+  it('returns at once when the page asks to confirm leaving, instead of waiting out the bound', async () => {
+    let cdp: any;
+    const reload = vi.fn(async () => {
+      later(() => cdp.emit('Page.javascriptDialogOpening', dialogEvent('beforeunload')));
+      return {};
+    });
+    cdp = makeMockClient(undefined, undefined, {}, {}, {}, { reload, ...dialogEvents(() => cdp) });
+    watchDialogs(cdp);
+    const client = await setupMcpClient(cdp);
+
+    const result = await call(client, 'reload_tab');
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('a beforeunload dialog');
+    expect(result.content[0].text).toContain('The reload waits for an answer in Chrome');
+  });
+
+  // As measured in Chrome: the old page's alert opens, the navigation closes it, and the new page loads.
+  it('goes on waiting through an alert the old page opens, which Chrome closes as the reload starts', async () => {
+    let cdp: any;
+    const reload = vi.fn(async () => {
+      later(() => {
+        cdp.emit('Page.javascriptDialogOpening', dialogEvent('alert', 'old page'));
+        cdp.emit('Page.javascriptDialogClosed', { result: false, userInput: '' });
+        commit(cdp, 'http://localhost/');
+        cdp.emit('Page.loadEventFired', { timestamp: 1 });
+      });
+      return {};
+    });
+    cdp = makeMockClient(pageRead('http://localhost/', 'Home'), undefined, {}, {}, {}, { reload, ...dialogEvents(() => cdp) });
+    watchDialogs(cdp);
+    const client = await setupMcpClient(cdp);
+
+    const result = await call(client, 'reload_tab');
+
+    expect(result.structuredContent).toEqual({ outcome: 'loaded', url: 'http://localhost/', title: 'Home' });
+  });
+
+  it('returns at once when the new page opens a dialog before its load event', async () => {
+    let cdp: any;
+    const reload = vi.fn(async () => {
+      later(() => {
+        commit(cdp, 'http://localhost/');
+        cdp.emit('Page.javascriptDialogOpening', dialogEvent('alert', 'startup'));
+      });
+      return {};
+    });
+    cdp = makeMockClient(undefined, undefined, {}, {}, {}, { reload, ...dialogEvents(() => cdp) });
+    watchDialogs(cdp);
+    const client = await setupMcpClient(cdp);
+
+    const result = await call(client, 'reload_tab');
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('the new page opened an alert dialog ("startup") before its load event');
   });
   // The edit-then-reload loop: the edited file's old breakpoint can fire during startup before it
   // is removed. The result has to say the stop may not be where it was set, and that it is gone.

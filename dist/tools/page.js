@@ -284,7 +284,8 @@ export function registerPageTools(server, getClient, session) {
             'Returns the real value when it serialises; objects that cannot (DOM nodes, Errors, Maps, class instances) come back ' +
             'as a preview instead: class name plus a first level of properties, marked `…` where Chrome truncated it — readable, ' +
             'not parseable as the value. ' +
-            'Top-level `await` works, but an expression that merely RETURNS a promise is NOT awaited — it comes back as a ' +
+            `Top-level \`await\` works (${EVAL_SETTLE_TIMEOUT_MS / 1000}s max), but an expression ` +
+            'that merely RETURNS a promise is NOT awaited — it comes back as a ' +
             'pending Promise, exactly as in the console. ' +
             'The call returns as soon as your expression finishes its synchronous work, before queued microtasks run, so the state ' +
             'triggered by a click is not visible in the same call: put `await Promise.resolve()` between the click and ' +
@@ -356,10 +357,12 @@ export function registerPageTools(server, getClient, session) {
                 watchForBlockedRenderer(client, () => done).then(() => ({ kind: 'blocked' })),
             ]), EVAL_SETTLE_TIMEOUT_MS);
             if (outcome === TIMED_OUT) {
-                return toolError(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms. Either it is waiting on ` +
+                return toolError(`Error: expression did not settle within ${EVAL_SETTLE_TIMEOUT_MS / 1000}s. Either it is waiting on ` +
                     'something that has not resolved (a pending promise, a request that never returns), or execution ' +
                     'is paused in the debugger, for example at a breakpoint set in DevTools; get_debugger_state shows ' +
-                    'which. The page is still running the expression.');
+                    'which. The page is still running the expression. To wait longer than ' +
+                    `${EVAL_SETTLE_TIMEOUT_MS / 1000}s, keep the promise instead of awaiting it (\`window.job = run()\`), ` +
+                    'then `await window.job` in later calls.');
             }
             if (outcome.kind === 'paused')
                 return await reportPausedEvaluation(outcome.event);

@@ -426,7 +426,7 @@ export function registerDebuggerTools(server, getClient, session) {
         return { content: [{ type: 'text', text: `Removed breakpoint ${breakpointId}.` }] };
     });
     server.registerTool('list_breakpoints', {
-        description: 'List breakpoints tracked by this server (set via `set_breakpoint`). Breakpoints set outside this server (DevTools UI, other CDP clients, prior sessions) are not visible — CDP has no API to enumerate them.',
+        description: 'List breakpoints set through `set_breakpoint`. Breakpoints set in DevTools or by another CDP client are not listed.',
         inputSchema: z.object({}),
         outputSchema: z.object({
             breakpoints: z.array(z.object({

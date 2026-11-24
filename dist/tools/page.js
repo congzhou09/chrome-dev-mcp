@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { BRING_TO_FRONT_TIMEOUT_MS, EVAL_EXECUTION_TIMEOUT_MS, EVAL_PROBE_INTERVAL_MS, EVAL_SETTLE_TIMEOUT_MS, EVAL_TERMINATE_WAIT_MS, FRAME_WAIT_TIMEOUT_MS, LAYOUT_METRICS_TIMEOUT_MS, MAX_HTML_LENGTH, NOT_CONNECTED, OWN_EXPRESSION, PAGE_COMMAND_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { currentDialog, dialogHold } from '../dialog.js';
 import { releaseRemoteObject, renderValueFirst } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 // Chrome reports a terminated evaluation as a REJECTED command rather than through
@@ -373,9 +374,13 @@ export function registerPageTools(server, getClient, session) {
                 client.Runtime.terminateExecution().catch(() => { });
                 const ended = await withTimeout(evaluation.then((value) => ({ value }), (err) => ({ err })), EVAL_TERMINATE_WAIT_MS);
                 if (ended === TIMED_OUT) {
+                    const dialog = currentDialog();
                     return toolError(`Error: the page has not responded for ${EVAL_EXECUTION_TIMEOUT_MS / 1000}s, and the expression did ` +
-                        'not stop when terminated. The page may be showing a modal dialog (alert, confirm or prompt); ' +
-                        'once the dialog is closed, the expression continues.');
+                        'not stop when terminated. ' +
+                        (dialog
+                            ? `The renderer is ${dialogHold(dialog).causes}. `
+                            : 'The page may be showing a modal dialog (alert, confirm or prompt). ') +
+                        'Once the dialog is closed in Chrome, the expression continues.');
                 }
                 if ('err' in ended) {
                     if (!isExecutionTerminated(ended.err))
@@ -621,6 +626,13 @@ export function registerPageTools(server, getClient, session) {
                     // Three different failures land here and they call for different next moves, so
                     // the message names the one that actually happened rather than blaming the clock
                     // for all of them.
+                    // A capture without `region` would be held by the dialog just the same.
+                    const dialog = probed === TIMED_OUT ? currentDialog() : null;
+                    if (dialog) {
+                        const { causes, advice } = dialogHold(dialog);
+                        return toolError(`Error: the viewport could not be measured: the renderer did not answer within ` +
+                            `${LAYOUT_METRICS_TIMEOUT_MS}ms — it is ${causes}. ${advice}`);
+                    }
                     const why = probed === TIMED_OUT
                         ? `the renderer did not answer within ${LAYOUT_METRICS_TIMEOUT_MS}ms — it may be ` +
                             'blocked in a synchronous loop, or blocked on a modal dialog'
@@ -707,6 +719,16 @@ export function registerPageTools(server, getClient, session) {
             // would surface as an unhandledRejection with nobody listening.
             shot.catch(() => { });
             let result = await withTimeout(shot, SCREENSHOT_TIMEOUT_MS);
+            // A dialog explains the timeout, and bringing the tab to the front does not close it.
+            const dialog = result === TIMED_OUT ? currentDialog() : null;
+            if (dialog) {
+                const { causes, advice } = dialogHold(dialog);
+                return {
+                    ok: false,
+                    error: toolError(`Error: screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms. The renderer is ${causes}. ` +
+                        `${advice} Nothing was captured.`),
+                };
+            }
             if (result === TIMED_OUT) {
                 const front = client.Page.bringToFront();
                 front.catch(() => { });

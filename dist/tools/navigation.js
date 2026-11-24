@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { NAVIGATION_TIMEOUT_MS, NOT_CONNECTED, OWN_EXPRESSION, PAGE_COMMAND_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { currentDialog, describeDialog, dialogHold } from '../dialog.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 import { droppedBreakpointsSchema } from './debugger.js';
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
@@ -45,6 +46,35 @@ export function registerNavigationTools(server, getClient, session) {
         let committedUrl;
         const emitter = client;
         let dispose = () => { };
+        // A dialog ends the wait as well, in two cases:
+        // - A beforeunload dialog holds the navigation back until the dialog is answered. Measured,
+        //   Chrome 157, the dialog answered with Cancel: the dialog opened 8ms after either command
+        //   was sent. Page.reload answered within 9ms, before the dialog was answered. Page.navigate
+        //   answered only once the dialog was answered, with errorText "net::ERR_ABORTED", and the 
+        //   old page stayed.
+        // - A dialog that the new page opens during startup holds back its load event. Measured,
+        //   Chrome 157: an alert() in the new page's script opened 10ms after its frameNavigated,
+        //   and loadEventFired came only once the alert was closed.
+        // Either can last as long as nobody answers the dialog in Chrome, so the call reports the
+        // dialog at once instead of waiting out the bound.
+        //
+        // An alert, confirm or prompt that the old page opens does not hold the navigation back:
+        // Chrome closes it as the navigation starts. Measured, Chrome 157, with an alert open on the
+        // old page: javascriptDialogClosed came with `result: false` right after Page.reload or
+        // Page.navigate was sent, and the new page loaded as usual. In one measured run of
+        // Page.navigate, the old page's alert opened during the call, 3ms before the new page's
+        // frameNavigated. So a dialog that opens before frameNavigated, other than a beforeunload
+        // dialog, does not end the wait.
+        //
+        // If Chrome stopped closing such a dialog, the navigation would wait for the dialog, and the
+        // call would end at the bound with the error that names an open dialog (see notCommitted).
+        let onDialog = (_event) => { };
+        const dialogOpened = new Promise((resolve) => {
+            onDialog = (event) => {
+                if (event?.type === 'beforeunload' || committedUrl !== undefined)
+                    resolve('dialog');
+            };
+        });
         const settled = new Promise((resolve) => {
             const onLoad = () => resolve('loaded');
             const onPaused = () => resolve('paused');
@@ -55,10 +85,12 @@ export function registerNavigationTools(server, getClient, session) {
             emitter.on('Page.loadEventFired', onLoad);
             emitter.on('Debugger.paused', onPaused);
             emitter.on('Page.frameNavigated', onNavigated);
+            emitter.on('Page.javascriptDialogOpening', onDialog);
             dispose = () => {
                 emitter.removeListener('Page.loadEventFired', onLoad);
                 emitter.removeListener('Debugger.paused', onPaused);
                 emitter.removeListener('Page.frameNavigated', onNavigated);
+                emitter.removeListener('Page.javascriptDialogOpening', onDialog);
             };
         });
         try {
@@ -68,7 +100,9 @@ export function registerNavigationTools(server, getClient, session) {
             // Page.navigate's answer for 6020ms. Page.reload answers at once in that state, but the
             // reload itself waits just the same — which is what `committedUrl` tells apart from a
             // page merely slow to load.
-            const response = await withTimeout(start().catch((e) => ({ rejected: e.message })), Math.max(0, deadline - Date.now()));
+            const response = await withTimeout(Promise.race([start().catch((e) => ({ rejected: e.message })), dialogOpened]), Math.max(0, deadline - Date.now()));
+            if (response === 'dialog')
+                return heldByDialog(what);
             if (response === TIMED_OUT)
                 return notCommitted(what);
             if ('rejected' in response)
@@ -85,7 +119,9 @@ export function registerNavigationTools(server, getClient, session) {
                 return toolError(`Error: ${what} failed: ${response.errorText}`);
             if (response.sameDocument)
                 return finish({ outcome: 'same-document', ...(await readPage(client)) });
-            const waited = await withTimeout(settled, Math.max(0, deadline - Date.now()));
+            const waited = await withTimeout(Promise.race([settled, dialogOpened]), Math.max(0, deadline - Date.now()));
+            if (waited === 'dialog')
+                return heldByDialog(what);
             if (waited === 'paused') {
                 return finish({
                     outcome: 'paused',
@@ -129,8 +165,28 @@ export function registerNavigationTools(server, getClient, session) {
         content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
         structuredContent: data,
     });
-    const notCommitted = (what) => toolError(`Error: ${what} did not commit within ${NAVIGATION_TIMEOUT_MS}ms. The old page is still in place — its ` +
-        'renderer may be blocked in a synchronous loop, which holds a navigation back until the loop ends.');
+    // A dialog found open here is one the wait went on for: it opened before the call began, or the
+    // old page opened it and Chrome did not close it (see the dialog cases in navigateAndSettle).
+    const notCommitted = (what) => {
+        const dialog = currentDialog();
+        return toolError(`Error: ${what} did not commit within ${NAVIGATION_TIMEOUT_MS}ms. The old page is still in place — ` +
+            (dialog
+                ? `its renderer is ${dialogHold(dialog).causes}. ${dialogHold(dialog).advice}`
+                : 'its renderer may be blocked in a synchronous loop, which holds a navigation back until the loop ends.'));
+    };
+    // Reports one of the two dialogs that end the wait: the old page's beforeunload dialog, or a
+    // dialog the new page opened.
+    const heldByDialog = (what) => {
+        const noun = what === 'reload' ? 'reload' : 'navigation';
+        // Recorded by watchDialogs, whose listener runs before the one that ended the wait.
+        const dialog = currentDialog();
+        const described = dialog ? describeDialog(dialog) : 'a dialog';
+        return toolError(dialog?.type === 'beforeunload'
+            ? `Error: the page opened ${described}, which asks whether to leave the page. The ${noun} waits for an ` +
+                'answer in Chrome: it goes ahead if the dialog is accepted, and is cancelled if the dialog is dismissed.'
+            : `Error: the new page opened ${described} before its load event. The new page goes on loading once ` +
+                'the dialog is closed in Chrome.');
+    };
     server.registerTool('navigate_tab', {
         description: `Navigate the connected tab to a URL and wait up to ${NAVIGATION_TIMEOUT_MS / 1000}s for the new page's load ` +
             'event — or for execution to pause first, e.g. on a breakpoint the new page hits during startup, in which ' +

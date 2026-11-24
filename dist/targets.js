@@ -1,5 +1,6 @@
 import CDP from 'chrome-remote-interface';
 import { OWN_EXPRESSION, TARGET_PROBE_TIMEOUT_MS } from './constants.js';
+import { watchDialogs } from './dialog.js';
 import { TIMED_OUT, withTimeout } from './timeout.js';
 // Every tab Chrome lists as a page, less DevTools windows, which are pages too.
 export async function listPageTargets() {
@@ -71,6 +72,7 @@ export async function restoreDiscardedTab(client) {
 // returned after 286ms, and the network capture had every request of the reload, the document's
 // included.
 export async function enableTarget(client, attachNetwork, restore) {
+    watchDialogs(client);
     const enabled = Promise.all([client.Runtime.enable(), client.Page.enable(), attachNetwork(client)]);
     // `enabled` is awaited below, unless restoreDiscardedTab throws first. In that case the caller
     // closes the connection, which rejects every command still unanswered, and this handler keeps

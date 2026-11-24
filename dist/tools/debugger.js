@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { NOT_CONNECTED, PAGE_COMMAND_TIMEOUT_MS, PAUSE_WAIT_TIMEOUT_MS, STEP_WAIT_TIMEOUT_MS, rendererTimedOut, } from '../constants.js';
+import { currentDialog, dialogHold } from '../dialog.js';
 import { releaseRemoteObject, renderRemoteObject } from '../remote-object.js';
 import { TIMED_OUT, withTimeout } from '../timeout.js';
 const toolError = (text) => ({ content: [{ type: 'text', text }], isError: true });
@@ -473,8 +474,12 @@ export function registerDebuggerTools(server, getClient, session) {
         // the pause was pending, and landed at the next statement that ran.
         const sent = await withTimeout(client.Debugger.pause(), PAUSE_WAIT_TIMEOUT_MS);
         if (sent === TIMED_OUT) {
-            return toolError(`Error: the page did not take the pause within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s — it may be showing a ` +
-                'modal dialog (alert, confirm or prompt), which holds every command back until it is closed. The pause ' +
+            const dialog = currentDialog();
+            return toolError(`Error: the page did not take the pause within ${PAUSE_WAIT_TIMEOUT_MS / 1000}s — ` +
+                (dialog
+                    ? `it is ${dialogHold(dialog).causes}. A dialog `
+                    : 'it may be showing a modal dialog (alert, confirm or prompt), which ') +
+                'holds every command back until it is closed in Chrome. The pause ' +
                 'is still queued: once the dialog closes, it lands at the next statement that runs.');
         }
         if (await landed)

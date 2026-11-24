@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { currentDialog, dialogHold } from './dialog.js';
 export const NOT_CONNECTED = {
     content: [
         {
@@ -263,17 +264,23 @@ export const OWN_EXPRESSION = { disableBreaks: true };
 //   switch_tab is already on that tab, and only reports the switch.
 //
 // A call with other causes passes its own, along with its own advice, or `advice: ''` for none.
-export const rendererTimedOut = (what, { causes = 'blocked in a synchronous loop, or blocked on a modal dialog', advice = 'Retry once the page responds again (the loop ends or the dialog is closed).', } = {}) => ({
-    content: [
-        {
-            type: 'text',
-            text: `Error: ${what} did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms. ` +
-                `The tab's renderer is not responding — it may be ${causes}.` +
-                (advice && ` ${advice}`),
-        },
-    ],
-    isError: true,
-});
+// A dialog the page opened replaces both: it holds back every command, whatever the call.
+export const rendererTimedOut = (what, { causes = 'blocked in a synchronous loop, or blocked on a modal dialog', advice = 'Retry once the page responds again (the loop ends or the dialog is closed).', } = {}) => {
+    const dialog = currentDialog();
+    const why = dialog ? `it is ${dialogHold(dialog).causes}` : `it may be ${causes}`;
+    const next = dialog ? dialogHold(dialog).advice : advice;
+    return {
+        content: [
+            {
+                type: 'text',
+                text: `Error: ${what} did not answer within ${PAGE_COMMAND_TIMEOUT_MS}ms. ` +
+                    `The tab's renderer is not responding — ${why}.` +
+                    (next && ` ${next}`),
+            },
+        ],
+        isError: true,
+    };
+};
 // Network traffic is far denser than console output — a single page load is routinely
 // 100-500 requests. Unlike MAX_CONSOLE_LOGS, the buffer depth is deliberately NOT reused
 // as the zod `.max()` on `limit`: 1000 records would be ~60-100k tokens in one response.

@@ -234,7 +234,7 @@ describe('evaluate_js', () => {
 
       expect(terminateExecution).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
-      expect((result.content as any)[0].text).toContain(`did not settle within ${EVAL_SETTLE_TIMEOUT_MS}ms`);
+      expect((result.content as any)[0].text).toContain(`did not settle within ${EVAL_SETTLE_TIMEOUT_MS / 1000}s`);
     } finally {
       vi.useRealTimers();
     }

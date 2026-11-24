@@ -363,12 +363,20 @@ export function registerPageTools(
         expression: z
           .string()
           .describe('JS source evaluated as-is. A function is not called — wrap it: `(() => { ... })()`'),
+        userGesture: z
+          .boolean()
+          .optional()
+          .describe(
+            'Run as a user gesture, which APIs gated on user activation require: play() with sound, window.open, ' +
+              'fullscreen, clipboard. Off by default, unlike the DevTools console: after a gesture the page stays ' +
+              'user-activated until it navigates, so leaving it can stop at its beforeunload dialog.',
+          ),
       }),
       annotations: {
         title: 'Evaluate JS',
       },
     },
-    async ({ expression }) => {
+    async ({ expression, userGesture }) => {
       const client = await getClient();
       if (!client) return NOT_CONNECTED;
       // Evaluated exactly once, in preview mode. Asking for the value here instead would
@@ -394,11 +402,42 @@ export function registerPageTools(
       // No `timeout`: Chrome keeps counting it while execution is paused, and ends the expression
       // at the next resume or step once it has run out. watchForBlockedRenderer stops a loop
       // instead — see EVAL_EXECUTION_TIMEOUT_MS for both measurements.
+      //
+      // `userGesture` is a stable parameter of Runtime.evaluate, documented only as "treated as
+      // initiated by user in the UI". That it grants user activation is supported by measurement
+      // alone. Measured, Chrome 157, a page that had never been activated:
+      //
+      //   userGesture   navigator.userActivation          window.open        play() with sound
+      //   not set       isActive false, hasBeenActive false   null (blocked)   NotAllowedError
+      //   true          isActive true,  hasBeenActive true    a window         resolved
+      //
+      // Should Chrome stop granting activation for it, the gated API fails the way it does without
+      // the parameter, with the page's own error. Reading `navigator.userActivation.isActive` in
+      // the same expression tells the caller which case it is.
+      //
+      // Off by default, although the DevTools console turns it on by default (its setting "Treat
+      // code evaluation as user action"). A gesture leaves sticky activation (`hasBeenActive`) on
+      // the page until the page navigates. If every call ran as a gesture, two things would go
+      // wrong:
+      // - Every read of activation state, and every behavior gated on it, would see an activation
+      //   that no user made.
+      // - reload_tab and navigate_tab would stop at beforeunload dialogs that the page does not
+      //   show otherwise. The HTML standard lets a browser skip the beforeunload dialog of a page
+      //   without sticky activation. Measured, Chrome 157, a page with a beforeunload handler:
+      //   Page.reload of the activated page opened the dialog, and Page.reload of the page never
+      //   activated reloaded without one.
+      //
+      // play() with sound is a poor test of this parameter: Chrome lets a site with microphone or
+      // camera permission play sound without any activation (kAutoplayBypassForMicCamera, enabled
+      // by default, in chrome_content_browser_client.cc). Measured, Chrome 157: on such a site
+      // play() resolved without a gesture, and after the microphone permission was revoked and the
+      // page reloaded, it failed with NotAllowedError.
       const evaluation = client.Runtime.evaluate({
         expression,
         returnByValue: false,
         generatePreview: true,
         replMode: true,
+        ...(userGesture && { userGesture: true }),
       });
       // The races below can abandon this promise. Without a handler of its own, a later
       // rejection would surface as an unhandledRejection with nobody listening.

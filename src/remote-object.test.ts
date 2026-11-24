@@ -85,6 +85,21 @@ describe('evaluate_js', () => {
     expect(evaluate.mock.calls[0][0]).not.toHaveProperty('timeout');
   });
 
+  // A gesture leaves sticky activation on the page, which later reloads and navigations can stop
+  // at (a beforeunload dialog). So the gesture runs only when the caller asks for it.
+  it.each([
+    { args: {}, sent: undefined },
+    { args: { userGesture: false }, sent: undefined },
+    { args: { userGesture: true }, sent: true },
+  ])('passes userGesture only when asked ($args)', async ({ args, sent }) => {
+    const evaluate = vi.fn().mockResolvedValue({ result: { type: 'number', value: 1 } });
+    const client = await setupMcpClient(makeMockClient(evaluate));
+
+    await client.callTool({ name: 'evaluate_js', arguments: { expression: '1', ...args } });
+
+    expect(evaluate.mock.calls[0][0].userGesture).toBe(sent);
+  });
+
   // A renderer held by synchronous code answers nothing, so a client-side race alone would hand
   // back control while leaving the tab spinning for every later call. The termination arrives as
   // a rejected command, not as exceptionDetails, in either code depending on replMode.

@@ -1,5 +1,5 @@
 # Publishes a release when a version tag is pushed. npm comes first: the MCP Registry rejects a version
-# that is not on npm yet. Both login with GitHub OIDC, so no secret is needed.
+# that is not on npm yet. Both log in with GitHub OIDC, so no secret is needed.
 # npm's trusted publisher setting names this file. Renaming the file means creating that setting again.
 name: Publish
 

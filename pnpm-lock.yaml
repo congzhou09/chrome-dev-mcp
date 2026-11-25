@@ -22,8 +22,8 @@ importers:
         version: 4.6.6
     devDependencies:
       '@types/chrome-remote-interface':
-        specifier: ^0.34.0
-        version: 0.34.0
+        specifier: ^0.34.1
+        version: 0.34.1
       '@types/node':
         specifier: ^25.8.0
         version: 25.8.0
@@ -353,8 +353,8 @@ packages:
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
 
-  '@types/chrome-remote-interface@0.34.0':
-    resolution: {integrity: sha512-4q8pMUvasrAkB7bejGWw5igboAvBz7vJRZq+295yFONGoeN7X/hfq8Mq4vTxUQKnENbR9tqksP8RZsLxlRtsWQ==}
+  '@types/chrome-remote-interface@0.34.1':
+    resolution: {integrity: sha512-YaxsTVDoCdgw3fha8Vd3+YtoA+OYw+RkcuabVEBvJm7eEv4FP+HBMVR9c0TleYuGoJpHhNPPjUhsgz6lMkmt/Q==}
 
   '@types/deep-eql@4.0.2':
     resolution: {integrity: sha512-c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw==}
@@ -488,8 +488,8 @@ packages:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
 
-  devtools-protocol@0.0.1173815:
-    resolution: {integrity: sha512-CmsjkudmgCMeae8FSJB4GV8COZwOk6dJKyE9HS2F/ih/sA8uTdbPKHg5F7DsrOYLEET/QKK00LJCU4YoyG+uHg==}
+  devtools-protocol@0.0.1721602:
+    resolution: {integrity: sha512-e+CRu+s/WFxe/RbRywkCdQDvmyCbM/JxvbyZMBxO3CDH1snKtpghcCzUJ69KUzG4QehmYyXBOtyCq1pNMScmyQ==}
 
   dunder-proto@1.0.1:
     resolution: {integrity: sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==}
@@ -1262,9 +1262,9 @@ snapshots:
       '@types/deep-eql': 4.0.2
       assertion-error: 2.0.1
 
-  '@types/chrome-remote-interface@0.34.0':
+  '@types/chrome-remote-interface@0.34.1':
     dependencies:
-      devtools-protocol: 0.0.1173815
+      devtools-protocol: 0.0.1721602
 
   '@types/deep-eql@4.0.2': {}
 
@@ -1402,7 +1402,7 @@ snapshots:
 
   detect-libc@2.1.2: {}
 
-  devtools-protocol@0.0.1173815: {}
+  devtools-protocol@0.0.1721602: {}
 
   dunder-proto@1.0.1:
     dependencies:
